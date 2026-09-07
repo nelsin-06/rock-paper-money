@@ -82,6 +82,15 @@ export async function getRoomState(code, { signal } = {}) {
   return mapRoomState(dto)
 }
 
+export async function validateSession(code, token, role, { signal } = {}) {
+  await request(`/api/rooms/${encodeURIComponent(code)}/validate-session`, {
+    method: 'POST',
+    headers: { ...bearer(token), 'Content-Type': 'application/json' },
+    body: JSON.stringify({ role }),
+    signal,
+  })
+}
+
 export function subscribeToRoom(code, { onState, onOpen, onError }) {
   const source = new EventSource(`/api/rooms/${encodeURIComponent(code)}/events`)
   source.onopen = () => onOpen?.()

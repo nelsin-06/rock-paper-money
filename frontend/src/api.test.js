@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { ApiError, createRoom, getRoomState, leaveRoom, startNextRound, submitMove, subscribeToRoom } from './api.js'
+import { ApiError, createRoom, getRoomState, leaveRoom, startNextRound, submitMove, subscribeToRoom, validateSession } from './api.js'
 
 function response(body, { status = 200 } = {}) {
   return new Response(body === null ? null : JSON.stringify(body), {
@@ -62,6 +62,18 @@ describe('API client', () => {
     expect(fetch).toHaveBeenNthCalledWith(2, '/api/rooms/ABC234/leave', expect.objectContaining({
       method: 'POST',
       headers: { Authorization: 'Bearer secret' },
+    }))
+  })
+
+  it('validates the stored player role with bearer credentials', async () => {
+    fetch.mockResolvedValue(response(null, { status: 204 }))
+
+    await validateSession('ABC234', 'secret', 'host')
+
+    expect(fetch).toHaveBeenCalledWith('/api/rooms/ABC234/validate-session', expect.objectContaining({
+      method: 'POST',
+      headers: { Authorization: 'Bearer secret', 'Content-Type': 'application/json' },
+      body: '{"role":"host"}',
     }))
   })
 

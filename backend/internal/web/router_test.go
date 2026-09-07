@@ -471,6 +471,32 @@ func TestGameplayAuthentication(t *testing.T) {
 	}
 }
 
+func TestValidateSessionAuthenticatesExactStoredRole(t *testing.T) {
+	handler := NewRouter(readyStoreForWeb(t))
+
+	validHost := performAuthorizedJSONRequest(t, handler, http.MethodPost, "/api/rooms/ABC234/validate-session", "host-token", `{"role":"host"}`)
+	assertNoContent(t, validHost)
+	validGuest := performAuthorizedJSONRequest(t, handler, http.MethodPost, "/api/rooms/ABC234/validate-session", "guest-token", `{"role":"guest"}`)
+	assertNoContent(t, validGuest)
+
+	wrongRole := performAuthorizedJSONRequest(t, handler, http.MethodPost, "/api/rooms/ABC234/validate-session", "host-token", `{"role":"guest"}`)
+	assertJSONError(t, wrongRole, http.StatusUnauthorized, "unauthorized")
+	invalidToken := performAuthorizedJSONRequest(t, handler, http.MethodPost, "/api/rooms/ABC234/validate-session", "unknown-token", `{"role":"host"}`)
+	assertJSONError(t, invalidToken, http.StatusUnauthorized, "unauthorized")
+	missingRoom := performAuthorizedJSONRequest(t, handler, http.MethodPost, "/api/rooms/NONE23/validate-session", "host-token", `{"role":"host"}`)
+	assertJSONError(t, missingRoom, http.StatusNotFound, "room not found")
+}
+
+func TestValidateSessionRejectsClosedRoom(t *testing.T) {
+	store := readyStoreForWeb(t)
+	if err := store.Leave("ABC234", "host-token"); err != nil {
+		t.Fatalf("close room: %v", err)
+	}
+
+	response := performAuthorizedJSONRequest(t, NewRouter(store), http.MethodPost, "/api/rooms/ABC234/validate-session", "host-token", `{"role":"host"}`)
+	assertJSONError(t, response, http.StatusNotFound, "room not found")
+}
+
 func TestSubmitMoveRejectsInvalidJSONAndMoves(t *testing.T) {
 	store := readyStoreForWeb(t)
 	handler := NewRouter(store)
@@ -569,6 +595,7 @@ func TestGameplayEndpointsRejectWrongMethods(t *testing.T) {
 		{method: http.MethodPost, path: "/api/rooms/ABC234/state"},
 		{method: http.MethodGet, path: "/api/rooms/ABC234/next-round"},
 		{method: http.MethodGet, path: "/api/rooms/ABC234/leave"},
+		{method: http.MethodGet, path: "/api/rooms/ABC234/validate-session"},
 	}
 
 	for _, test := range tests {

@@ -78,6 +78,32 @@ function Home({ onEnterRoom }) {
   )
 }
 
+function SessionRecovery({ error, onRetry, onForget }) {
+  return (
+    <main className="page recovery-page">
+      <section className="entry-card centered" aria-live="polite">
+        {error ? (
+          <>
+            <p className="eyebrow">Session unavailable</p>
+            <h1>We could not restore your room</h1>
+            <p>{error}</p>
+            <div className="recovery-actions">
+              <button className="button button-primary" onClick={onRetry}>Retry</button>
+              <button className="button button-quiet" onClick={onForget}>Forget this session</button>
+            </div>
+          </>
+        ) : (
+          <>
+            <div className="loader" />
+            <h1>Restoring your room…</h1>
+            <p>Checking your saved player credentials.</p>
+          </>
+        )}
+      </section>
+    </main>
+  )
+}
+
 function Scoreboard({ players = [], role, resolved = false }) {
   return (
     <section className="scoreboard" aria-label="Score and readiness">
@@ -292,15 +318,61 @@ function Room({ session, onLeave }) {
 
 export default function App() {
   const [session, setSession] = useState(() => loadSession())
+  const [sessionReady, setSessionReady] = useState(() => !session)
+  const [validationError, setValidationError] = useState('')
+  const [validationAttempt, setValidationAttempt] = useState(0)
+
+  useEffect(() => {
+    if (!session || sessionReady) return undefined
+
+    const controller = new AbortController()
+    let active = true
+
+    api.validateSession(session.roomCode, session.playerToken, session.role, { signal: controller.signal })
+      .then(() => {
+        if (active) setSessionReady(true)
+      })
+      .catch((requestError) => {
+        if (!active || controller.signal.aborted) return
+        if (requestError?.status === 401 || requestError?.status === 404) {
+          clearSession()
+          setSession(null)
+          return
+        }
+        setValidationError(displayError(requestError))
+      })
+
+    return () => {
+      active = false
+      controller.abort()
+    }
+  }, [session, sessionReady, validationAttempt])
 
   function leaveRoom() {
     clearSession()
     setSession(null)
+    setSessionReady(false)
+    setValidationError('')
+  }
+
+  function enterRoom(nextSession) {
+    setSession(nextSession)
+    setSessionReady(true)
+    setValidationError('')
+  }
+
+  function retryValidation() {
+    setValidationError('')
+    setValidationAttempt((attempt) => attempt + 1)
+  }
+
+  if (session && !sessionReady) {
+    return <SessionRecovery error={validationError} onRetry={retryValidation} onForget={leaveRoom} />
   }
 
   return session ? (
     <Room key={`${session.roomCode}:${session.playerToken}`} session={session} onLeave={leaveRoom} />
   ) : (
-    <Home onEnterRoom={setSession} />
+    <Home onEnterRoom={enterRoom} />
   )
 }

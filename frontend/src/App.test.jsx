@@ -4,11 +4,12 @@ import { act, fireEvent, render, screen, waitFor, within } from '@testing-librar
 import userEvent from '@testing-library/user-event'
 import App from './App.jsx'
 import * as api from './api.js'
-import { STORAGE_KEY } from './storage.js'
+import { APP_VERSION, STORAGE_KEY } from './storage.js'
 
 vi.mock('./api.js')
 
 const hostSession = { roomCode: 'ABC234', playerToken: 'host-secret', role: 'host' }
+const persistedHostSession = { ...hostSession, version: APP_VERSION }
 const waitingState = {
   roomCode: 'ABC234', ready: false, resolved: false, round: 1, closed: false,
   players: [{ role: 'host', wins: 0, submitted: false, wantsNextRound: false }], result: null, moves: [],
@@ -39,6 +40,8 @@ describe('core room flow', () => {
     localStorage.clear()
     api.createRoom.mockReset()
     api.joinRoom.mockReset()
+    api.validateSession.mockReset()
+    api.validateSession.mockResolvedValue()
     api.subscribeToRoom.mockReset()
     api.submitMove.mockReset()
     api.startNextRound.mockReset()
@@ -56,7 +59,7 @@ describe('core room flow', () => {
     expect(await screen.findByRole('heading', { name: /waiting for a guest/i })).toBeInTheDocument()
     expect(screen.getByLabelText('Room code ABC234')).toBeInTheDocument()
     expect(screen.queryByText('host-secret')).not.toBeInTheDocument()
-    expect(JSON.parse(localStorage.getItem(STORAGE_KEY))).toEqual(hostSession)
+    expect(JSON.parse(localStorage.getItem(STORAGE_KEY))).toEqual(persistedHostSession)
   })
 
   it('joins using a normalized six-character code', async () => {
@@ -116,12 +119,13 @@ describe('core room flow', () => {
   })
 
   it('restores a room, submits only one move, and hides choices before resolution', async () => {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(hostSession))
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(persistedHostSession))
     streamRoomState(readyState)
     api.submitMove.mockResolvedValue()
     render(<App />)
 
     const choices = await screen.findByLabelText('Choose a move')
+    expect(api.validateSession).toHaveBeenCalledWith('ABC234', 'host-secret', 'host', expect.objectContaining({ signal: expect.any(AbortSignal) }))
     expect(screen.getByText(/stays secret until both players/i)).toBeInTheDocument()
     expect(screen.queryByText(/opponent.*rock/i)).not.toBeInTheDocument()
 
@@ -132,7 +136,7 @@ describe('core room flow', () => {
   })
 
   it('recovers visible action state after a StrictMode move failure', async () => {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(hostSession))
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(persistedHostSession))
     streamRoomState(readyState)
     api.submitMove.mockRejectedValue(new Error('Move failed'))
     render(<StrictMode><App /></StrictMode>)
@@ -146,7 +150,7 @@ describe('core room flow', () => {
   })
 
   it('shows submitted readiness from server truth without revealing either move', async () => {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(hostSession))
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(persistedHostSession))
     const submitted = {
       ...readyState,
       players: [{ role: 'host', wins: 0, submitted: true }, { role: 'guest', wins: 0, submitted: false }],
@@ -160,7 +164,7 @@ describe('core room flow', () => {
   })
 
   it('shows both next-round decisions and starts only after the other player accepts', async () => {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(hostSession))
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(persistedHostSession))
     const resolved = {
       roomCode: 'ABC234', ready: true, resolved: true, round: 1, closed: false, result: 'player_one_wins',
       players: [
@@ -203,7 +207,7 @@ describe('core room flow', () => {
   })
 
   it('closes the room locally after the leave command succeeds', async () => {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(hostSession))
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(persistedHostSession))
     streamRoomState(readyState)
     api.leaveRoom.mockResolvedValue()
     render(<App />)
@@ -217,7 +221,7 @@ describe('core room flow', () => {
   })
 
   it('ejects the connected player when SSE reports that the opponent left', async () => {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(hostSession))
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(persistedHostSession))
     streamRoomState(readyState)
     render(<App />)
     await screen.findByRole('heading', { name: 'Choose your move' })
@@ -227,7 +231,7 @@ describe('core room flow', () => {
   })
 
   it('shows when the opponent requested another round and allows acceptance', async () => {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(hostSession))
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(persistedHostSession))
     const opponentRequested = {
       roomCode: 'ABC234', ready: true, resolved: true, round: 4, closed: false, result: 'draw',
       players: [
@@ -246,7 +250,7 @@ describe('core room flow', () => {
   })
 
   it('keeps credentials and replaces the EventSource when live updates are retried', async () => {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(hostSession))
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(persistedHostSession))
     const firstClose = vi.fn()
     const secondClose = vi.fn()
     api.subscribeToRoom
@@ -267,5 +271,65 @@ describe('core room flow', () => {
     expect(await screen.findByRole('heading', { name: /waiting for a guest/i })).toBeInTheDocument()
     expect(firstClose).toHaveBeenCalledOnce()
     expect(api.subscribeToRoom).toHaveBeenCalledTimes(2)
+  })
+
+  it.each([401, 404])('clears an invalid restored session after validation returns %s', async (status) => {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(persistedHostSession))
+    api.validateSession.mockRejectedValue(Object.assign(new Error('Session rejected'), { status }))
+    render(<App />)
+
+    expect(await screen.findByRole('button', { name: 'Create room' })).toBeInTheDocument()
+    expect(localStorage.getItem(STORAGE_KEY)).toBeNull()
+    expect(api.subscribeToRoom).not.toHaveBeenCalled()
+  })
+
+  it('keeps credentials hidden from the room while transient validation fails and supports retry', async () => {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(persistedHostSession))
+    api.validateSession
+      .mockRejectedValueOnce(Object.assign(new Error('Server unavailable'), { status: 503 }))
+      .mockResolvedValueOnce()
+    streamRoomState(waitingState)
+    render(<App />)
+
+    expect(await screen.findByRole('heading', { name: /could not restore your room/i })).toBeInTheDocument()
+    expect(localStorage.getItem(STORAGE_KEY)).not.toBeNull()
+    expect(screen.queryByLabelText('Room code ABC234')).not.toBeInTheDocument()
+    expect(api.subscribeToRoom).not.toHaveBeenCalled()
+
+    await userEvent.click(screen.getByRole('button', { name: 'Retry' }))
+    expect(await screen.findByRole('heading', { name: /waiting for a guest/i })).toBeInTheDocument()
+    expect(api.validateSession).toHaveBeenCalledTimes(2)
+    expect(api.subscribeToRoom).toHaveBeenCalledOnce()
+  })
+
+  it('ignores a cancelled StrictMode validation result after restoration succeeds', async () => {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(persistedHostSession))
+    let rejectCancelledValidation
+    api.validateSession
+      .mockImplementationOnce(() => new Promise((_, reject) => { rejectCancelledValidation = reject }))
+      .mockResolvedValueOnce()
+    streamRoomState(waitingState)
+    render(<StrictMode><App /></StrictMode>)
+
+    expect(api.subscribeToRoom).not.toHaveBeenCalled()
+    expect(await screen.findByRole('heading', { name: /waiting for a guest/i })).toBeInTheDocument()
+    await act(async () => {
+      rejectCancelledValidation(Object.assign(new Error('Unauthorized'), { status: 401 }))
+    })
+
+    expect(screen.getByLabelText('Room code ABC234')).toBeInTheDocument()
+    expect(localStorage.getItem(STORAGE_KEY)).not.toBeNull()
+    expect(api.subscribeToRoom).toHaveBeenCalledTimes(2)
+  })
+
+  it('allows a transiently blocked user to forget the session locally', async () => {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(persistedHostSession))
+    api.validateSession.mockRejectedValue(new Error('Network unavailable'))
+    render(<App />)
+
+    await userEvent.click(await screen.findByRole('button', { name: 'Forget this session' }))
+    expect(screen.getByRole('button', { name: 'Create room' })).toBeInTheDocument()
+    expect(localStorage.getItem(STORAGE_KEY)).toBeNull()
+    expect(api.subscribeToRoom).not.toHaveBeenCalled()
   })
 })

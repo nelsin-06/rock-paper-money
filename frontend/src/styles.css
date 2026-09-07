@@ -35,6 +35,11 @@ button:focus-visible, input:focus-visible {
 
 .page { width: min(100% - 2rem, 860px); margin: 0 auto; padding: 3rem 0; }
 .home-page { min-height: 100vh; display: grid; grid-template-columns: 1.2fr 0.8fr; gap: 4rem; align-items: center; }
+.recovery-page { display: grid; min-height: 100vh; place-items: center; }
+.recovery-page .entry-card { width: min(100%, 34rem); }
+.recovery-page h1 { margin: 0.2rem 0 0.6rem; }
+.recovery-page p:not(.eyebrow) { color: var(--muted); }
+.recovery-actions { display: grid; gap: 0.75rem; margin-top: 1.5rem; }
 .eyebrow { margin: 0 0 0.65rem; color: var(--accent); font-size: 0.76rem; font-weight: 800; letter-spacing: 0.16em; text-transform: uppercase; }
 .hero h1 { max-width: 650px; margin: 0; font-size: clamp(3.3rem, 9vw, 7.5rem); line-height: 0.84; letter-spacing: -0.07em; }
 .hero h1 span { color: var(--accent); }

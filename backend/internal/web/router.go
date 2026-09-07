@@ -54,6 +54,7 @@ func newRouterWithLogger(store *room.Store, generateCode, generateToken generato
 	mux.HandleFunc("POST /api/rooms/{code}/moves", handler.submitMove)
 	mux.HandleFunc("GET /api/rooms/{code}/state", handler.roomState)
 	mux.HandleFunc("GET /api/rooms/{code}/events", handler.roomEvents)
+	mux.HandleFunc("POST /api/rooms/{code}/validate-session", handler.validateSession)
 	mux.HandleFunc("POST /api/rooms/{code}/next-round", handler.startNextRound)
 	mux.HandleFunc("POST /api/rooms/{code}/leave", handler.leaveRoom)
 	return logRequests(logger, mux)
@@ -201,6 +202,34 @@ func (rt *router) roomState(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, publicRoomState(code, state))
+}
+
+func (rt *router) validateSession(w http.ResponseWriter, r *http.Request) {
+	_, state, ok := rt.findRoom(w, r.PathValue("code"))
+	if !ok {
+		return
+	}
+	if state.Closed {
+		writeError(w, http.StatusNotFound, "room not found")
+		return
+	}
+
+	_, role, ok := authenticatedPlayerRole(r, state)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	var request validateSessionRequest
+	if !decodeJSONBody(r, &request) || (request.Role != "host" && request.Role != "guest") {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if request.Role != role {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (rt *router) roomEvents(w http.ResponseWriter, r *http.Request) {
@@ -384,6 +413,10 @@ type nextRoundRequest struct {
 	Round uint64 `json:"round"`
 }
 
+type validateSessionRequest struct {
+	Role string `json:"role"`
+}
+
 type stateResponse struct {
 	RoomCode string        `json:"room_code"`
 	Ready    bool          `json:"ready"`
@@ -412,21 +445,26 @@ func normalizeRoomCode(code string) string {
 }
 
 func authenticatedPlayer(r *http.Request, state room.State) (string, bool) {
+	playerID, _, ok := authenticatedPlayerRole(r, state)
+	return playerID, ok
+}
+
+func authenticatedPlayerRole(r *http.Request, state room.State) (string, string, bool) {
 	values := r.Header.Values("Authorization")
 	if len(values) != 1 {
-		return "", false
+		return "", "", false
 	}
 
 	scheme, token, found := strings.Cut(values[0], " ")
 	if !found || !strings.EqualFold(scheme, "Bearer") || token == "" || strings.ContainsAny(token, " \t\r\n") {
-		return "", false
+		return "", "", false
 	}
-	for _, player := range state.Players {
+	for index, player := range state.Players {
 		if player.ID == token {
-			return player.ID, true
+			return player.ID, playerRole(index), true
 		}
 	}
-	return "", false
+	return "", "", false
 }
 
 func playerRole(index int) string {
