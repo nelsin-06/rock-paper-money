@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"time"
 
 	"example.com/rock-paper-money/internal/game"
 	"example.com/rock-paper-money/internal/room"
@@ -20,6 +21,7 @@ const (
 	playerTokenBytes      = 32
 	maxGenerationAttempts = 8
 	roomCodeAlphabet      = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+	heartbeatInterval     = 15 * time.Second
 )
 
 type generator func() (string, error)
@@ -51,6 +53,7 @@ func newRouterWithLogger(store *room.Store, generateCode, generateToken generato
 	mux.HandleFunc("POST /api/rooms/{code}/join", handler.joinRoom)
 	mux.HandleFunc("POST /api/rooms/{code}/moves", handler.submitMove)
 	mux.HandleFunc("GET /api/rooms/{code}/state", handler.roomState)
+	mux.HandleFunc("GET /api/rooms/{code}/events", handler.roomEvents)
 	mux.HandleFunc("POST /api/rooms/{code}/next-round", handler.startNextRound)
 	return logRequests(logger, mux)
 }
@@ -191,6 +194,73 @@ func (rt *router) roomState(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	writeJSON(w, http.StatusOK, publicRoomState(code, state))
+}
+
+func (rt *router) roomEvents(w http.ResponseWriter, r *http.Request) {
+	code := normalizeRoomCode(r.PathValue("code"))
+	if code == "" {
+		writeError(w, http.StatusBadRequest, "room code is required")
+		return
+	}
+	if !supportsStreaming(w) {
+		writeError(w, http.StatusInternalServerError, "streaming is not supported")
+		return
+	}
+
+	controller := http.NewResponseController(w)
+	if err := controller.SetWriteDeadline(time.Time{}); err != nil {
+		writeError(w, http.StatusInternalServerError, "streaming is not supported")
+		return
+	}
+
+	initial, changes, unsubscribe, err := rt.store.Subscribe(code)
+	if errors.Is(err, room.ErrRoomNotFound) {
+		writeError(w, http.StatusNotFound, "room not found")
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal server error")
+		return
+	}
+	defer unsubscribe()
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	if err := writeRoomEvent(w, controller, initial); err != nil {
+		return
+	}
+
+	lastRevision := initial.Revision
+	heartbeat := time.NewTicker(heartbeatInterval)
+	defer heartbeat.Stop()
+
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		case <-changes:
+			snapshot, err := rt.store.Snapshot(code)
+			if err != nil || snapshot.Revision <= lastRevision {
+				continue
+			}
+			if err := writeRoomEvent(w, controller, snapshot); err != nil {
+				return
+			}
+			lastRevision = snapshot.Revision
+		case <-heartbeat.C:
+			if _, err := io.WriteString(w, ": heartbeat\n\n"); err != nil {
+				return
+			}
+			if err := controller.Flush(); err != nil {
+				return
+			}
+		}
+	}
+}
+
+func publicRoomState(code string, state room.State) stateResponse {
 	response := stateResponse{
 		RoomCode: code,
 		Ready:    state.Ready,
@@ -211,8 +281,7 @@ func (rt *router) roomState(w http.ResponseWriter, r *http.Request) {
 			response.Moves[i] = stateMove{Role: playerRole(i), Move: move.Move}
 		}
 	}
-
-	writeJSON(w, http.StatusOK, response)
+	return response
 }
 
 func (rt *router) startNextRound(w http.ResponseWriter, r *http.Request) {
@@ -312,6 +381,33 @@ func playerRole(index int) string {
 		return "host"
 	}
 	return "guest"
+}
+
+func supportsStreaming(w http.ResponseWriter) bool {
+	for {
+		if _, ok := w.(interface{ FlushError() error }); ok {
+			return true
+		}
+		if _, ok := w.(http.Flusher); ok {
+			return true
+		}
+		unwrapper, ok := w.(interface{ Unwrap() http.ResponseWriter })
+		if !ok {
+			return false
+		}
+		w = unwrapper.Unwrap()
+	}
+}
+
+func writeRoomEvent(w io.Writer, controller *http.ResponseController, snapshot room.Snapshot) error {
+	data, err := json.Marshal(publicRoomState(snapshot.State.Code, snapshot.State))
+	if err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintf(w, "id: %d\ndata: %s\n\n", snapshot.Revision, data); err != nil {
+		return err
+	}
+	return controller.Flush()
 }
 
 func writeError(w http.ResponseWriter, status int, message string) {

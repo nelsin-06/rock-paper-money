@@ -4,10 +4,85 @@ import (
 	"errors"
 	"sync"
 	"testing"
+	"time"
 
 	"example.com/rock-paper-money/internal/game"
 	"example.com/rock-paper-money/internal/room"
 )
+
+func TestStoreSubscriptionsReportSuccessfulRoomChanges(t *testing.T) {
+	store := newStoreWithRoom(t)
+	initial, changes, unsubscribe, err := store.Subscribe("ABCD")
+	if err != nil {
+		t.Fatalf("Subscribe() error = %v", err)
+	}
+	defer unsubscribe()
+	if initial.Revision != 1 || len(initial.State.Players) != 1 {
+		t.Fatalf("initial snapshot = %#v, want revision 1 with host", initial)
+	}
+
+	if err := store.Join("ABCD", "guest"); err != nil {
+		t.Fatalf("Join() error = %v", err)
+	}
+	select {
+	case <-changes:
+	case <-time.After(time.Second):
+		t.Fatal("successful Join() did not notify subscriber")
+	}
+
+	updated, err := store.Snapshot("ABCD")
+	if err != nil {
+		t.Fatalf("Snapshot() error = %v", err)
+	}
+	if updated.Revision != 2 || !updated.State.Ready {
+		t.Errorf("updated snapshot = %#v, want revision 2 ready room", updated)
+	}
+
+	if err := store.Join("ABCD", "third"); !errors.Is(err, room.ErrRoomFull) {
+		t.Fatalf("Join(third) error = %v, want %v", err, room.ErrRoomFull)
+	}
+	select {
+	case <-changes:
+		t.Fatal("failed mutation notified subscriber")
+	case <-time.After(20 * time.Millisecond):
+	}
+}
+
+func TestStoreSubscriptionsCoalesceAndUnsubscribeSafely(t *testing.T) {
+	store := readyStore(t)
+	_, changes, unsubscribe, err := store.Subscribe("ABCD")
+	if err != nil {
+		t.Fatalf("Subscribe() error = %v", err)
+	}
+
+	if err := store.SubmitMove("ABCD", "host", game.Rock); err != nil {
+		t.Fatalf("host SubmitMove() error = %v", err)
+	}
+	if err := store.SubmitMove("ABCD", "guest", game.Scissors); err != nil {
+		t.Fatalf("guest SubmitMove() error = %v", err)
+	}
+	select {
+	case <-changes:
+	case <-time.After(time.Second):
+		t.Fatal("room changes were not reported")
+	}
+	select {
+	case <-changes:
+		t.Fatal("notifications were not coalesced for a slow subscriber")
+	default:
+	}
+
+	unsubscribe()
+	unsubscribe()
+	if err := store.StartNextRound("ABCD"); err != nil {
+		t.Fatalf("StartNextRound() error = %v", err)
+	}
+	select {
+	case <-changes:
+		t.Fatal("unsubscribed listener received a notification")
+	case <-time.After(20 * time.Millisecond):
+	}
+}
 
 func TestStoreCreateAndFindState(t *testing.T) {
 	store := room.NewStore()

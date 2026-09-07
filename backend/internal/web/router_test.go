@@ -1,15 +1,107 @@
 package web
 
 import (
+	"bufio"
 	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"example.com/rock-paper-money/internal/room"
 )
+
+func TestRoomEventsStreamsCurrentAndChangedPublicState(t *testing.T) {
+	store := room.NewStore()
+	if _, err := store.Create("ABC234", "host-secret-token"); err != nil {
+		t.Fatalf("create room: %v", err)
+	}
+
+	server := httptest.NewUnstartedServer(NewRouter(store))
+	server.Config.WriteTimeout = 25 * time.Millisecond
+	server.Start()
+	defer server.Close()
+
+	request, err := http.NewRequest(http.MethodGet, server.URL+"/api/rooms/ABC234/events", nil)
+	if err != nil {
+		t.Fatalf("create events request: %v", err)
+	}
+	response, err := server.Client().Do(request)
+	if err != nil {
+		t.Fatalf("connect to room events: %v", err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("events status = %d, want %d", response.StatusCode, http.StatusOK)
+	}
+	if contentType := response.Header.Get("Content-Type"); contentType != "text/event-stream" {
+		t.Fatalf("Content-Type = %q, want %q", contentType, "text/event-stream")
+	}
+
+	reader := bufio.NewReader(response.Body)
+	initialID, initialBody := readRoomEvent(t, reader)
+	if initialID != "1" {
+		t.Errorf("initial event ID = %q, want 1", initialID)
+	}
+	assertPublicStateDoesNotExposeTokens(t, initialBody, "host-secret-token")
+	initial := decodeStateJSON(t, initialBody)
+	if initial.Ready || len(initial.Players) != 1 {
+		t.Errorf("initial state = %#v, want waiting room", initial)
+	}
+
+	// Prove the endpoint clears its own deadline rather than relying on a zero
+	// server-wide WriteTimeout.
+	time.Sleep(50 * time.Millisecond)
+	if err := store.Join("ABC234", "guest-secret-token"); err != nil {
+		t.Fatalf("join room: %v", err)
+	}
+	changedID, changedBody := readRoomEvent(t, reader)
+	if changedID != "2" {
+		t.Errorf("changed event ID = %q, want 2", changedID)
+	}
+	assertPublicStateDoesNotExposeTokens(t, changedBody, "host-secret-token", "guest-secret-token")
+	changed := decodeStateJSON(t, changedBody)
+	if !changed.Ready || len(changed.Players) != 2 {
+		t.Errorf("changed state = %#v, want ready room", changed)
+	}
+
+	if err := store.SubmitMove("ABC234", "host-secret-token", "rock"); err != nil {
+		t.Fatalf("submit host move: %v", err)
+	}
+	moveID, moveBody := readRoomEvent(t, reader)
+	if moveID != "3" {
+		t.Errorf("move event ID = %q, want 3", moveID)
+	}
+	assertPublicStateDoesNotExposeTokens(t, moveBody, "host-secret-token", "guest-secret-token")
+	assertRoundOutcomeOmitted(t, moveBody)
+	if strings.Contains(moveBody, "rock") {
+		t.Errorf("unresolved SSE state exposed submitted move: %s", moveBody)
+	}
+
+	if err := store.SubmitMove("ABC234", "guest-secret-token", "scissors"); err != nil {
+		t.Fatalf("submit guest move: %v", err)
+	}
+	resolvedID, resolvedBody := readRoomEvent(t, reader)
+	if resolvedID != "4" {
+		t.Errorf("resolved event ID = %q, want 4", resolvedID)
+	}
+	resolved := decodeStateJSON(t, resolvedBody)
+	if !resolved.Resolved || len(resolved.Moves) != 2 {
+		t.Errorf("resolved SSE state = %#v, want complete resolved round", resolved)
+	}
+}
+
+func TestRoomEventsRejectsUnsupportedStreamingBeforeStartingStream(t *testing.T) {
+	store := room.NewStore()
+	if _, err := store.Create("ABC234", "host-token"); err != nil {
+		t.Fatalf("create room: %v", err)
+	}
+
+	response := performRequest(t, NewRouter(store), http.MethodGet, "/api/rooms/ABC234/events")
+	assertJSONError(t, response, http.StatusInternalServerError, "streaming is not supported")
+}
 
 func TestHealth(t *testing.T) {
 	request := httptest.NewRequest(http.MethodGet, "/api/health", nil)
@@ -491,6 +583,57 @@ func decodeState(t *testing.T, response *httptest.ResponseRecorder) stateRespons
 		t.Fatalf("decode state response: %v", err)
 	}
 	return state
+}
+
+func decodeStateJSON(t *testing.T, body string) stateResponse {
+	t.Helper()
+	var state stateResponse
+	if err := json.Unmarshal([]byte(body), &state); err != nil {
+		t.Fatalf("decode state JSON: %v", err)
+	}
+	return state
+}
+
+func readRoomEvent(t *testing.T, reader *bufio.Reader) (string, string) {
+	t.Helper()
+	type result struct {
+		id   string
+		data string
+		err  error
+	}
+	resultChannel := make(chan result, 1)
+	go func() {
+		var event result
+		for {
+			line, err := reader.ReadString('\n')
+			if err != nil {
+				event.err = err
+				resultChannel <- event
+				return
+			}
+			line = strings.TrimSuffix(line, "\n")
+			switch {
+			case line == "":
+				resultChannel <- event
+				return
+			case strings.HasPrefix(line, "id: "):
+				event.id = strings.TrimPrefix(line, "id: ")
+			case strings.HasPrefix(line, "data: "):
+				event.data = strings.TrimPrefix(line, "data: ")
+			}
+		}
+	}()
+
+	select {
+	case event := <-resultChannel:
+		if event.err != nil {
+			t.Fatalf("read SSE event: %v", event.err)
+		}
+		return event.id, event.data
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for SSE event")
+		return "", ""
+	}
 }
 
 func assertStatePlayers(t *testing.T, state stateResponse, ready, resolved bool, hostWins, guestWins int, hostSubmitted, guestSubmitted bool) {

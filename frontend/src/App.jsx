@@ -123,7 +123,8 @@ function Room({ session, onLeave }) {
   const [error, setError] = useState('')
   const [action, setAction] = useState(null)
   const [movePending, setMovePending] = useState(false)
-  const refreshRef = useRef(() => {})
+  const [connectionAttempt, setConnectionAttempt] = useState(0)
+  const [connectionError, setConnectionError] = useState('')
   const actionLockRef = useRef(false)
   const mountedRef = useRef(true)
 
@@ -136,44 +137,31 @@ function Room({ session, onLeave }) {
 
   useEffect(() => {
     let active = true
-    let timer
-    let controller
 
-    async function poll(showLoading = false) {
-      if (showLoading) setLoading(true)
-      const pollController = new AbortController()
-      controller = pollController
-      try {
-        const nextState = await api.getRoomState(session.roomCode, { signal: pollController.signal })
+    const close = api.subscribeToRoom(session.roomCode, {
+      onOpen: () => {
+        if (active) setConnectionError('')
+      },
+      onState: (nextState) => {
         if (!active) return
         setState(nextState)
         const serverPlayer = nextState.players.find((player) => player.role === session.role)
         if (serverPlayer?.submitted) setMovePending(false)
-        setError('')
+        setConnectionError('')
         setLoading(false)
-      } catch (requestError) {
-        if (!active || pollController.signal.aborted) return
-        setError(displayError(requestError))
+      },
+      onError: (streamError) => {
+        if (!active) return
+        setConnectionError(displayError(streamError))
         setLoading(false)
-      } finally {
-        if (active && controller === pollController) timer = window.setTimeout(poll, 1000)
-      }
-    }
-
-    refreshRef.current = () => {
-      window.clearTimeout(timer)
-      controller?.abort()
-      poll()
-    }
-    poll(true)
+      },
+    })
 
     return () => {
       active = false
-      window.clearTimeout(timer)
-      controller?.abort()
-      refreshRef.current = () => {}
+      close()
     }
-  }, [session.roomCode, session.playerToken, session.role])
+  }, [session.roomCode, session.role, connectionAttempt])
 
   async function performAction(name, request) {
     if (actionLockRef.current) return
@@ -183,7 +171,6 @@ function Room({ session, onLeave }) {
     setError('')
     try {
       await request()
-      refreshRef.current()
     } catch (requestError) {
       if (mountedRef.current) {
         if (name === 'move') setMovePending(false)
@@ -198,6 +185,12 @@ function Room({ session, onLeave }) {
   const currentPlayer = state?.players.find((player) => player.role === session.role)
   const hasSubmitted = (currentPlayer?.submitted ?? false) || movePending
 
+  function retryConnection() {
+    setLoading(true)
+    setConnectionError('')
+    setConnectionAttempt((attempt) => attempt + 1)
+  }
+
   return (
     <main className="page room-page">
       <header className="room-header">
@@ -211,10 +204,10 @@ function Room({ session, onLeave }) {
 
       <Scoreboard players={state?.players} role={session.role} />
 
-      {error && (
+      {(error || connectionError) && (
         <div className="notice notice-error" role="alert">
-          <span>{error}</span>
-          <button onClick={() => refreshRef.current()}>Retry</button>
+          <span>{error || connectionError}</span>
+          {connectionError && <button onClick={retryConnection}>Retry</button>}
         </div>
       )}
 

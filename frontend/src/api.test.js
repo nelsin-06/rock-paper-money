@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { ApiError, createRoom, getRoomState, submitMove } from './api.js'
+import { ApiError, createRoom, getRoomState, submitMove, subscribeToRoom } from './api.js'
 
 function response(body, { status = 200 } = {}) {
   return new Response(body === null ? null : JSON.stringify(body), {
@@ -47,4 +47,42 @@ describe('API client', () => {
       body: '{"move":"paper"}',
     }))
   })
+
+  it('subscribes to public room events, maps snapshots, and closes cleanly', () => {
+    class FakeEventSource {
+      constructor(url) {
+        this.url = url
+        this.close = vi.fn()
+        FakeEventSource.instance = this
+      }
+    }
+    vi.stubGlobal('EventSource', FakeEventSource)
+    const onState = vi.fn()
+    const onError = vi.fn()
+
+    const close = subscribeToRoom('ABC234', { onState, onError })
+    expect(FakeEventSource.instance.url).toBe('/api/rooms/ABC234/events')
+    expect(FakeEventSource.instance.url).not.toContain('token')
+
+    FakeEventSource.instance.onmessage({ data: JSON.stringify({
+      room_code: 'ABC234', ready: false, resolved: false,
+      players: [{ role: 'host', wins: 0, submitted: false }],
+    }) })
+    expect(onState).toHaveBeenCalledWith(waitingFrontendState())
+
+    FakeEventSource.instance.onmessage({ data: 'not JSON' })
+    expect(onError).toHaveBeenCalledWith(expect.objectContaining({
+      message: 'The game server returned an invalid room update.',
+    }))
+
+    close()
+    expect(FakeEventSource.instance.close).toHaveBeenCalledOnce()
+  })
 })
+
+function waitingFrontendState() {
+  return {
+    roomCode: 'ABC234', ready: false, resolved: false,
+    players: [{ role: 'host', wins: 0, submitted: false }], result: null, moves: [],
+  }
+}

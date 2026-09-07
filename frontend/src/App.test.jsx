@@ -21,19 +21,32 @@ const readyState = {
   ], result: null, moves: [],
 }
 
+let activeStream
+let closeStream
+
+function streamRoomState(initialState) {
+  api.subscribeToRoom.mockImplementation((_code, handlers) => {
+    activeStream = handlers
+    closeStream = vi.fn()
+    handlers.onOpen()
+    handlers.onState(initialState)
+    return closeStream
+  })
+}
+
 describe('core room flow', () => {
   beforeEach(() => {
     localStorage.clear()
     api.createRoom.mockReset()
     api.joinRoom.mockReset()
-    api.getRoomState.mockReset()
+    api.subscribeToRoom.mockReset()
     api.submitMove.mockReset()
     api.startNextRound.mockReset()
   })
 
   it('shows home and creates a room while persisting private credentials', async () => {
     api.createRoom.mockResolvedValue(hostSession)
-    api.getRoomState.mockResolvedValue(waitingState)
+    streamRoomState(waitingState)
     render(<App />)
 
     expect(screen.getByRole('heading', { name: /rock.*paper.*money/i })).toBeInTheDocument()
@@ -47,7 +60,7 @@ describe('core room flow', () => {
 
   it('joins using a normalized six-character code', async () => {
     api.joinRoom.mockResolvedValue({ ...hostSession, role: 'guest' })
-    api.getRoomState.mockResolvedValue(readyState)
+    streamRoomState(readyState)
     render(<App />)
 
     await userEvent.type(screen.getByLabelText(/six-character room code/i), 'abc234')
@@ -59,7 +72,7 @@ describe('core room flow', () => {
 
   it('locks same-tick duplicate create attempts', async () => {
     api.createRoom.mockResolvedValue(hostSession)
-    api.getRoomState.mockResolvedValue(waitingState)
+    streamRoomState(waitingState)
     render(<App />)
 
     const create = screen.getByRole('button', { name: 'Create room' })
@@ -74,7 +87,7 @@ describe('core room flow', () => {
 
   it('locks same-tick duplicate join attempts', async () => {
     api.joinRoom.mockResolvedValue({ ...hostSession, role: 'guest' })
-    api.getRoomState.mockResolvedValue(readyState)
+    streamRoomState(readyState)
     render(<App />)
     fireEvent.change(screen.getByLabelText(/six-character room code/i), { target: { value: 'ABC234' } })
 
@@ -90,7 +103,7 @@ describe('core room flow', () => {
 
   it('releases the home entry lock after failure so create can be retried', async () => {
     api.createRoom.mockRejectedValueOnce(new Error('Create failed')).mockResolvedValue(hostSession)
-    api.getRoomState.mockResolvedValue(waitingState)
+    streamRoomState(waitingState)
     render(<App />)
 
     await userEvent.click(screen.getByRole('button', { name: 'Create room' }))
@@ -103,7 +116,7 @@ describe('core room flow', () => {
 
   it('restores a room, submits only one move, and hides choices before resolution', async () => {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(hostSession))
-    api.getRoomState.mockResolvedValue(readyState)
+    streamRoomState(readyState)
     api.submitMove.mockResolvedValue()
     render(<App />)
 
@@ -119,7 +132,7 @@ describe('core room flow', () => {
 
   it('recovers visible action state after a StrictMode move failure', async () => {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(hostSession))
-    api.getRoomState.mockResolvedValue(readyState)
+    streamRoomState(readyState)
     api.submitMove.mockRejectedValue(new Error('Move failed'))
     render(<StrictMode><App /></StrictMode>)
 
@@ -137,7 +150,7 @@ describe('core room flow', () => {
       ...readyState,
       players: [{ role: 'host', wins: 0, submitted: true }, { role: 'guest', wins: 0, submitted: false }],
     }
-    api.getRoomState.mockResolvedValue(submitted)
+    streamRoomState(submitted)
     render(<App />)
 
     expect(await screen.findByRole('heading', { name: 'Move submitted' })).toBeInTheDocument()
@@ -156,7 +169,7 @@ describe('core room flow', () => {
       ...readyState,
       players: [{ role: 'host', wins: 1, submitted: false }, { role: 'guest', wins: 0, submitted: false }],
     }
-    api.getRoomState.mockResolvedValueOnce(resolved).mockResolvedValue(nextRound)
+    streamRoomState(resolved)
     api.startNextRound.mockResolvedValue()
     render(<App />)
 
@@ -167,6 +180,7 @@ describe('core room flow', () => {
 
     await userEvent.click(screen.getByRole('button', { name: 'Next round' }))
     expect(api.startNextRound).toHaveBeenCalledWith('ABC234', 'host-secret')
+    act(() => activeStream.onState(nextRound))
     expect(await screen.findByRole('heading', { name: 'Choose your move' })).toBeInTheDocument()
     expect(screen.getByLabelText('host score')).toHaveTextContent('1')
 
@@ -174,16 +188,30 @@ describe('core room flow', () => {
     await userEvent.click(screen.getByRole('button', { name: 'Leave room' }))
     expect(screen.getByRole('button', { name: 'Create room' })).toBeInTheDocument()
     expect(localStorage.getItem(STORAGE_KEY)).toBeNull()
+    expect(closeStream).toHaveBeenCalledOnce()
   })
 
-  it('keeps credentials and offers retry after a polling failure', async () => {
+  it('keeps credentials and replaces the EventSource when live updates are retried', async () => {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(hostSession))
-    api.getRoomState.mockRejectedValueOnce(new Error('Network unavailable')).mockResolvedValue(waitingState)
+    const firstClose = vi.fn()
+    const secondClose = vi.fn()
+    api.subscribeToRoom
+      .mockImplementationOnce((_code, handlers) => {
+        handlers.onError(new Error('Network unavailable'))
+        return firstClose
+      })
+      .mockImplementationOnce((_code, handlers) => {
+        handlers.onOpen()
+        handlers.onState(waitingState)
+        return secondClose
+      })
     render(<App />)
 
     expect(await screen.findByRole('alert')).toHaveTextContent('Network unavailable')
     expect(localStorage.getItem(STORAGE_KEY)).not.toBeNull()
     await userEvent.click(screen.getByRole('button', { name: 'Retry' }))
     expect(await screen.findByRole('heading', { name: /waiting for a guest/i })).toBeInTheDocument()
+    expect(firstClose).toHaveBeenCalledOnce()
+    expect(api.subscribeToRoom).toHaveBeenCalledTimes(2)
   })
 })

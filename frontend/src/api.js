@@ -79,6 +79,22 @@ export async function getRoomState(code, { signal } = {}) {
   return mapRoomState(dto)
 }
 
+export function subscribeToRoom(code, { onState, onOpen, onError }) {
+  const source = new EventSource(`/api/rooms/${encodeURIComponent(code)}/events`)
+  source.onopen = () => onOpen?.()
+  source.onmessage = (event) => {
+    try {
+      onState(mapRoomState(JSON.parse(event.data)))
+    } catch {
+      onError?.(new ApiError('The game server returned an invalid room update.'))
+    }
+  }
+  source.onerror = () => {
+    onError?.(new ApiError('Live room updates disconnected. Reconnecting…'))
+  }
+  return () => source.close()
+}
+
 export async function submitMove(code, token, move, { signal } = {}) {
   await request(`/api/rooms/${encodeURIComponent(code)}/moves`, {
     method: 'POST',
