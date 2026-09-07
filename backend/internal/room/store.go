@@ -128,7 +128,7 @@ func (s *Store) SubmitMove(code, playerID string, move game.Move) error {
 	return nil
 }
 
-func (s *Store) StartNextRound(code string) error {
+func (s *Store) RequestNextRound(code, playerID string, round uint64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -136,7 +136,22 @@ func (s *Store) StartNextRound(code string) error {
 	if err != nil {
 		return err
 	}
-	if err := found.room.StartNextRound(); err != nil {
+	if err := found.room.RequestNextRound(playerID, round); err != nil {
+		return err
+	}
+	s.notify(found)
+	return nil
+}
+
+func (s *Store) Leave(code, playerID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	found, err := s.room(code)
+	if err != nil {
+		return err
+	}
+	if err := found.room.Leave(playerID); err != nil {
 		return err
 	}
 	s.notify(found)

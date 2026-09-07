@@ -184,10 +184,10 @@ func TestResolutionAwardsOnlyTheWinner(t *testing.T) {
 	}
 }
 
-func TestStartNextRoundRequiresResolutionAndPreservesScores(t *testing.T) {
+func TestNextRoundStartsOnlyAfterBothPlayersRequestIt(t *testing.T) {
 	r := readyRoom(t)
-	if err := r.StartNextRound(); !errors.Is(err, room.ErrRoundNotResolved) {
-		t.Errorf("StartNextRound() before resolution error = %v, want %v", err, room.ErrRoundNotResolved)
+	if err := r.RequestNextRound("host", 1); !errors.Is(err, room.ErrRoundNotResolved) {
+		t.Errorf("RequestNextRound() before resolution error = %v, want %v", err, room.ErrRoundNotResolved)
 	}
 
 	if err := r.SubmitMove("host", game.Rock); err != nil {
@@ -196,12 +196,23 @@ func TestStartNextRoundRequiresResolutionAndPreservesScores(t *testing.T) {
 	if err := r.SubmitMove("guest", game.Scissors); err != nil {
 		t.Fatalf("guest SubmitMove() error = %v", err)
 	}
-	if err := r.StartNextRound(); err != nil {
-		t.Fatalf("StartNextRound() error = %v", err)
+	if err := r.RequestNextRound("guest", 1); err != nil {
+		t.Fatalf("guest RequestNextRound() error = %v", err)
+	}
+
+	waiting := r.State()
+	if !waiting.Resolved || !waiting.Players[1].WantsNextRound || waiting.Players[0].WantsNextRound {
+		t.Fatalf("state after first request = %#v, want resolved round with only guest requesting", waiting)
+	}
+	if err := r.RequestNextRound("guest", 1); !errors.Is(err, room.ErrNextRoundRequested) {
+		t.Errorf("duplicate RequestNextRound() error = %v, want %v", err, room.ErrNextRoundRequested)
+	}
+	if err := r.RequestNextRound("host", 1); err != nil {
+		t.Fatalf("host RequestNextRound() error = %v", err)
 	}
 
 	state := r.State()
-	if !state.Ready || state.Resolved || len(state.Moves) != 0 || state.Result != "" {
+	if !state.Ready || state.Resolved || state.Round != 2 || len(state.Moves) != 0 || state.Result != "" {
 		t.Errorf("next round state = %#v, want ready room with cleared round data", state)
 	}
 	if state.Players[0].Submitted || state.Players[1].Submitted {
@@ -216,6 +227,26 @@ func TestStartNextRoundRequiresResolutionAndPreservesScores(t *testing.T) {
 		t.Fatalf("second-round guest SubmitMove() error = %v", err)
 	}
 	assertWins(t, r.State(), 1, 1)
+
+	if err := r.RequestNextRound("host", 1); !errors.Is(err, room.ErrStaleRound) {
+		t.Errorf("stale RequestNextRound() error = %v, want %v", err, room.ErrStaleRound)
+	}
+}
+
+func TestLeaveClosesRoomForBothPlayers(t *testing.T) {
+	r := readyRoom(t)
+	if err := r.Leave("guest"); err != nil {
+		t.Fatalf("Leave() error = %v", err)
+	}
+	if !r.State().Closed {
+		t.Fatal("State().Closed = false, want true")
+	}
+	if err := r.SubmitMove("host", game.Rock); !errors.Is(err, room.ErrRoomClosed) {
+		t.Errorf("SubmitMove() after leave error = %v, want %v", err, room.ErrRoomClosed)
+	}
+	if err := r.Leave("host"); !errors.Is(err, room.ErrRoomClosed) {
+		t.Errorf("second Leave() error = %v, want %v", err, room.ErrRoomClosed)
+	}
 }
 
 func TestStateIsDetachedFromRoom(t *testing.T) {

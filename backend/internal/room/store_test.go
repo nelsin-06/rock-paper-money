@@ -74,8 +74,8 @@ func TestStoreSubscriptionsCoalesceAndUnsubscribeSafely(t *testing.T) {
 
 	unsubscribe()
 	unsubscribe()
-	if err := store.StartNextRound("ABCD"); err != nil {
-		t.Fatalf("StartNextRound() error = %v", err)
+	if err := store.RequestNextRound("ABCD", "host", 1); err != nil {
+		t.Fatalf("RequestNextRound() error = %v", err)
 	}
 	select {
 	case <-changes:
@@ -155,7 +155,8 @@ func TestStoreReturnsNotFoundForEveryRoomOperation(t *testing.T) {
 		},
 		{name: "join", call: func() error { return store.Join("NONE", "guest") }},
 		{name: "submit move", call: func() error { return store.SubmitMove("NONE", "host", game.Rock) }},
-		{name: "start next round", call: func() error { return store.StartNextRound("NONE") }},
+		{name: "request next round", call: func() error { return store.RequestNextRound("NONE", "host", 1) }},
+		{name: "leave", call: func() error { return store.Leave("NONE", "host") }},
 	}
 
 	for _, test := range tests {
@@ -191,8 +192,8 @@ func TestStoreDelegatesRoomInvariants(t *testing.T) {
 	if err := store.SubmitMove("ABCD", "host", game.Move("lizard")); !errors.Is(err, room.ErrInvalidMove) {
 		t.Errorf("SubmitMove(invalid) error = %v, want %v", err, room.ErrInvalidMove)
 	}
-	if err := store.StartNextRound("ABCD"); !errors.Is(err, room.ErrRoundNotResolved) {
-		t.Errorf("StartNextRound() error = %v, want %v", err, room.ErrRoundNotResolved)
+	if err := store.RequestNextRound("ABCD", "host", 1); !errors.Is(err, room.ErrRoundNotResolved) {
+		t.Errorf("RequestNextRound() error = %v, want %v", err, room.ErrRoundNotResolved)
 	}
 
 	if err := store.SubmitMove("ABCD", "host", game.Rock); err != nil {
@@ -204,8 +205,11 @@ func TestStoreDelegatesRoomInvariants(t *testing.T) {
 	if err := store.SubmitMove("ABCD", "guest", game.Scissors); err != nil {
 		t.Fatalf("guest SubmitMove() error = %v", err)
 	}
-	if err := store.StartNextRound("ABCD"); err != nil {
-		t.Fatalf("StartNextRound() after resolution error = %v", err)
+	if err := store.RequestNextRound("ABCD", "host", 1); err != nil {
+		t.Fatalf("host RequestNextRound() error = %v", err)
+	}
+	if err := store.RequestNextRound("ABCD", "guest", 1); err != nil {
+		t.Fatalf("guest RequestNextRound() error = %v", err)
 	}
 
 	state, err := store.State("ABCD")

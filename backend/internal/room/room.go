@@ -8,21 +8,25 @@ import (
 )
 
 var (
-	ErrEmptyCode        = errors.New("room code is required")
-	ErrMissingPlayerID  = errors.New("player ID is required")
-	ErrDuplicatePlayer  = errors.New("player already joined")
-	ErrRoomFull         = errors.New("room already has two players")
-	ErrUnknownPlayer    = errors.New("player is not in the room")
-	ErrRoomNotReady     = errors.New("room needs a second player")
-	ErrDuplicateMove    = errors.New("player already submitted a move")
-	ErrInvalidMove      = errors.New("move is invalid")
-	ErrRoundNotResolved = errors.New("round is not resolved")
+	ErrEmptyCode          = errors.New("room code is required")
+	ErrMissingPlayerID    = errors.New("player ID is required")
+	ErrDuplicatePlayer    = errors.New("player already joined")
+	ErrRoomFull           = errors.New("room already has two players")
+	ErrUnknownPlayer      = errors.New("player is not in the room")
+	ErrRoomNotReady       = errors.New("room needs a second player")
+	ErrDuplicateMove      = errors.New("player already submitted a move")
+	ErrInvalidMove        = errors.New("move is invalid")
+	ErrRoundNotResolved   = errors.New("round is not resolved")
+	ErrNextRoundRequested = errors.New("player already requested another round")
+	ErrStaleRound         = errors.New("round request is stale")
+	ErrRoomClosed         = errors.New("room is closed")
 )
 
 type Player struct {
-	ID        string
-	Wins      int
-	Submitted bool
+	ID             string
+	Wins           int
+	Submitted      bool
+	WantsNextRound bool
 }
 
 type player struct {
@@ -41,16 +45,21 @@ type State struct {
 	Players  []Player
 	Ready    bool
 	Resolved bool
+	Round    uint64
+	Closed   bool
 	Moves    []PlayerMove
 	Result   game.Result
 }
 
 type Room struct {
-	code     string
-	players  []player
-	moves    map[string]game.Move
-	resolved bool
-	result   game.Result
+	code              string
+	players           []player
+	moves             map[string]game.Move
+	resolved          bool
+	result            game.Result
+	round             uint64
+	nextRoundRequests map[string]bool
+	closed            bool
 }
 
 func New(code, hostPlayerID string) (*Room, error) {
@@ -62,13 +71,18 @@ func New(code, hostPlayerID string) (*Room, error) {
 	}
 
 	return &Room{
-		code:    code,
-		players: []player{{id: hostPlayerID}},
-		moves:   make(map[string]game.Move, 2),
+		code:              code,
+		players:           []player{{id: hostPlayerID}},
+		moves:             make(map[string]game.Move, 2),
+		round:             1,
+		nextRoundRequests: make(map[string]bool, 2),
 	}, nil
 }
 
 func (r *Room) Join(playerID string) error {
+	if r.closed {
+		return ErrRoomClosed
+	}
 	if playerID == "" {
 		return ErrMissingPlayerID
 	}
@@ -84,6 +98,9 @@ func (r *Room) Join(playerID string) error {
 }
 
 func (r *Room) SubmitMove(playerID string, move game.Move) error {
+	if r.closed {
+		return ErrRoomClosed
+	}
 	if !r.hasPlayer(playerID) {
 		return ErrUnknownPlayer
 	}
@@ -105,14 +122,44 @@ func (r *Room) SubmitMove(playerID string, move game.Move) error {
 	return nil
 }
 
-func (r *Room) StartNextRound() error {
+func (r *Room) RequestNextRound(playerID string, round uint64) error {
+	if r.closed {
+		return ErrRoomClosed
+	}
+	if !r.hasPlayer(playerID) {
+		return ErrUnknownPlayer
+	}
 	if !r.resolved {
 		return ErrRoundNotResolved
+	}
+	if round != r.round {
+		return ErrStaleRound
+	}
+	if r.nextRoundRequests[playerID] {
+		return ErrNextRoundRequested
+	}
+
+	r.nextRoundRequests[playerID] = true
+	if len(r.nextRoundRequests) < len(r.players) {
+		return nil
 	}
 
 	r.moves = make(map[string]game.Move, 2)
 	r.resolved = false
 	r.result = ""
+	r.round++
+	r.nextRoundRequests = make(map[string]bool, 2)
+	return nil
+}
+
+func (r *Room) Leave(playerID string) error {
+	if r.closed {
+		return ErrRoomClosed
+	}
+	if !r.hasPlayer(playerID) {
+		return ErrUnknownPlayer
+	}
+	r.closed = true
 	return nil
 }
 
@@ -120,7 +167,12 @@ func (r *Room) State() State {
 	players := make([]Player, len(r.players))
 	for i, player := range r.players {
 		_, submitted := r.moves[player.id]
-		players[i] = Player{ID: player.id, Wins: player.wins, Submitted: submitted}
+		players[i] = Player{
+			ID:             player.id,
+			Wins:           player.wins,
+			Submitted:      submitted,
+			WantsNextRound: r.nextRoundRequests[player.id],
+		}
 	}
 
 	state := State{
@@ -128,6 +180,8 @@ func (r *Room) State() State {
 		Players:  players,
 		Ready:    len(r.players) == 2,
 		Resolved: r.resolved,
+		Round:    r.round,
+		Closed:   r.closed,
 	}
 
 	if !r.resolved {

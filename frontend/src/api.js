@@ -48,10 +48,13 @@ function mapRoomState(dto) {
     roomCode: dto.room_code,
     ready: dto.ready,
     resolved: dto.resolved,
+    round: dto.round,
+    closed: dto.closed,
     players: dto.players.map((player) => ({
       role: player.role,
       wins: player.wins,
       submitted: player.submitted,
+      wantsNextRound: player.wants_next_round,
     })),
     result: dto.result ?? null,
     moves: (dto.moves ?? []).map((move) => ({ role: move.role, move: move.move })),
@@ -104,8 +107,17 @@ export async function submitMove(code, token, move, { signal } = {}) {
   })
 }
 
-export async function startNextRound(code, token, { signal } = {}) {
+export async function startNextRound(code, token, round, { signal } = {}) {
   await request(`/api/rooms/${encodeURIComponent(code)}/next-round`, {
+    method: 'POST',
+    headers: { ...bearer(token), 'Content-Type': 'application/json' },
+    body: JSON.stringify({ round }),
+    signal,
+  })
+}
+
+export async function leaveRoom(code, token, { signal } = {}) {
+  await request(`/api/rooms/${encodeURIComponent(code)}/leave`, {
     method: 'POST',
     headers: bearer(token),
     signal,

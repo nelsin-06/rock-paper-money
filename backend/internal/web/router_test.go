@@ -91,6 +91,30 @@ func TestRoomEventsStreamsCurrentAndChangedPublicState(t *testing.T) {
 	if !resolved.Resolved || len(resolved.Moves) != 2 {
 		t.Errorf("resolved SSE state = %#v, want complete resolved round", resolved)
 	}
+
+	if err := store.RequestNextRound("ABC234", "guest-secret-token", 1); err != nil {
+		t.Fatalf("request next round: %v", err)
+	}
+	requestID, requestBody := readRoomEvent(t, reader)
+	if requestID != "5" {
+		t.Errorf("next-round request event ID = %q, want 5", requestID)
+	}
+	requested := decodeStateJSON(t, requestBody)
+	if !requested.Resolved || !requested.Players[1].WantsNextRound || requested.Players[0].WantsNextRound {
+		t.Errorf("next-round request SSE state = %#v, want only guest requesting", requested)
+	}
+
+	if err := store.Leave("ABC234", "host-secret-token"); err != nil {
+		t.Fatalf("leave room: %v", err)
+	}
+	closedID, closedBody := readRoomEvent(t, reader)
+	if closedID != "6" {
+		t.Errorf("closed event ID = %q, want 6", closedID)
+	}
+	assertPublicStateDoesNotExposeTokens(t, closedBody, "host-secret-token", "guest-secret-token")
+	if closed := decodeStateJSON(t, closedBody); !closed.Closed {
+		t.Errorf("closed SSE state = %#v, want closed room", closed)
+	}
 }
 
 func TestRoomEventsRejectsUnsupportedStreamingBeforeStartingStream(t *testing.T) {
@@ -367,8 +391,17 @@ func TestFullMatchAndNextRound(t *testing.T) {
 		}
 	}
 
-	nextRound := performAuthorizedJSONRequest(t, handler, http.MethodPost, "/api/rooms/%20abc234%20/next-round", guest.PlayerToken, "")
+	nextRound := performAuthorizedJSONRequest(t, handler, http.MethodPost, "/api/rooms/%20abc234%20/next-round", guest.PlayerToken, `{"round":1}`)
 	assertNoContent(t, nextRound)
+
+	wantsAnother := performRequest(t, handler, http.MethodGet, "/api/rooms/ABC234/state")
+	state = decodeState(t, wantsAnother)
+	if !state.Resolved || state.Players[0].WantsNextRound || !state.Players[1].WantsNextRound {
+		t.Errorf("state after first next-round request = %#v, want resolved round with guest requesting", state)
+	}
+
+	acceptRound := performAuthorizedJSONRequest(t, handler, http.MethodPost, "/api/rooms/ABC234/next-round", host.PlayerToken, `{"round":1}`)
+	assertNoContent(t, acceptRound)
 
 	reset := performRequest(t, handler, http.MethodGet, "/api/rooms/ABC234/state")
 	assertPublicStateDoesNotExposeTokens(t, reset.Body.String(), host.PlayerToken, guest.PlayerToken)
@@ -378,6 +411,22 @@ func TestFullMatchAndNextRound(t *testing.T) {
 		t.Errorf("next-round state retained round outcome: %#v", state)
 	}
 	assertRoundOutcomeOmitted(t, reset.Body.String())
+
+	secondRoundHostMove := performAuthorizedJSONRequest(t, handler, http.MethodPost, "/api/rooms/ABC234/moves", host.PlayerToken, `{"move":"rock"}`)
+	assertNoContent(t, secondRoundHostMove)
+	secondRoundGuestMove := performAuthorizedJSONRequest(t, handler, http.MethodPost, "/api/rooms/ABC234/moves", guest.PlayerToken, `{"move":"paper"}`)
+	assertNoContent(t, secondRoundGuestMove)
+	stale := performAuthorizedJSONRequest(t, handler, http.MethodPost, "/api/rooms/ABC234/next-round", guest.PlayerToken, `{"round":1}`)
+	assertJSONError(t, stale, http.StatusConflict, "round request is stale")
+
+	left := performAuthorizedJSONRequest(t, handler, http.MethodPost, "/api/rooms/ABC234/leave", guest.PlayerToken, "")
+	assertNoContent(t, left)
+	closed := performRequest(t, handler, http.MethodGet, "/api/rooms/ABC234/state")
+	if state = decodeState(t, closed); !state.Closed {
+		t.Errorf("state after leave = %#v, want closed room", state)
+	}
+	moveAfterLeave := performAuthorizedJSONRequest(t, handler, http.MethodPost, "/api/rooms/ABC234/moves", host.PlayerToken, `{"move":"rock"}`)
+	assertJSONError(t, moveAfterLeave, http.StatusConflict, "room is closed")
 }
 
 func TestGameplayAuthentication(t *testing.T) {
@@ -399,6 +448,8 @@ func TestGameplayAuthentication(t *testing.T) {
 		{name: "next round missing authorization", path: "/api/rooms/ABC234/next-round"},
 		{name: "next round malformed authorization", path: "/api/rooms/ABC234/next-round", authorizer: setAuthorization("Bearer")},
 		{name: "next round unknown bearer", path: "/api/rooms/ABC234/next-round", authorizer: setAuthorization("Bearer unknown-secret")},
+		{name: "leave missing authorization", path: "/api/rooms/ABC234/leave"},
+		{name: "leave unknown bearer", path: "/api/rooms/ABC234/leave", authorizer: setAuthorization("Bearer unknown-secret")},
 	}
 
 	for _, test := range tests {
@@ -446,6 +497,22 @@ func TestSubmitMoveRejectsInvalidJSONAndMoves(t *testing.T) {
 	}
 }
 
+func TestNextRoundRejectsInvalidRequestBodies(t *testing.T) {
+	store := readyStoreForWeb(t)
+	if err := store.SubmitMove("ABC234", "host-token", "rock"); err != nil {
+		t.Fatalf("submit host move: %v", err)
+	}
+	if err := store.SubmitMove("ABC234", "guest-token", "paper"); err != nil {
+		t.Fatalf("submit guest move: %v", err)
+	}
+	handler := NewRouter(store)
+
+	for _, body := range []string{"", `{}`, `{"round":1,"extra":true}`, `{"round":1}{"round":1}`} {
+		response := performAuthorizedJSONRequest(t, handler, http.MethodPost, "/api/rooms/ABC234/next-round", "host-token", body)
+		assertJSONError(t, response, http.StatusBadRequest, "invalid request body")
+	}
+}
+
 func TestGameplayConflicts(t *testing.T) {
 	t.Run("room not ready", func(t *testing.T) {
 		store := room.NewStore()
@@ -465,7 +532,7 @@ func TestGameplayConflicts(t *testing.T) {
 	})
 
 	t.Run("unresolved next round", func(t *testing.T) {
-		response := performAuthorizedJSONRequest(t, NewRouter(readyStoreForWeb(t)), http.MethodPost, "/api/rooms/ABC234/next-round", "guest-token", "")
+		response := performAuthorizedJSONRequest(t, NewRouter(readyStoreForWeb(t)), http.MethodPost, "/api/rooms/ABC234/next-round", "guest-token", `{"round":1}`)
 		assertJSONError(t, response, http.StatusConflict, "round is not resolved")
 	})
 }
@@ -480,6 +547,7 @@ func TestGameplayEndpointsReturnNotFoundForUnknownRoom(t *testing.T) {
 		{method: http.MethodPost, path: "/api/rooms/NONE23/moves", body: `{"move":"rock"}`},
 		{method: http.MethodGet, path: "/api/rooms/NONE23/state"},
 		{method: http.MethodPost, path: "/api/rooms/NONE23/next-round"},
+		{method: http.MethodPost, path: "/api/rooms/NONE23/leave"},
 	}
 
 	for _, test := range tests {
@@ -500,6 +568,7 @@ func TestGameplayEndpointsRejectWrongMethods(t *testing.T) {
 		{method: http.MethodGet, path: "/api/rooms/ABC234/moves"},
 		{method: http.MethodPost, path: "/api/rooms/ABC234/state"},
 		{method: http.MethodGet, path: "/api/rooms/ABC234/next-round"},
+		{method: http.MethodGet, path: "/api/rooms/ABC234/leave"},
 	}
 
 	for _, test := range tests {

@@ -78,7 +78,7 @@ function Home({ onEnterRoom }) {
   )
 }
 
-function Scoreboard({ players = [], role }) {
+function Scoreboard({ players = [], role, resolved = false }) {
   return (
     <section className="scoreboard" aria-label="Score and readiness">
       {['host', 'guest'].map((playerRole) => {
@@ -87,8 +87,10 @@ function Scoreboard({ players = [], role }) {
           <div className={`player-card ${playerRole === role ? 'player-card-you' : ''}`} key={playerRole}>
             <div>
               <p>{playerRole === 'host' ? 'Host' : 'Guest'} {playerRole === role && <span className="you">You</span>}</p>
-              <span className={`status-dot ${player?.submitted ? 'status-ready' : ''}`}>
-                {player?.submitted ? 'Move locked' : player ? 'Choosing' : 'Not connected'}
+              <span className={`status-dot ${(resolved ? player?.wantsNextRound : player?.submitted) ? 'status-ready' : ''}`}>
+                {resolved
+                  ? player?.wantsNextRound ? 'Wants another round' : 'Deciding'
+                  : player?.submitted ? 'Move locked' : player ? 'Choosing' : 'Not connected'}
               </span>
             </div>
             <strong aria-label={`${playerRole} score`}>{player?.wins ?? 0}</strong>
@@ -144,6 +146,10 @@ function Room({ session, onLeave }) {
       },
       onState: (nextState) => {
         if (!active) return
+        if (nextState.closed) {
+          onLeave()
+          return
+        }
         setState(nextState)
         const serverPlayer = nextState.players.find((player) => player.role === session.role)
         if (serverPlayer?.submitted) setMovePending(false)
@@ -161,7 +167,7 @@ function Room({ session, onLeave }) {
       active = false
       close()
     }
-  }, [session.roomCode, session.role, connectionAttempt])
+  }, [session.roomCode, session.role, connectionAttempt, onLeave])
 
   async function performAction(name, request) {
     if (actionLockRef.current) return
@@ -184,6 +190,8 @@ function Room({ session, onLeave }) {
 
   const currentPlayer = state?.players.find((player) => player.role === session.role)
   const hasSubmitted = (currentPlayer?.submitted ?? false) || movePending
+  const opponent = state?.players.find((player) => player.role !== session.role)
+  const wantsNextRound = currentPlayer?.wantsNextRound ?? false
 
   function retryConnection() {
     setLoading(true)
@@ -199,10 +207,19 @@ function Room({ session, onLeave }) {
           <h1 aria-label={`Room code ${session.roomCode}`}>{session.roomCode}</h1>
           <p className="share-hint">Share this code with your opponent.</p>
         </div>
-        <button className="button button-quiet" onClick={onLeave}>Leave room</button>
+        <button
+          className="button button-quiet"
+          disabled={action !== null}
+          onClick={() => performAction('leave', async () => {
+            await api.leaveRoom(session.roomCode, session.playerToken)
+            if (mountedRef.current) onLeave()
+          })}
+        >
+          {action === 'leave' ? 'Leaving room…' : 'Leave room'}
+        </button>
       </header>
 
-      <Scoreboard players={state?.players} role={session.role} />
+      <Scoreboard players={state?.players} role={session.role} resolved={state?.resolved} />
 
       {(error || connectionError) && (
         <div className="notice notice-error" role="alert">
@@ -247,17 +264,28 @@ function Room({ session, onLeave }) {
       {state?.resolved && (
         <section className="game-panel">
           <RoundResult state={state} role={session.role} />
+          <p aria-live="polite">
+            {wantsNextRound
+              ? 'You want another round. Waiting for your opponent to decide.'
+              : opponent?.wantsNextRound
+                ? 'Your opponent wants another round. Accept or leave the room.'
+                : 'Request another round, or leave the room.'}
+          </p>
           <button
             className="button button-primary"
-            disabled={action !== null}
-            onClick={() => performAction('next', () => api.startNextRound(session.roomCode, session.playerToken))}
+            disabled={action !== null || wantsNextRound}
+            onClick={() => performAction('next', () => api.startNextRound(session.roomCode, session.playerToken, state.round))}
           >
-            {action === 'next' ? 'Starting next round…' : 'Next round'}
+            {action === 'next'
+              ? 'Sending request…'
+              : wantsNextRound
+                ? 'Waiting for opponent…'
+                : opponent?.wantsNextRound ? 'Accept next round' : 'Request next round'}
           </button>
         </section>
       )}
 
-      <p className="leave-note">Leaving only clears this device. The server room remains open.</p>
+      <p className="leave-note">Leaving closes this room for both players.</p>
     </main>
   )
 }

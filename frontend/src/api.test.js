@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { ApiError, createRoom, getRoomState, submitMove, subscribeToRoom } from './api.js'
+import { ApiError, createRoom, getRoomState, leaveRoom, startNextRound, submitMove, subscribeToRoom } from './api.js'
 
 function response(body, { status = 200 } = {}) {
   return new Response(body === null ? null : JSON.stringify(body), {
@@ -15,14 +15,14 @@ describe('API client', () => {
     fetch
       .mockResolvedValueOnce(response({ room_code: 'ABC234', player_token: 'private-token' }, { status: 201 }))
       .mockResolvedValueOnce(response({
-        room_code: 'ABC234', ready: true, resolved: false,
-        players: [{ role: 'host', wins: 2, submitted: true }],
+        room_code: 'ABC234', ready: true, resolved: false, round: 3, closed: false,
+        players: [{ role: 'host', wins: 2, submitted: true, wants_next_round: false }],
       }))
 
     await expect(createRoom()).resolves.toEqual({ roomCode: 'ABC234', playerToken: 'private-token', role: 'host' })
     await expect(getRoomState('ABC234')).resolves.toEqual({
-      roomCode: 'ABC234', ready: true, resolved: false,
-      players: [{ role: 'host', wins: 2, submitted: true }], result: null, moves: [],
+      roomCode: 'ABC234', ready: true, resolved: false, round: 3, closed: false,
+      players: [{ role: 'host', wins: 2, submitted: true, wantsNextRound: false }], result: null, moves: [],
     })
   })
 
@@ -48,6 +48,23 @@ describe('API client', () => {
     }))
   })
 
+  it('sends authenticated next-round consensus and leave commands', async () => {
+    fetch.mockResolvedValue(response(null, { status: 204 }))
+
+    await startNextRound('ABC234', 'secret', 2)
+    expect(fetch).toHaveBeenNthCalledWith(1, '/api/rooms/ABC234/next-round', expect.objectContaining({
+      method: 'POST',
+      headers: { Authorization: 'Bearer secret', 'Content-Type': 'application/json' },
+      body: '{"round":2}',
+    }))
+
+    await leaveRoom('ABC234', 'secret')
+    expect(fetch).toHaveBeenNthCalledWith(2, '/api/rooms/ABC234/leave', expect.objectContaining({
+      method: 'POST',
+      headers: { Authorization: 'Bearer secret' },
+    }))
+  })
+
   it('subscribes to public room events, maps snapshots, and closes cleanly', () => {
     class FakeEventSource {
       constructor(url) {
@@ -65,8 +82,8 @@ describe('API client', () => {
     expect(FakeEventSource.instance.url).not.toContain('token')
 
     FakeEventSource.instance.onmessage({ data: JSON.stringify({
-      room_code: 'ABC234', ready: false, resolved: false,
-      players: [{ role: 'host', wins: 0, submitted: false }],
+      room_code: 'ABC234', ready: false, resolved: false, round: 1, closed: false,
+      players: [{ role: 'host', wins: 0, submitted: false, wants_next_round: false }],
     }) })
     expect(onState).toHaveBeenCalledWith(waitingFrontendState())
 
@@ -82,7 +99,7 @@ describe('API client', () => {
 
 function waitingFrontendState() {
   return {
-    roomCode: 'ABC234', ready: false, resolved: false,
-    players: [{ role: 'host', wins: 0, submitted: false }], result: null, moves: [],
+    roomCode: 'ABC234', ready: false, resolved: false, round: 1, closed: false,
+    players: [{ role: 'host', wins: 0, submitted: false, wantsNextRound: false }], result: null, moves: [],
   }
 }

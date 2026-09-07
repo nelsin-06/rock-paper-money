@@ -55,6 +55,7 @@ func newRouterWithLogger(store *room.Store, generateCode, generateToken generato
 	mux.HandleFunc("GET /api/rooms/{code}/state", handler.roomState)
 	mux.HandleFunc("GET /api/rooms/{code}/events", handler.roomEvents)
 	mux.HandleFunc("POST /api/rooms/{code}/next-round", handler.startNextRound)
+	mux.HandleFunc("POST /api/rooms/{code}/leave", handler.leaveRoom)
 	return logRequests(logger, mux)
 }
 
@@ -132,6 +133,9 @@ func (rt *router) joinRoom(w http.ResponseWriter, r *http.Request) {
 		case errors.Is(err, room.ErrRoomFull):
 			writeError(w, http.StatusConflict, "room is full")
 			return
+		case errors.Is(err, room.ErrRoomClosed):
+			writeError(w, http.StatusConflict, "room is closed")
+			return
 		case errors.Is(err, room.ErrRoomNotFound):
 			writeError(w, http.StatusNotFound, "room not found")
 			return
@@ -179,6 +183,8 @@ func (rt *router) submitMove(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, "room not ready")
 	case errors.Is(err, room.ErrDuplicateMove):
 		writeError(w, http.StatusConflict, "move already submitted")
+	case errors.Is(err, room.ErrRoomClosed):
+		writeError(w, http.StatusConflict, "room is closed")
 	case errors.Is(err, room.ErrRoomNotFound):
 		writeError(w, http.StatusNotFound, "room not found")
 	case errors.Is(err, room.ErrUnknownPlayer):
@@ -265,13 +271,16 @@ func publicRoomState(code string, state room.State) stateResponse {
 		RoomCode: code,
 		Ready:    state.Ready,
 		Resolved: state.Resolved,
+		Round:    state.Round,
+		Closed:   state.Closed,
 		Players:  make([]statePlayer, len(state.Players)),
 	}
 	for i, player := range state.Players {
 		response.Players[i] = statePlayer{
-			Role:      playerRole(i),
-			Wins:      player.Wins,
-			Submitted: player.Submitted,
+			Role:           playerRole(i),
+			Wins:           player.Wins,
+			Submitted:      player.Submitted,
+			WantsNextRound: player.WantsNextRound,
 		}
 	}
 	if state.Resolved {
@@ -289,18 +298,55 @@ func (rt *router) startNextRound(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if _, ok := authenticatedPlayer(r, state); !ok {
+	playerID, ok := authenticatedPlayer(r, state)
+	if !ok {
 		writeError(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
+	var request nextRoundRequest
+	if !decodeJSONBody(r, &request) || request.Round == 0 {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
 
-	switch err := rt.store.StartNextRound(code); {
+	switch err := rt.store.RequestNextRound(code, playerID, request.Round); {
 	case err == nil:
 		w.WriteHeader(http.StatusNoContent)
 	case errors.Is(err, room.ErrRoundNotResolved):
 		writeError(w, http.StatusConflict, "round is not resolved")
+	case errors.Is(err, room.ErrNextRoundRequested):
+		writeError(w, http.StatusConflict, "next round already requested")
+	case errors.Is(err, room.ErrStaleRound):
+		writeError(w, http.StatusConflict, "round request is stale")
+	case errors.Is(err, room.ErrRoomClosed):
+		writeError(w, http.StatusConflict, "room is closed")
 	case errors.Is(err, room.ErrRoomNotFound):
 		writeError(w, http.StatusNotFound, "room not found")
+	default:
+		writeError(w, http.StatusInternalServerError, "internal server error")
+	}
+}
+
+func (rt *router) leaveRoom(w http.ResponseWriter, r *http.Request) {
+	code, state, ok := rt.findRoom(w, r.PathValue("code"))
+	if !ok {
+		return
+	}
+	playerID, ok := authenticatedPlayer(r, state)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	switch err := rt.store.Leave(code, playerID); {
+	case err == nil:
+		w.WriteHeader(http.StatusNoContent)
+	case errors.Is(err, room.ErrRoomClosed):
+		writeError(w, http.StatusConflict, "room is closed")
+	case errors.Is(err, room.ErrRoomNotFound):
+		writeError(w, http.StatusNotFound, "room not found")
+	case errors.Is(err, room.ErrUnknownPlayer):
+		writeError(w, http.StatusUnauthorized, "unauthorized")
 	default:
 		writeError(w, http.StatusInternalServerError, "internal server error")
 	}
@@ -334,19 +380,26 @@ type moveRequest struct {
 	Move game.Move `json:"move"`
 }
 
+type nextRoundRequest struct {
+	Round uint64 `json:"round"`
+}
+
 type stateResponse struct {
 	RoomCode string        `json:"room_code"`
 	Ready    bool          `json:"ready"`
 	Resolved bool          `json:"resolved"`
+	Round    uint64        `json:"round"`
+	Closed   bool          `json:"closed"`
 	Players  []statePlayer `json:"players"`
 	Result   game.Result   `json:"result,omitempty"`
 	Moves    []stateMove   `json:"moves,omitempty"`
 }
 
 type statePlayer struct {
-	Role      string `json:"role"`
-	Wins      int    `json:"wins"`
-	Submitted bool   `json:"submitted"`
+	Role           string `json:"role"`
+	Wins           int    `json:"wins"`
+	Submitted      bool   `json:"submitted"`
+	WantsNextRound bool   `json:"wants_next_round"`
 }
 
 type stateMove struct {
@@ -381,6 +434,15 @@ func playerRole(index int) string {
 		return "host"
 	}
 	return "guest"
+}
+
+func decodeJSONBody(r *http.Request, destination any) bool {
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(destination); err != nil {
+		return false
+	}
+	return errors.Is(decoder.Decode(&struct{}{}), io.EOF)
 }
 
 func supportsStreaming(w http.ResponseWriter) bool {
