@@ -1,0 +1,32 @@
+# JavaScript dependencies and generated output
+node_modules/
+dist/
+.vite/
+coverage/
+
+# Go build and test artifacts
+bin/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+# Logs and local environment files
+*.log
+.env
+.env.*
+!.env.example
+
+# Editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Operating system files
+.DS_Store
+Thumbs.db

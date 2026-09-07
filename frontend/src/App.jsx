@@ -1,0 +1,285 @@
+import { useEffect, useRef, useState } from 'react'
+import * as api from './api.js'
+import { clearSession, loadSession, saveSession } from './storage.js'
+
+const MOVES = [
+  { value: 'rock', label: 'Rock', symbol: '●' },
+  { value: 'paper', label: 'Paper', symbol: '▰' },
+  { value: 'scissors', label: 'Scissors', symbol: '✦' },
+]
+
+function displayError(error) {
+  return error instanceof Error ? error.message : 'Something went wrong. Please try again.'
+}
+
+function Home({ onEnterRoom }) {
+  const [code, setCode] = useState('')
+  const [busy, setBusy] = useState(null)
+  const [error, setError] = useState('')
+  const entryLockRef = useRef(false)
+
+  async function enter(action, role) {
+    if (entryLockRef.current) return
+    entryLockRef.current = true
+    setBusy(role)
+    setError('')
+    try {
+      const session = await action()
+      saveSession(session)
+      onEnterRoom(session)
+    } catch (requestError) {
+      entryLockRef.current = false
+      setError(displayError(requestError))
+      setBusy(null)
+    }
+  }
+
+  function handleJoin(event) {
+    event.preventDefault()
+    if (code.length !== 6) {
+      setError('Enter the six-character room code.')
+      return
+    }
+    enter(() => api.joinRoom(code), 'guest')
+  }
+
+  return (
+    <main className="page home-page">
+      <section className="hero" aria-labelledby="home-title">
+        <p className="eyebrow">Two players · One room</p>
+        <h1 id="home-title">Rock. Paper. <span>Money.</span></h1>
+        <p className="hero-copy">Open a room, share the code, and settle it in three moves.</p>
+      </section>
+
+      <section className="entry-card" aria-label="Enter a game">
+        <button className="button button-primary" disabled={busy !== null} onClick={() => enter(api.createRoom, 'host')}>
+          {busy === 'host' ? 'Creating room…' : 'Create room'}
+        </button>
+        <div className="divider"><span>or join</span></div>
+        <form onSubmit={handleJoin}>
+          <label htmlFor="room-code">Six-character room code</label>
+          <input
+            id="room-code"
+            value={code}
+            onChange={(event) => setCode(event.target.value.replace(/[^a-z0-9]/gi, '').toUpperCase().slice(0, 6))}
+            placeholder="ABC234"
+            autoComplete="off"
+            autoCapitalize="characters"
+            spellCheck="false"
+            inputMode="text"
+          />
+          <button className="button button-secondary" disabled={busy !== null || code.length !== 6}>
+            {busy === 'guest' ? 'Joining room…' : 'Join room'}
+          </button>
+        </form>
+        {error && <div className="notice notice-error" role="alert">{error}</div>}
+      </section>
+    </main>
+  )
+}
+
+function Scoreboard({ players = [], role }) {
+  return (
+    <section className="scoreboard" aria-label="Score and readiness">
+      {['host', 'guest'].map((playerRole) => {
+        const player = players.find((candidate) => candidate.role === playerRole)
+        return (
+          <div className={`player-card ${playerRole === role ? 'player-card-you' : ''}`} key={playerRole}>
+            <div>
+              <p>{playerRole === 'host' ? 'Host' : 'Guest'} {playerRole === role && <span className="you">You</span>}</p>
+              <span className={`status-dot ${player?.submitted ? 'status-ready' : ''}`}>
+                {player?.submitted ? 'Move locked' : player ? 'Choosing' : 'Not connected'}
+              </span>
+            </div>
+            <strong aria-label={`${playerRole} score`}>{player?.wins ?? 0}</strong>
+          </div>
+        )
+      })}
+    </section>
+  )
+}
+
+function RoundResult({ state, role }) {
+  const localWon = (state.result === 'player_one_wins' && role === 'host') ||
+    (state.result === 'player_two_wins' && role === 'guest')
+  const title = state.result === 'draw' ? 'Draw round' : localWon ? 'You won' : 'You lost'
+  const moveFor = (playerRole) => state.moves.find((item) => item.role === playerRole)?.move ?? 'unknown'
+
+  return (
+    <section className="result-panel" aria-live="polite">
+      <p className="eyebrow">Round complete</p>
+      <h2>{title}</h2>
+      <div className="revealed-moves">
+        <p><span>Your move</span><strong>{moveFor(role)}</strong></p>
+        <p><span>Opponent</span><strong>{moveFor(role === 'host' ? 'guest' : 'host')}</strong></p>
+      </div>
+    </section>
+  )
+}
+
+function Room({ session, onLeave }) {
+  const [state, setState] = useState(null)
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState('')
+  const [action, setAction] = useState(null)
+  const [movePending, setMovePending] = useState(false)
+  const refreshRef = useRef(() => {})
+  const actionLockRef = useRef(false)
+  const mountedRef = useRef(true)
+
+  useEffect(() => {
+    mountedRef.current = true
+    return () => {
+      mountedRef.current = false
+    }
+  }, [])
+
+  useEffect(() => {
+    let active = true
+    let timer
+    let controller
+
+    async function poll(showLoading = false) {
+      if (showLoading) setLoading(true)
+      const pollController = new AbortController()
+      controller = pollController
+      try {
+        const nextState = await api.getRoomState(session.roomCode, { signal: pollController.signal })
+        if (!active) return
+        setState(nextState)
+        const serverPlayer = nextState.players.find((player) => player.role === session.role)
+        if (serverPlayer?.submitted) setMovePending(false)
+        setError('')
+        setLoading(false)
+      } catch (requestError) {
+        if (!active || pollController.signal.aborted) return
+        setError(displayError(requestError))
+        setLoading(false)
+      } finally {
+        if (active && controller === pollController) timer = window.setTimeout(poll, 1000)
+      }
+    }
+
+    refreshRef.current = () => {
+      window.clearTimeout(timer)
+      controller?.abort()
+      poll()
+    }
+    poll(true)
+
+    return () => {
+      active = false
+      window.clearTimeout(timer)
+      controller?.abort()
+      refreshRef.current = () => {}
+    }
+  }, [session.roomCode, session.playerToken, session.role])
+
+  async function performAction(name, request) {
+    if (actionLockRef.current) return
+    actionLockRef.current = true
+    if (name === 'move') setMovePending(true)
+    setAction(name)
+    setError('')
+    try {
+      await request()
+      refreshRef.current()
+    } catch (requestError) {
+      if (mountedRef.current) {
+        if (name === 'move') setMovePending(false)
+        setError(displayError(requestError))
+      }
+    } finally {
+      actionLockRef.current = false
+      if (mountedRef.current) setAction(null)
+    }
+  }
+
+  const currentPlayer = state?.players.find((player) => player.role === session.role)
+  const hasSubmitted = (currentPlayer?.submitted ?? false) || movePending
+
+  return (
+    <main className="page room-page">
+      <header className="room-header">
+        <div>
+          <p className="eyebrow">Room code</p>
+          <h1 aria-label={`Room code ${session.roomCode}`}>{session.roomCode}</h1>
+          <p className="share-hint">Share this code with your opponent.</p>
+        </div>
+        <button className="button button-quiet" onClick={onLeave}>Leave room</button>
+      </header>
+
+      <Scoreboard players={state?.players} role={session.role} />
+
+      {error && (
+        <div className="notice notice-error" role="alert">
+          <span>{error}</span>
+          <button onClick={() => refreshRef.current()}>Retry</button>
+        </div>
+      )}
+
+      {loading && !state && <section className="game-panel centered" aria-live="polite"><div className="loader" /><h2>Loading room…</h2></section>}
+
+      {state && !state.ready && (
+        <section className="game-panel centered" aria-live="polite">
+          <div className="waiting-mark"><span /><span /><span /></div>
+          <p className="eyebrow">Room is open</p>
+          <h2>Waiting for a guest</h2>
+          <p>Keep this page open while your opponent joins with the code above.</p>
+        </section>
+      )}
+
+      {state?.ready && !state.resolved && (
+        <section className="game-panel" aria-labelledby="round-title">
+          <p className="eyebrow">Current round</p>
+          <h2 id="round-title">{hasSubmitted ? 'Move submitted' : 'Choose your move'}</h2>
+          <p>{hasSubmitted ? 'Your choice is hidden. Waiting for your opponent.' : 'Your move stays secret until both players submit.'}</p>
+          <div className="move-grid" aria-label="Choose a move">
+            {MOVES.map((move) => (
+              <button
+                className="move-button"
+                key={move.value}
+                disabled={hasSubmitted || action !== null}
+                onClick={() => performAction('move', () => api.submitMove(session.roomCode, session.playerToken, move.value))}
+              >
+                <span aria-hidden="true">{move.symbol}</span>
+                {move.label}
+              </button>
+            ))}
+          </div>
+          {action === 'move' && <p className="action-status" role="status">Locking your move…</p>}
+        </section>
+      )}
+
+      {state?.resolved && (
+        <section className="game-panel">
+          <RoundResult state={state} role={session.role} />
+          <button
+            className="button button-primary"
+            disabled={action !== null}
+            onClick={() => performAction('next', () => api.startNextRound(session.roomCode, session.playerToken))}
+          >
+            {action === 'next' ? 'Starting next round…' : 'Next round'}
+          </button>
+        </section>
+      )}
+
+      <p className="leave-note">Leaving only clears this device. The server room remains open.</p>
+    </main>
+  )
+}
+
+export default function App() {
+  const [session, setSession] = useState(() => loadSession())
+
+  function leaveRoom() {
+    clearSession()
+    setSession(null)
+  }
+
+  return session ? (
+    <Room key={`${session.roomCode}:${session.playerToken}`} session={session} onLeave={leaveRoom} />
+  ) : (
+    <Home onEnterRoom={setSession} />
+  )
+}
