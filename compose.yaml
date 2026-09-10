@@ -1,0 +1,19 @@
+services:
+  postgres:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_USER: rock_paper_money
+      POSTGRES_PASSWORD: rock_paper_money
+      POSTGRES_DB: rock_paper_money
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U rock_paper_money -d rock_paper_money"]
+      interval: 2s
+      timeout: 3s
+      retries: 10
+    volumes:
+      - rock-paper-money-postgres:/var/lib/postgresql
+
+volumes:
+  rock-paper-money-postgres:

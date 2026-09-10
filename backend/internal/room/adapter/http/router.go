@@ -1,8 +1,7 @@
-package web
+package roomhttp
 
 import (
-	"crypto/rand"
-	"encoding/base64"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,43 +11,27 @@ import (
 	"strings"
 	"time"
 
-	"example.com/rock-paper-money/internal/game"
-	"example.com/rock-paper-money/internal/room"
+	"example.com/rock-paper-money/internal/room/application"
+	"example.com/rock-paper-money/internal/room/domain"
 )
 
 const (
-	roomCodeLength        = 6
-	playerTokenBytes      = 32
-	maxGenerationAttempts = 8
-	roomCodeAlphabet      = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
-	heartbeatInterval     = 15 * time.Second
+	roomCodeLength    = 6
+	roomCodeAlphabet  = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+	heartbeatInterval = 15 * time.Second
 )
 
-type generator func() (string, error)
-
 type router struct {
-	store         *room.Store
-	generateCode  generator
-	generateToken generator
+	service *application.Service
+	ready   func(context.Context) error
 }
 
-func NewRouter(store *room.Store) http.Handler {
-	return newRouterWithLogger(store, randomRoomCode, randomPlayerToken, slog.Default())
-}
-
-func newRouter(store *room.Store, generateCode, generateToken generator) http.Handler {
-	return newRouterWithLogger(store, generateCode, generateToken, slog.Default())
-}
-
-func newRouterWithLogger(store *room.Store, generateCode, generateToken generator, logger *slog.Logger) http.Handler {
-	handler := &router{
-		store:         store,
-		generateCode:  generateCode,
-		generateToken: generateToken,
-	}
+func NewRouter(service *application.Service, ready func(context.Context) error) http.Handler {
+	handler := &router{service: service, ready: ready}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/health", health)
+	mux.HandleFunc("GET /api/ready", handler.readiness)
 	mux.HandleFunc("POST /api/rooms", handler.createRoom)
 	mux.HandleFunc("POST /api/rooms/{code}/join", handler.joinRoom)
 	mux.HandleFunc("POST /api/rooms/{code}/moves", handler.submitMove)
@@ -57,7 +40,7 @@ func newRouterWithLogger(store *room.Store, generateCode, generateToken generato
 	mux.HandleFunc("POST /api/rooms/{code}/validate-session", handler.validateSession)
 	mux.HandleFunc("POST /api/rooms/{code}/next-round", handler.startNextRound)
 	mux.HandleFunc("POST /api/rooms/{code}/leave", handler.leaveRoom)
-	return logRequests(logger, mux)
+	return logRequests(slog.Default(), mux)
 }
 
 func health(w http.ResponseWriter, _ *http.Request) {
@@ -67,33 +50,23 @@ func health(w http.ResponseWriter, _ *http.Request) {
 	}{Status: "ok"})
 }
 
-func (rt *router) createRoom(w http.ResponseWriter, _ *http.Request) {
-	for range maxGenerationAttempts {
-		code, err := rt.generateCode()
-		if err != nil {
-			writeError(w, http.StatusInternalServerError, "internal server error")
-			return
-		}
-
-		token, err := rt.generateToken()
-		if err != nil {
-			writeError(w, http.StatusInternalServerError, "internal server error")
-			return
-		}
-
-		if _, err := rt.store.Create(code, token); err != nil {
-			if errors.Is(err, room.ErrDuplicateRoom) {
-				continue
-			}
-			writeError(w, http.StatusInternalServerError, "internal server error")
-			return
-		}
-
-		writeJSON(w, http.StatusCreated, roomCredentials{RoomCode: code, PlayerToken: token})
+func (rt *router) readiness(w http.ResponseWriter, r *http.Request) {
+	if rt.ready != nil && rt.ready(r.Context()) != nil {
+		writeError(w, http.StatusServiceUnavailable, "not ready")
 		return
 	}
+	writeJSON(w, http.StatusOK, struct {
+		Status string `json:"status"`
+	}{Status: "ok"})
+}
 
-	writeError(w, http.StatusInternalServerError, "internal server error")
+func (rt *router) createRoom(w http.ResponseWriter, r *http.Request) {
+	credentials, err := rt.service.Create(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal server error")
+		return
+	}
+	writeJSON(w, http.StatusCreated, roomCredentials{RoomCode: credentials.RoomCode, PlayerToken: credentials.PlayerToken})
 }
 
 func (rt *router) joinRoom(w http.ResponseWriter, r *http.Request) {
@@ -103,60 +76,36 @@ func (rt *router) joinRoom(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	state, err := rt.store.State(code)
-	if err != nil {
-		if errors.Is(err, room.ErrRoomNotFound) {
-			writeError(w, http.StatusNotFound, "room not found")
-			return
-		}
-		writeError(w, http.StatusInternalServerError, "internal server error")
+	credentials, err := rt.service.Join(r.Context(), code)
+	switch {
+	case err == nil:
+		writeJSON(w, http.StatusCreated, roomCredentials{RoomCode: code, PlayerToken: credentials.PlayerToken})
 		return
-	}
-	if state.Ready {
+	case errors.Is(err, domain.ErrRoomFull):
 		writeError(w, http.StatusConflict, "room is full")
 		return
+	case errors.Is(err, domain.ErrRoomClosed):
+		writeError(w, http.StatusConflict, "room is closed")
+		return
+	case errors.Is(err, application.ErrRoomNotFound):
+		writeError(w, http.StatusNotFound, "room not found")
+		return
+	default:
+		writeError(w, http.StatusInternalServerError, "internal server error")
 	}
-
-	for range maxGenerationAttempts {
-		token, err := rt.generateToken()
-		if err != nil {
-			writeError(w, http.StatusInternalServerError, "internal server error")
-			return
-		}
-
-		err = rt.store.Join(code, token)
-		switch {
-		case err == nil:
-			writeJSON(w, http.StatusCreated, roomCredentials{RoomCode: code, PlayerToken: token})
-			return
-		case errors.Is(err, room.ErrDuplicatePlayer):
-			continue
-		case errors.Is(err, room.ErrRoomFull):
-			writeError(w, http.StatusConflict, "room is full")
-			return
-		case errors.Is(err, room.ErrRoomClosed):
-			writeError(w, http.StatusConflict, "room is closed")
-			return
-		case errors.Is(err, room.ErrRoomNotFound):
-			writeError(w, http.StatusNotFound, "room not found")
-			return
-		default:
-			writeError(w, http.StatusInternalServerError, "internal server error")
-			return
-		}
-	}
-
-	writeError(w, http.StatusInternalServerError, "internal server error")
 }
 
 func (rt *router) submitMove(w http.ResponseWriter, r *http.Request) {
-	code, state, ok := rt.findRoom(w, r.PathValue("code"))
+	code, _, ok := rt.findRoom(r.Context(), w, r.PathValue("code"))
 	if !ok {
 		return
 	}
-
-	playerID, ok := authenticatedPlayer(r, state)
+	token, ok := bearerToken(r)
 	if !ok {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	if _, _, err := rt.service.Authenticate(r.Context(), code, token); err != nil {
 		writeError(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
@@ -172,23 +121,23 @@ func (rt *router) submitMove(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	if !game.IsValidMove(request.Move) {
+	if !domain.IsValidMove(request.Move) {
 		writeError(w, http.StatusBadRequest, "invalid move")
 		return
 	}
 
-	switch err := rt.store.SubmitMove(code, playerID, request.Move); {
+	switch err := rt.service.SubmitMove(r.Context(), code, token, request.Move); {
 	case err == nil:
 		w.WriteHeader(http.StatusNoContent)
-	case errors.Is(err, room.ErrRoomNotReady):
+	case errors.Is(err, domain.ErrRoomNotReady):
 		writeError(w, http.StatusConflict, "room not ready")
-	case errors.Is(err, room.ErrDuplicateMove):
+	case errors.Is(err, domain.ErrDuplicateMove):
 		writeError(w, http.StatusConflict, "move already submitted")
-	case errors.Is(err, room.ErrRoomClosed):
+	case errors.Is(err, domain.ErrRoomClosed):
 		writeError(w, http.StatusConflict, "room is closed")
-	case errors.Is(err, room.ErrRoomNotFound):
+	case errors.Is(err, application.ErrRoomNotFound):
 		writeError(w, http.StatusNotFound, "room not found")
-	case errors.Is(err, room.ErrUnknownPlayer):
+	case errors.Is(err, application.ErrUnauthorized):
 		writeError(w, http.StatusUnauthorized, "unauthorized")
 	default:
 		writeError(w, http.StatusInternalServerError, "internal server error")
@@ -196,7 +145,7 @@ func (rt *router) submitMove(w http.ResponseWriter, r *http.Request) {
 }
 
 func (rt *router) roomState(w http.ResponseWriter, r *http.Request) {
-	code, state, ok := rt.findRoom(w, r.PathValue("code"))
+	code, state, ok := rt.findRoom(r.Context(), w, r.PathValue("code"))
 	if !ok {
 		return
 	}
@@ -205,21 +154,28 @@ func (rt *router) roomState(w http.ResponseWriter, r *http.Request) {
 }
 
 func (rt *router) validateSession(w http.ResponseWriter, r *http.Request) {
-	_, state, ok := rt.findRoom(w, r.PathValue("code"))
-	if !ok {
+	code, state, found := rt.findRoom(r.Context(), w, r.PathValue("code"))
+	if !found {
 		return
 	}
 	if state.Closed {
 		writeError(w, http.StatusNotFound, "room not found")
 		return
 	}
-
-	_, role, ok := authenticatedPlayerRole(r, state)
-	if !ok {
+	token, valid := bearerToken(r)
+	if !valid {
 		writeError(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
-
+	_, role, err := rt.service.Authenticate(r.Context(), code, token)
+	if errors.Is(err, application.ErrRoomNotFound) {
+		writeError(w, http.StatusNotFound, "room not found")
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
 	var request validateSessionRequest
 	if !decodeJSONBody(r, &request) || (request.Role != "host" && request.Role != "guest") {
 		writeError(w, http.StatusBadRequest, "invalid request body")
@@ -249,8 +205,8 @@ func (rt *router) roomEvents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	initial, changes, unsubscribe, err := rt.store.Subscribe(code)
-	if errors.Is(err, room.ErrRoomNotFound) {
+	initial, changes, unsubscribe, err := rt.service.Subscribe(r.Context(), code)
+	if errors.Is(err, application.ErrRoomNotFound) {
 		writeError(w, http.StatusNotFound, "room not found")
 		return
 	}
@@ -276,7 +232,7 @@ func (rt *router) roomEvents(w http.ResponseWriter, r *http.Request) {
 		case <-r.Context().Done():
 			return
 		case <-changes:
-			snapshot, err := rt.store.Snapshot(code)
+			snapshot, err := rt.service.Snapshot(r.Context(), code)
 			if err != nil || snapshot.Revision <= lastRevision {
 				continue
 			}
@@ -295,7 +251,7 @@ func (rt *router) roomEvents(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func publicRoomState(code string, state room.State) stateResponse {
+func publicRoomState(code string, state domain.State) stateResponse {
 	response := stateResponse{
 		RoomCode: code,
 		Ready:    state.Ready,
@@ -323,12 +279,16 @@ func publicRoomState(code string, state room.State) stateResponse {
 }
 
 func (rt *router) startNextRound(w http.ResponseWriter, r *http.Request) {
-	code, state, ok := rt.findRoom(w, r.PathValue("code"))
+	code, _, ok := rt.findRoom(r.Context(), w, r.PathValue("code"))
 	if !ok {
 		return
 	}
-	playerID, ok := authenticatedPlayer(r, state)
+	token, ok := bearerToken(r)
 	if !ok {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	if _, _, err := rt.service.Authenticate(r.Context(), code, token); err != nil {
 		writeError(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
@@ -338,66 +298,68 @@ func (rt *router) startNextRound(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	switch err := rt.store.RequestNextRound(code, playerID, request.Round); {
+	switch err := rt.service.RequestNextRound(r.Context(), code, token, request.Round); {
 	case err == nil:
 		w.WriteHeader(http.StatusNoContent)
-	case errors.Is(err, room.ErrRoundNotResolved):
+	case errors.Is(err, domain.ErrRoundNotResolved):
 		writeError(w, http.StatusConflict, "round is not resolved")
-	case errors.Is(err, room.ErrNextRoundRequested):
+	case errors.Is(err, domain.ErrNextRoundRequested):
 		writeError(w, http.StatusConflict, "next round already requested")
-	case errors.Is(err, room.ErrStaleRound):
+	case errors.Is(err, domain.ErrStaleRound):
 		writeError(w, http.StatusConflict, "round request is stale")
-	case errors.Is(err, room.ErrRoomClosed):
+	case errors.Is(err, domain.ErrRoomClosed):
 		writeError(w, http.StatusConflict, "room is closed")
-	case errors.Is(err, room.ErrRoomNotFound):
+	case errors.Is(err, application.ErrRoomNotFound):
 		writeError(w, http.StatusNotFound, "room not found")
+	case errors.Is(err, application.ErrUnauthorized):
+		writeError(w, http.StatusUnauthorized, "unauthorized")
 	default:
 		writeError(w, http.StatusInternalServerError, "internal server error")
 	}
 }
 
 func (rt *router) leaveRoom(w http.ResponseWriter, r *http.Request) {
-	code, state, ok := rt.findRoom(w, r.PathValue("code"))
+	code, _, ok := rt.findRoom(r.Context(), w, r.PathValue("code"))
 	if !ok {
 		return
 	}
-	playerID, ok := authenticatedPlayer(r, state)
+	token, ok := bearerToken(r)
 	if !ok {
 		writeError(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
 
-	switch err := rt.store.Leave(code, playerID); {
+	switch err := rt.service.Leave(r.Context(), code, token); {
 	case err == nil:
 		w.WriteHeader(http.StatusNoContent)
-	case errors.Is(err, room.ErrRoomClosed):
+	case errors.Is(err, domain.ErrRoomClosed):
 		writeError(w, http.StatusConflict, "room is closed")
-	case errors.Is(err, room.ErrRoomNotFound):
+	case errors.Is(err, application.ErrRoomNotFound):
 		writeError(w, http.StatusNotFound, "room not found")
-	case errors.Is(err, room.ErrUnknownPlayer):
+	case errors.Is(err, application.ErrUnauthorized):
 		writeError(w, http.StatusUnauthorized, "unauthorized")
 	default:
 		writeError(w, http.StatusInternalServerError, "internal server error")
 	}
 }
 
-func (rt *router) findRoom(w http.ResponseWriter, rawCode string) (string, room.State, bool) {
+func (rt *router) findRoom(ctx context.Context, w http.ResponseWriter, rawCode string) (string, domain.State, bool) {
 	code := normalizeRoomCode(rawCode)
 	if code == "" {
 		writeError(w, http.StatusBadRequest, "room code is required")
-		return "", room.State{}, false
+		return "", domain.State{}, false
 	}
 
-	state, err := rt.store.State(code)
-	if errors.Is(err, room.ErrRoomNotFound) {
+	snapshot, err := rt.service.Snapshot(ctx, code)
+	if errors.Is(err, application.ErrRoomNotFound) {
 		writeError(w, http.StatusNotFound, "room not found")
-		return "", room.State{}, false
+		return "", domain.State{}, false
 	}
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "internal server error")
-		return "", room.State{}, false
+		return "", domain.State{}, false
 	}
-	return code, state, true
+	return code, snapshot.State, true
 }
 
 type roomCredentials struct {
@@ -406,7 +368,7 @@ type roomCredentials struct {
 }
 
 type moveRequest struct {
-	Move game.Move `json:"move"`
+	Move domain.Move `json:"move"`
 }
 
 type nextRoundRequest struct {
@@ -424,7 +386,7 @@ type stateResponse struct {
 	Round    uint64        `json:"round"`
 	Closed   bool          `json:"closed"`
 	Players  []statePlayer `json:"players"`
-	Result   game.Result   `json:"result,omitempty"`
+	Result   domain.Result `json:"result,omitempty"`
 	Moves    []stateMove   `json:"moves,omitempty"`
 }
 
@@ -436,35 +398,25 @@ type statePlayer struct {
 }
 
 type stateMove struct {
-	Role string    `json:"role"`
-	Move game.Move `json:"move"`
+	Role string      `json:"role"`
+	Move domain.Move `json:"move"`
 }
 
 func normalizeRoomCode(code string) string {
 	return strings.ToUpper(strings.TrimSpace(code))
 }
 
-func authenticatedPlayer(r *http.Request, state room.State) (string, bool) {
-	playerID, _, ok := authenticatedPlayerRole(r, state)
-	return playerID, ok
-}
-
-func authenticatedPlayerRole(r *http.Request, state room.State) (string, string, bool) {
+func bearerToken(r *http.Request) (string, bool) {
 	values := r.Header.Values("Authorization")
 	if len(values) != 1 {
-		return "", "", false
+		return "", false
 	}
 
 	scheme, token, found := strings.Cut(values[0], " ")
 	if !found || !strings.EqualFold(scheme, "Bearer") || token == "" || strings.ContainsAny(token, " \t\r\n") {
-		return "", "", false
+		return "", false
 	}
-	for index, player := range state.Players {
-		if player.ID == token {
-			return player.ID, playerRole(index), true
-		}
-	}
-	return "", "", false
+	return token, true
 }
 
 func playerRole(index int) string {
@@ -499,7 +451,7 @@ func supportsStreaming(w http.ResponseWriter) bool {
 	}
 }
 
-func writeRoomEvent(w io.Writer, controller *http.ResponseController, snapshot room.Snapshot) error {
+func writeRoomEvent(w io.Writer, controller *http.ResponseController, snapshot application.Snapshot) error {
 	data, err := json.Marshal(publicRoomState(snapshot.State.Code, snapshot.State))
 	if err != nil {
 		return err
@@ -520,25 +472,4 @@ func writeJSON(w http.ResponseWriter, status int, value any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(value)
-}
-
-func randomRoomCode() (string, error) {
-	random := make([]byte, roomCodeLength)
-	if _, err := io.ReadFull(rand.Reader, random); err != nil {
-		return "", fmt.Errorf("generate room code: %w", err)
-	}
-
-	code := make([]byte, roomCodeLength)
-	for i, value := range random {
-		code[i] = roomCodeAlphabet[int(value)%len(roomCodeAlphabet)]
-	}
-	return string(code), nil
-}
-
-func randomPlayerToken() (string, error) {
-	random := make([]byte, playerTokenBytes)
-	if _, err := io.ReadFull(rand.Reader, random); err != nil {
-		return "", fmt.Errorf("generate player token: %w", err)
-	}
-	return base64.RawURLEncoding.EncodeToString(random), nil
 }

@@ -1,4 +1,4 @@
-package web
+package roomhttp
 
 import (
 	"log/slog"
