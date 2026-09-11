@@ -21,6 +21,14 @@ const readyState = {
     { role: 'guest', wins: 0, submitted: false, wantsNextRound: false },
   ], result: null, moves: [],
 }
+const resolvedState = {
+  roomCode: 'ABC234', ready: true, resolved: true, round: 1, closed: false, forfeit: false, result: 'player_one_wins',
+  players: [
+    { role: 'host', wins: 1, submitted: true, wantsNextRound: false },
+    { role: 'guest', wins: 0, submitted: true, wantsNextRound: false },
+  ],
+  moves: [{ role: 'host', move: 'paper' }, { role: 'guest', move: 'rock' }],
+}
 
 let activeStream
 let closeStream
@@ -46,6 +54,8 @@ describe('core room flow', () => {
     api.submitMove.mockReset()
     api.startNextRound.mockReset()
     api.leaveRoom.mockReset()
+    api.refreshPresence.mockReset()
+    api.refreshPresence.mockResolvedValue()
   })
 
   it('shows home and creates a room while persisting private credentials', async () => {
@@ -206,18 +216,41 @@ describe('core room flow', () => {
     expect(screen.getByLabelText('host score')).toHaveTextContent('1')
   })
 
-  it('closes the room locally after the leave command succeeds', async () => {
+  it('disables voluntary leave while the round is unfinished', async () => {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(persistedHostSession))
     streamRoomState(readyState)
-    api.leaveRoom.mockResolvedValue()
     render(<App />)
 
     await screen.findByRole('heading', { name: 'Choose your move' })
+    const leave = screen.getByRole('button', { name: 'Leave room' })
+    expect(leave).toBeDisabled()
+    await userEvent.click(leave)
+    expect(api.leaveRoom).not.toHaveBeenCalled()
+    expect(screen.getByText('You can leave after the round is finished.')).toBeInTheDocument()
+  })
+
+  it('closes the room locally after a finished-game leave succeeds', async () => {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(persistedHostSession))
+    streamRoomState(resolvedState)
+    api.leaveRoom.mockResolvedValue()
+    render(<App />)
+
+    await screen.findByRole('heading', { name: 'You won' })
     await userEvent.click(screen.getByRole('button', { name: 'Leave room' }))
     expect(api.leaveRoom).toHaveBeenCalledWith('ABC234', 'host-secret')
-    expect(screen.getByRole('button', { name: 'Create room' })).toBeInTheDocument()
+		expect(screen.getByRole('button', { name: 'Create room' })).toBeInTheDocument()
     expect(localStorage.getItem(STORAGE_KEY)).toBeNull()
     expect(closeStream).toHaveBeenCalledOnce()
+  })
+
+  it('shows a finished forfeit without inventing revealed moves', async () => {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(persistedHostSession))
+    streamRoomState({ ...resolvedState, forfeit: true, moves: [] })
+    render(<App />)
+
+    expect(await screen.findByRole('heading', { name: 'You won' })).toBeInTheDocument()
+    expect(screen.getByText('Your opponent disconnected and did not return.')).toBeInTheDocument()
+    expect(screen.queryByText('unknown')).not.toBeInTheDocument()
   })
 
   it('ejects the connected player when SSE reports that the opponent left', async () => {
@@ -271,6 +304,24 @@ describe('core room flow', () => {
     expect(await screen.findByRole('heading', { name: /waiting for a guest/i })).toBeInTheDocument()
     expect(firstClose).toHaveBeenCalledOnce()
     expect(api.subscribeToRoom).toHaveBeenCalledTimes(2)
+  })
+
+  it('aborts an in-flight presence renewal when the room unmounts', async () => {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(persistedHostSession))
+    streamRoomState(readyState)
+    let presenceSignal
+    let finishPresence
+    api.refreshPresence.mockImplementation((_code, _token, { signal }) => {
+      presenceSignal = signal
+      return new Promise((resolve) => { finishPresence = resolve })
+    })
+    const { unmount } = render(<App />)
+
+    await screen.findByRole('heading', { name: 'Choose your move' })
+    expect(presenceSignal.aborted).toBe(false)
+    unmount()
+    expect(presenceSignal.aborted).toBe(true)
+    await act(async () => finishPresence())
   })
 
   it.each([401, 404])('clears an invalid restored session after validation returns %s', async (status) => {

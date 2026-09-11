@@ -60,8 +60,8 @@ func TestPostgresPersistsAndSerializesRooms(t *testing.T) {
 	if snapshot.Revision != 4 || !snapshot.State.Resolved || snapshot.State.Players[0].Wins != 1 {
 		t.Fatalf("reconstructed = %#v", snapshot)
 	}
-	if err = restarted.SubmitMove(ctx, host.RoomCode, host.PlayerToken, domain.Paper); !errors.Is(err, domain.ErrDuplicateMove) {
-		t.Fatalf("duplicate error = %v", err)
+	if err = restarted.SubmitMove(ctx, host.RoomCode, host.PlayerToken, domain.Paper); !errors.Is(err, domain.ErrRoundResolved) {
+		t.Fatalf("resolved round error = %v", err)
 	}
 	unchanged, err := restarted.Snapshot(ctx, host.RoomCode)
 	if err != nil {
@@ -101,7 +101,9 @@ func TestPostgresConcurrentJoinAllowsOneGuest(t *testing.T) {
 	for i := range 2 {
 		go func() {
 			<-start
-			_, err := repository.Join(context.Background(), "JOIN23", fmt.Sprintf("guest-%d", i), application.DigestToken(fmt.Sprintf("token-%d", i)))
+			now := time.Now()
+			deadline := now.Add(13 * time.Second)
+			_, _, err := repository.Join(context.Background(), "JOIN23", fmt.Sprintf("guest-%d", i), application.DigestToken(fmt.Sprintf("token-%d", i)), application.PresenceWindow{ObservedAt: now, ProofAfter: deadline, Deadline: deadline, EvaluateAt: deadline.Add(3 * time.Second)})
 			errs <- err
 		}()
 	}
@@ -119,6 +121,82 @@ func TestPostgresConcurrentJoinAllowsOneGuest(t *testing.T) {
 	}
 	if success != 1 || full != 1 {
 		t.Fatalf("success=%d full=%d", success, full)
+	}
+}
+
+func TestPostgresPersistsForfeitAndRejectsStaleLease(t *testing.T) {
+	pool := integrationPool(t)
+	ctx := context.Background()
+	repository := postgres.NewRepository(pool)
+	service := fixedService(repository, postgres.NewEvents(pool, slog.Default()))
+	host, err := service.Create(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	guest, err := service.Join(ctx, host.RoomCode)
+	if err != nil {
+		t.Fatal(err)
+	}
+	observed := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
+	guestDeadline := observed.Add(13 * time.Second)
+	guestWindow := application.PresenceWindow{ObservedAt: observed, ProofAfter: guestDeadline, Deadline: guestDeadline, EvaluateAt: guestDeadline.Add(3 * time.Second)}
+	skewedHostObserved := observed.Add(4 * time.Second)
+	skewedHostDeadline := skewedHostObserved.Add(13 * time.Second)
+	skewedHostWindow := application.PresenceWindow{ObservedAt: skewedHostObserved, ProofAfter: skewedHostDeadline, Deadline: skewedHostDeadline, EvaluateAt: skewedHostDeadline.Add(3 * time.Second)}
+	if _, err = repository.RefreshPresence(ctx, host.RoomCode, application.DigestToken(host.PlayerToken), skewedHostWindow); err != nil {
+		t.Fatal(err)
+	}
+	staleLeases, err := repository.RefreshPresence(ctx, host.RoomCode, application.DigestToken(guest.PlayerToken), guestWindow)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stale := postgresLeaseForPlayer(t, staleLeases, "guest-id")
+	currentLeases, err := repository.RefreshPresence(ctx, host.RoomCode, application.DigestToken(guest.PlayerToken), guestWindow)
+	if err != nil {
+		t.Fatal(err)
+	}
+	current := postgresLeaseForPlayer(t, currentLeases, "guest-id")
+	if _, changed, err := repository.ForfeitExpired(ctx, stale, guestWindow.EvaluateAt); err != nil || changed {
+		t.Fatalf("stale lease changed=%v error=%v", changed, err)
+	}
+	if _, changed, err := repository.ForfeitExpired(ctx, current, guestWindow.EvaluateAt); err != nil || changed {
+		t.Fatalf("skewed absent lease changed=%v error=%v", changed, err)
+	}
+	hostObserved := guestWindow.ProofAfter.Add(time.Second)
+	hostDeadline := hostObserved.Add(13 * time.Second)
+	hostWindow := application.PresenceWindow{ObservedAt: hostObserved, ProofAfter: hostDeadline, Deadline: hostDeadline, EvaluateAt: hostDeadline.Add(3 * time.Second)}
+	refreshedLeases, err := repository.RefreshPresence(ctx, host.RoomCode, application.DigestToken(host.PlayerToken), hostWindow)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reconstructed := postgresLeaseForPlayer(t, refreshedLeases, "guest-id")
+	if reconstructed.Generation <= current.Generation || reconstructed.Deadline != current.Deadline || reconstructed.ProofAfter != current.ProofAfter {
+		t.Fatalf("reconstructed lease = %#v, previous = %#v", reconstructed, current)
+	}
+	snapshot, changed, err := repository.ForfeitExpired(ctx, reconstructed, guestWindow.EvaluateAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !changed || !snapshot.State.Forfeit || snapshot.State.Result != domain.PlayerOneWins || snapshot.State.Players[0].Wins != 1 {
+		t.Fatalf("forfeit snapshot = %#v, changed=%v", snapshot, changed)
+	}
+	if _, changed, err = repository.ForfeitExpired(ctx, reconstructed, guestWindow.EvaluateAt); err != nil || changed {
+		t.Fatalf("duplicate lease changed=%v error=%v", changed, err)
+	}
+	var presenceCount int
+	if err = pool.QueryRow(ctx, "SELECT count(*) FROM room_presence WHERE room_code=$1", host.RoomCode).Scan(&presenceCount); err != nil {
+		t.Fatal(err)
+	}
+	if presenceCount != 2 {
+		t.Fatalf("presence rows after forfeit = %d, want 2", presenceCount)
+	}
+	restarted := application.NewService(postgres.NewRepository(pool), postgres.NewEvents(pool, slog.Default()))
+	restored, err := restarted.Snapshot(ctx, host.RoomCode)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !restored.State.Forfeit || restored.State.Result != domain.PlayerOneWins || restored.State.Players[0].Wins != 1 {
+		t.Fatalf("restored forfeit = %#v", restored)
 	}
 }
 
@@ -162,6 +240,12 @@ func TestPostgresPreservesRoundHistoryAndClosedRoomAcrossRestart(t *testing.T) {
 		t.Fatalf("round-one history = result %q, %d moves, %d requests", result, moveCount, requestCount)
 	}
 
+	if err = service.SubmitMove(ctx, host.RoomCode, host.PlayerToken, domain.Rock); err != nil {
+		t.Fatal(err)
+	}
+	if err = service.SubmitMove(ctx, host.RoomCode, guest.PlayerToken, domain.Rock); err != nil {
+		t.Fatal(err)
+	}
 	if err = service.Leave(ctx, host.RoomCode, host.PlayerToken); err != nil {
 		t.Fatal(err)
 	}
@@ -170,7 +254,7 @@ func TestPostgresPreservesRoundHistoryAndClosedRoomAcrossRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if role != "host" || snapshot.Revision != 7 || snapshot.State.Round != 2 || !snapshot.State.Closed || snapshot.State.Players[0].Wins != 1 {
+	if role != "host" || snapshot.Revision != 9 || snapshot.State.Round != 2 || !snapshot.State.Resolved || !snapshot.State.Closed || snapshot.State.Players[0].Wins != 1 {
 		t.Fatalf("restarted closed room = role %q, snapshot %#v", role, snapshot)
 	}
 }
@@ -246,4 +330,15 @@ func fixedService(repository application.Repository, events application.Events) 
 		return value, nil
 	}
 	return application.NewServiceWithGenerators(repository, events, func() (string, error) { return "PGT234", nil }, next, next)
+}
+
+func postgresLeaseForPlayer(t *testing.T, leases []application.PresenceLease, playerID string) application.PresenceLease {
+	t.Helper()
+	for _, lease := range leases {
+		if lease.PlayerID == playerID {
+			return lease
+		}
+	}
+	t.Fatalf("lease for %q not found in %#v", playerID, leases)
+	return application.PresenceLease{}
 }

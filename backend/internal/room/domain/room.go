@@ -17,6 +17,8 @@ var (
 	ErrRoundNotResolved   = errors.New("round is not resolved")
 	ErrNextRoundRequested = errors.New("player already requested another round")
 	ErrStaleRound         = errors.New("round request is stale")
+	ErrRoundResolved      = errors.New("round is already resolved")
+	ErrGameUnfinished     = errors.New("game is unfinished")
 	ErrRoomClosed         = errors.New("room is closed")
 	ErrInvalidState       = errors.New("invalid persisted room state")
 )
@@ -75,6 +77,7 @@ type State struct {
 	Closed   bool
 	Moves    []PlayerMove
 	Result   Result
+	Forfeit  bool
 }
 
 // PersistenceState contains the complete aggregate state without credentials.
@@ -85,6 +88,7 @@ type PersistenceState struct {
 	Closed            bool
 	Resolved          bool
 	Result            Result
+	ForfeitedPlayerID string
 	Moves             map[string]Move
 	NextRoundRequests map[string]bool
 }
@@ -100,6 +104,7 @@ type Room struct {
 	moves             map[string]Move
 	resolved          bool
 	result            Result
+	forfeitedPlayerID string
 	round             uint64
 	nextRoundRequests map[string]bool
 	closed            bool
@@ -138,17 +143,27 @@ func Restore(state PersistenceState) (*Room, error) {
 		}
 	}
 	if state.Resolved {
-		if len(state.Players) != 2 || len(state.Moves) != 2 || (state.Result != Draw && state.Result != PlayerOneWins && state.Result != PlayerTwoWins) {
+		if len(state.Players) != 2 || (state.Result != Draw && state.Result != PlayerOneWins && state.Result != PlayerTwoWins) {
 			return nil, ErrInvalidState
 		}
-		result, _ := DetermineResult(state.Moves[state.Players[0].ID], state.Moves[state.Players[1].ID])
-		if result != state.Result {
-			return nil, ErrInvalidState
+		if state.ForfeitedPlayerID == "" {
+			if len(state.Moves) != 2 {
+				return nil, ErrInvalidState
+			}
+			result, _ := DetermineResult(state.Moves[state.Players[0].ID], state.Moves[state.Players[1].ID])
+			if result != state.Result {
+				return nil, ErrInvalidState
+			}
+		} else {
+			if !seen[state.ForfeitedPlayerID] || len(state.Moves) > 1 || state.Result == Draw ||
+				(state.ForfeitedPlayerID == state.Players[0].ID) != (state.Result == PlayerTwoWins) {
+				return nil, ErrInvalidState
+			}
 		}
-	} else if state.Result != "" || len(state.NextRoundRequests) != 0 {
+	} else if state.Result != "" || state.ForfeitedPlayerID != "" || len(state.NextRoundRequests) != 0 {
 		return nil, ErrInvalidState
 	}
-	return &Room{code: state.Code, players: append([]PersistedPlayer(nil), state.Players...), moves: cloneMoves(state.Moves), resolved: state.Resolved, result: state.Result, round: state.Round, nextRoundRequests: cloneRequests(state.NextRoundRequests), closed: state.Closed}, nil
+	return &Room{code: state.Code, players: append([]PersistedPlayer(nil), state.Players...), moves: cloneMoves(state.Moves), resolved: state.Resolved, result: state.Result, forfeitedPlayerID: state.ForfeitedPlayerID, round: state.Round, nextRoundRequests: cloneRequests(state.NextRoundRequests), closed: state.Closed}, nil
 }
 
 func (r *Room) Join(playerID string) error {
@@ -177,6 +192,9 @@ func (r *Room) SubmitMove(playerID string, move Move) error {
 	}
 	if len(r.players) < 2 {
 		return ErrRoomNotReady
+	}
+	if r.resolved {
+		return ErrRoundResolved
 	}
 	if !IsValidMove(move) {
 		return fmt.Errorf("%w: %q", ErrInvalidMove, move)
@@ -212,6 +230,7 @@ func (r *Room) RequestNextRound(playerID string, round uint64) error {
 		r.moves = map[string]Move{}
 		r.resolved = false
 		r.result = ""
+		r.forfeitedPlayerID = ""
 		r.round++
 		r.nextRoundRequests = map[string]bool{}
 	}
@@ -225,7 +244,40 @@ func (r *Room) Leave(playerID string) error {
 	if !r.hasPlayer(playerID) {
 		return ErrUnknownPlayer
 	}
+	if !r.resolved {
+		return ErrGameUnfinished
+	}
 	r.closed = true
+	return nil
+}
+
+// Forfeit resolves an unfinished round for the opponent of a disconnected player.
+// The expected round makes delayed or duplicate expiry attempts deterministic no-ops.
+func (r *Room) Forfeit(playerID string, expectedRound uint64) error {
+	if r.closed {
+		return ErrRoomClosed
+	}
+	if !r.hasPlayer(playerID) {
+		return ErrUnknownPlayer
+	}
+	if expectedRound != r.round {
+		return ErrStaleRound
+	}
+	if r.resolved {
+		return ErrRoundResolved
+	}
+	if len(r.players) != 2 {
+		return ErrRoomNotReady
+	}
+	r.resolved = true
+	r.forfeitedPlayerID = playerID
+	if r.players[0].ID == playerID {
+		r.result = PlayerTwoWins
+		r.players[1].Wins++
+	} else {
+		r.result = PlayerOneWins
+		r.players[0].Wins++
+	}
 	return nil
 }
 
@@ -235,18 +287,20 @@ func (r *Room) State() State {
 		_, submitted := r.moves[p.ID]
 		players[i] = Player{ID: p.ID, Wins: p.Wins, Submitted: submitted, WantsNextRound: r.nextRoundRequests[p.ID]}
 	}
-	state := State{Code: r.code, Players: players, Ready: len(players) == 2, Resolved: r.resolved, Round: r.round, Closed: r.closed}
+	state := State{Code: r.code, Players: players, Ready: len(players) == 2, Resolved: r.resolved, Round: r.round, Closed: r.closed, Forfeit: r.forfeitedPlayerID != ""}
 	if r.resolved {
 		state.Result = r.result
 		for _, p := range r.players {
-			state.Moves = append(state.Moves, PlayerMove{PlayerID: p.ID, Move: r.moves[p.ID]})
+			if move, ok := r.moves[p.ID]; ok {
+				state.Moves = append(state.Moves, PlayerMove{PlayerID: p.ID, Move: move})
+			}
 		}
 	}
 	return state
 }
 
 func (r *Room) PersistenceState() PersistenceState {
-	return PersistenceState{Code: r.code, Players: append([]PersistedPlayer(nil), r.players...), Round: r.round, Closed: r.closed, Resolved: r.resolved, Result: r.result, Moves: cloneMoves(r.moves), NextRoundRequests: cloneRequests(r.nextRoundRequests)}
+	return PersistenceState{Code: r.code, Players: append([]PersistedPlayer(nil), r.players...), Round: r.round, Closed: r.closed, Resolved: r.resolved, Result: r.result, ForfeitedPlayerID: r.forfeitedPlayerID, Moves: cloneMoves(r.moves), NextRoundRequests: cloneRequests(r.nextRoundRequests)}
 }
 
 func (r *Room) hasPlayer(id string) bool {

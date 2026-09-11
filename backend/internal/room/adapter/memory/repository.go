@@ -3,8 +3,10 @@ package memory
 import (
 	"context"
 	"crypto/subtle"
+	"errors"
 	"fmt"
 	"sync"
+	"time"
 
 	"example.com/rock-paper-money/internal/room/application"
 	"example.com/rock-paper-money/internal/room/domain"
@@ -19,6 +21,13 @@ type storedRoom struct {
 	room        *domain.Room
 	revision    uint64
 	credentials map[string]application.CredentialDigest
+	presence    map[string]memoryPresence
+}
+
+type memoryPresence struct {
+	generation  uint64
+	refreshedAt time.Time
+	deadline    time.Time
 }
 
 func New() (*Repository, *Events) {
@@ -37,27 +46,34 @@ func (r *Repository) Create(_ context.Context, aggregate *domain.Room, digest ap
 	if err != nil {
 		return application.Snapshot{}, err
 	}
-	r.rooms[state.Code] = &storedRoom{room: storedAggregate, revision: 1, credentials: map[string]application.CredentialDigest{state.Players[0].ID: digest}}
+	r.rooms[state.Code] = &storedRoom{room: storedAggregate, revision: 1, credentials: map[string]application.CredentialDigest{state.Players[0].ID: digest}, presence: map[string]memoryPresence{}}
 	return application.Snapshot{State: state, Revision: 1}, nil
 }
 
-func (r *Repository) Join(_ context.Context, code, playerID string, digest application.CredentialDigest) (application.Snapshot, error) {
+func (r *Repository) Join(_ context.Context, code, playerID string, digest application.CredentialDigest, window application.PresenceWindow) (application.Snapshot, []application.PresenceLease, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	stored, err := r.room(code)
 	if err != nil {
-		return application.Snapshot{}, err
+		return application.Snapshot{}, nil, err
 	}
 	for _, existing := range stored.credentials {
 		if equalDigest(existing, digest) {
-			return application.Snapshot{}, domain.ErrDuplicatePlayer
+			return application.Snapshot{}, nil, domain.ErrDuplicatePlayer
 		}
 	}
 	if err := stored.room.Join(playerID); err != nil {
-		return application.Snapshot{}, err
+		return application.Snapshot{}, nil, err
 	}
 	stored.credentials[playerID] = digest
-	return r.changed(code, stored), nil
+	state := stored.room.State()
+	leases := make([]application.PresenceLease, 0, len(state.Players))
+	for _, player := range state.Players {
+		generation := stored.presence[player.ID].generation + 1
+		stored.presence[player.ID] = memoryPresence{generation: generation, refreshedAt: window.ObservedAt, deadline: window.Deadline}
+		leases = append(leases, application.PresenceLease{RoomCode: code, PlayerID: player.ID, Round: state.Round, Generation: generation, Deadline: window.Deadline, EvaluateAt: window.EvaluateAt, ProofAfter: window.ProofAfter, Active: true})
+	}
+	return r.changed(code, stored), leases, nil
 }
 
 func (r *Repository) Mutate(_ context.Context, code string, digest application.CredentialDigest, mutation application.Mutation) (application.Snapshot, error) {
@@ -109,6 +125,74 @@ func (r *Repository) Authenticate(_ context.Context, code string, digest applica
 		role = "host"
 	}
 	return application.Snapshot{State: state, Revision: stored.revision}, role, nil
+}
+
+func (r *Repository) RefreshPresence(_ context.Context, code string, digest application.CredentialDigest, window application.PresenceWindow) ([]application.PresenceLease, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	stored, err := r.room(code)
+	if err != nil {
+		return nil, err
+	}
+	playerID, ok := authenticate(stored.credentials, digest)
+	if !ok {
+		return nil, application.ErrUnauthorized
+	}
+	state := stored.room.State()
+	presence := stored.presence[playerID]
+	presence.refreshedAt = window.ObservedAt
+	presence.deadline = window.Deadline
+	stored.presence[playerID] = presence
+	active := !state.Closed && !state.Resolved && state.Ready
+	evaluationDelay := window.EvaluateAt.Sub(window.Deadline)
+	leases := make([]application.PresenceLease, 0, len(state.Players))
+	for _, player := range state.Players {
+		participant, exists := stored.presence[player.ID]
+		if !exists {
+			continue
+		}
+		participant.generation++
+		stored.presence[player.ID] = participant
+		leases = append(leases, application.PresenceLease{RoomCode: code, PlayerID: player.ID, Round: state.Round, Generation: participant.generation, Deadline: participant.deadline, EvaluateAt: participant.deadline.Add(evaluationDelay), ProofAfter: participant.deadline, Active: active})
+	}
+	return leases, nil
+}
+
+func (r *Repository) ForfeitExpired(_ context.Context, lease application.PresenceLease, now time.Time) (application.Snapshot, bool, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	stored, err := r.room(lease.RoomCode)
+	if err != nil {
+		return application.Snapshot{}, false, err
+	}
+	presence, ok := stored.presence[lease.PlayerID]
+	if !ok || presence.generation != lease.Generation || now.Before(presence.deadline) {
+		return application.Snapshot{State: stored.room.State(), Revision: stored.revision}, false, nil
+	}
+	state := stored.room.State()
+	remainingConnected := false
+	for _, player := range state.Players {
+		if player.ID == lease.PlayerID {
+			continue
+		}
+		remaining, present := stored.presence[player.ID]
+		remainingConnected = present && now.Before(remaining.deadline) && remaining.refreshedAt.After(lease.ProofAfter)
+	}
+	if !remainingConnected {
+		return application.Snapshot{State: state, Revision: stored.revision}, false, nil
+	}
+	working, err := domain.Restore(stored.room.PersistenceState())
+	if err != nil {
+		return application.Snapshot{}, false, err
+	}
+	if err = working.Forfeit(lease.PlayerID, lease.Round); err != nil {
+		if errors.Is(err, domain.ErrStaleRound) || errors.Is(err, domain.ErrRoundResolved) || errors.Is(err, domain.ErrRoomClosed) {
+			return application.Snapshot{State: stored.room.State(), Revision: stored.revision}, false, nil
+		}
+		return application.Snapshot{}, false, err
+	}
+	stored.room = working
+	return r.changed(lease.RoomCode, stored), true, nil
 }
 
 func (r *Repository) room(code string) (*storedRoom, error) {

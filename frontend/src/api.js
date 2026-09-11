@@ -6,6 +6,8 @@ export class ApiError extends Error {
   }
 }
 
+export const PRESENCE_HEARTBEAT_MS = 3000
+
 async function request(path, options = {}) {
   let response
   try {
@@ -50,6 +52,7 @@ function mapRoomState(dto) {
     resolved: dto.resolved,
     round: dto.round,
     closed: dto.closed,
+    forfeit: dto.forfeit ?? false,
     players: dto.players.map((player) => ({
       role: player.role,
       wins: player.wins,
@@ -127,6 +130,14 @@ export async function startNextRound(code, token, round, { signal } = {}) {
 
 export async function leaveRoom(code, token, { signal } = {}) {
   await request(`/api/rooms/${encodeURIComponent(code)}/leave`, {
+    method: 'POST',
+    headers: bearer(token),
+    signal,
+  })
+}
+
+export async function refreshPresence(code, token, { signal } = {}) {
+  await request(`/api/rooms/${encodeURIComponent(code)}/presence`, {
     method: 'POST',
     headers: bearer(token),
     signal,

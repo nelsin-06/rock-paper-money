@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"example.com/rock-paper-money/internal/room/application"
 	"example.com/rock-paper-money/internal/room/domain"
@@ -13,6 +14,8 @@ import (
 )
 
 type Repository struct{ pool *pgxpool.Pool }
+
+var errPresenceLeaseCurrent = errors.New("presence lease is still current")
 
 func NewRepository(pool *pgxpool.Pool) *Repository   { return &Repository{pool: pool} }
 func (r *Repository) Ping(ctx context.Context) error { return r.pool.Ping(ctx) }
@@ -41,8 +44,9 @@ func (r *Repository) Create(ctx context.Context, aggregate *domain.Room, digest 
 	return application.Snapshot{State: aggregate.State(), Revision: 1}, nil
 }
 
-func (r *Repository) Join(ctx context.Context, code, playerID string, digest application.CredentialDigest) (application.Snapshot, error) {
-	return r.write(ctx, code, nil, func(tx pgx.Tx, aggregate *domain.Room, _ string) error {
+func (r *Repository) Join(ctx context.Context, code, playerID string, digest application.CredentialDigest, window application.PresenceWindow) (application.Snapshot, []application.PresenceLease, error) {
+	var leases []application.PresenceLease
+	snapshot, err := r.write(ctx, code, nil, func(tx pgx.Tx, aggregate *domain.Room, _ string) error {
 		if err := aggregate.Join(playerID); err != nil {
 			return err
 		}
@@ -50,8 +54,30 @@ func (r *Repository) Join(ctx context.Context, code, playerID string, digest app
 		if isUnique(err) {
 			return domain.ErrDuplicatePlayer
 		}
-		return err
+		if err != nil {
+			return err
+		}
+		rows, err := tx.Query(ctx, "INSERT INTO room_presence(room_code,player_id,generation,deadline,refreshed_at) SELECT room_code,player_id,1,$2,$3 FROM room_seats WHERE room_code=$1 ON CONFLICT(room_code,player_id) DO UPDATE SET generation=room_presence.generation+1,deadline=EXCLUDED.deadline,refreshed_at=EXCLUDED.refreshed_at RETURNING player_id,generation", code, window.Deadline, window.ObservedAt)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var lease application.PresenceLease
+			if err = rows.Scan(&lease.PlayerID, &lease.Generation); err != nil {
+				return err
+			}
+			lease.RoomCode = code
+			lease.Round = aggregate.State().Round
+			lease.Deadline = window.Deadline
+			lease.EvaluateAt = window.EvaluateAt
+			lease.ProofAfter = window.ProofAfter
+			lease.Active = true
+			leases = append(leases, lease)
+		}
+		return rows.Err()
 	})
+	return snapshot, leases, err
 }
 
 func (r *Repository) Mutate(ctx context.Context, code string, digest application.CredentialDigest, mutation application.Mutation) (application.Snapshot, error) {
@@ -152,6 +178,96 @@ func (r *Repository) Authenticate(ctx context.Context, code string, digest appli
 	return application.Snapshot{State: aggregate.State(), Revision: revision}, role, nil
 }
 
+func (r *Repository) RefreshPresence(ctx context.Context, code string, digest application.CredentialDigest, window application.PresenceWindow) ([]application.PresenceLease, error) {
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx)
+	var status string
+	var round uint64
+	if err = tx.QueryRow(ctx, "SELECT status,current_round FROM room_rooms WHERE code=$1 FOR UPDATE", code).Scan(&status, &round); errors.Is(err, pgx.ErrNoRows) {
+		return nil, application.ErrRoomNotFound
+	} else if err != nil {
+		return nil, err
+	}
+	var playerID string
+	if err = tx.QueryRow(ctx, "SELECT player_id FROM room_seats WHERE room_code=$1 AND credential_digest=$2", code, digest[:]).Scan(&playerID); errors.Is(err, pgx.ErrNoRows) {
+		return nil, application.ErrUnauthorized
+	} else if err != nil {
+		return nil, err
+	}
+	var playerCount int
+	var result *string
+	if err = tx.QueryRow(ctx, "SELECT count(*),max(result) FROM room_seats s LEFT JOIN room_rounds rr ON rr.room_code=s.room_code AND rr.number=$2 WHERE s.room_code=$1", code, round).Scan(&playerCount, &result); err != nil {
+		return nil, err
+	}
+	active := status == "active" && result == nil && playerCount == 2
+	if _, err = tx.Exec(ctx, "INSERT INTO room_presence(room_code,player_id,generation,deadline,refreshed_at) VALUES($1,$2,1,$3,$4) ON CONFLICT(room_code,player_id) DO UPDATE SET deadline=EXCLUDED.deadline,refreshed_at=EXCLUDED.refreshed_at", code, playerID, window.Deadline, window.ObservedAt); err != nil {
+		return nil, err
+	}
+	rows, err := tx.Query(ctx, "UPDATE room_presence SET generation=generation+1 WHERE room_code=$1 RETURNING player_id,generation,deadline", code)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	evaluationDelay := window.EvaluateAt.Sub(window.Deadline)
+	leases := make([]application.PresenceLease, 0, playerCount)
+	for rows.Next() {
+		var lease application.PresenceLease
+		if err = rows.Scan(&lease.PlayerID, &lease.Generation, &lease.Deadline); err != nil {
+			return nil, err
+		}
+		lease.RoomCode = code
+		lease.Round = round
+		lease.EvaluateAt = lease.Deadline.Add(evaluationDelay)
+		lease.ProofAfter = lease.Deadline
+		lease.Active = active
+		leases = append(leases, lease)
+	}
+	if err = rows.Err(); err != nil {
+		return nil, err
+	}
+	rows.Close()
+	if err = tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	return leases, nil
+}
+
+func (r *Repository) ForfeitExpired(ctx context.Context, lease application.PresenceLease, now time.Time) (application.Snapshot, bool, error) {
+	snapshot, err := r.write(ctx, lease.RoomCode, nil, func(tx pgx.Tx, aggregate *domain.Room, _ string) error {
+		var generation uint64
+		var deadline time.Time
+		if queryErr := tx.QueryRow(ctx, "SELECT generation,deadline FROM room_presence WHERE room_code=$1 AND player_id=$2 FOR UPDATE", lease.RoomCode, lease.PlayerID).Scan(&generation, &deadline); errors.Is(queryErr, pgx.ErrNoRows) {
+			return errPresenceLeaseCurrent
+		} else if queryErr != nil {
+			return queryErr
+		}
+		if generation != lease.Generation || now.Before(deadline) {
+			return errPresenceLeaseCurrent
+		}
+		var remainingConnected bool
+		if queryErr := tx.QueryRow(ctx, "SELECT EXISTS(SELECT 1 FROM room_presence WHERE room_code=$1 AND player_id<>$2 AND deadline>$3 AND refreshed_at>$4)", lease.RoomCode, lease.PlayerID, now, lease.ProofAfter).Scan(&remainingConnected); queryErr != nil {
+			return queryErr
+		}
+		if !remainingConnected {
+			return errPresenceLeaseCurrent
+		}
+		if forfeitErr := aggregate.Forfeit(lease.PlayerID, lease.Round); forfeitErr != nil {
+			if errors.Is(forfeitErr, domain.ErrStaleRound) || errors.Is(forfeitErr, domain.ErrRoundResolved) || errors.Is(forfeitErr, domain.ErrRoomClosed) {
+				return errPresenceLeaseCurrent
+			}
+			return forfeitErr
+		}
+		return nil
+	})
+	if errors.Is(err, errPresenceLeaseCurrent) {
+		return application.Snapshot{}, false, nil
+	}
+	return snapshot, err == nil, err
+}
+
 type queryer interface {
 	Query(context.Context, string, ...any) (pgx.Rows, error)
 	QueryRow(context.Context, string, ...any) pgx.Row
@@ -160,8 +276,8 @@ type queryer interface {
 func load(ctx context.Context, q queryer, code string) (*domain.Room, map[string]string, error) {
 	var round uint64
 	var status string
-	var result *string
-	if err := q.QueryRow(ctx, "SELECT r.current_round,r.status,rr.result FROM room_rooms r JOIN room_rounds rr ON rr.room_code=r.code AND rr.number=r.current_round WHERE r.code=$1", code).Scan(&round, &status, &result); err != nil {
+	var result, forfeitedRole *string
+	if err := q.QueryRow(ctx, "SELECT r.current_round,r.status,rr.result,rr.forfeited_role FROM room_rooms r JOIN room_rounds rr ON rr.room_code=r.code AND rr.number=r.current_round WHERE r.code=$1", code).Scan(&round, &status, &result, &forfeitedRole); err != nil {
 		return nil, nil, err
 	}
 	rows, err := q.Query(ctx, "SELECT role,player_id,wins FROM room_seats WHERE room_code=$1 ORDER BY CASE role WHEN 'host' THEN 0 ELSE 1 END", code)
@@ -200,6 +316,9 @@ func load(ctx context.Context, q queryer, code string) (*domain.Room, map[string
 	if result != nil {
 		state.Resolved = true
 		state.Result = domain.Result(*result)
+	}
+	if forfeitedRole != nil {
+		state.ForfeitedPlayerID = roles[*forfeitedRole]
 	}
 	aggregate, err := domain.Restore(state)
 	return aggregate, roles, err
@@ -260,11 +379,17 @@ func save(ctx context.Context, tx pgx.Tx, aggregate *domain.Room, roles map[stri
 	}
 	var result any
 	var resolvedAt any
+	var forfeitedRole any
 	if state.Resolved {
 		result = string(state.Result)
 		resolvedAt = "now"
+		for role, id := range roles {
+			if id == state.ForfeitedPlayerID {
+				forfeitedRole = role
+			}
+		}
 	}
-	if _, err := tx.Exec(ctx, "INSERT INTO room_rounds(room_code,number,result,resolved_at) VALUES($1,$2,$3,CASE WHEN $4::text IS NULL THEN NULL ELSE now() END) ON CONFLICT(room_code,number) DO UPDATE SET result=EXCLUDED.result,resolved_at=EXCLUDED.resolved_at", state.Code, state.Round, result, resolvedAt); err != nil {
+	if _, err := tx.Exec(ctx, "INSERT INTO room_rounds(room_code,number,result,resolved_at,forfeited_role) VALUES($1,$2,$3,CASE WHEN $4::text IS NULL THEN NULL ELSE now() END,$5) ON CONFLICT(room_code,number) DO UPDATE SET result=EXCLUDED.result,resolved_at=EXCLUDED.resolved_at,forfeited_role=EXCLUDED.forfeited_role", state.Code, state.Round, result, resolvedAt, forfeitedRole); err != nil {
 		return err
 	}
 	if state.Round > previousRound {

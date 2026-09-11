@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { ApiError, createRoom, getRoomState, leaveRoom, startNextRound, submitMove, subscribeToRoom, validateSession } from './api.js'
+import { ApiError, createRoom, getRoomState, leaveRoom, PRESENCE_HEARTBEAT_MS, refreshPresence, startNextRound, submitMove, subscribeToRoom, validateSession } from './api.js'
 
 function response(body, { status = 200 } = {}) {
   return new Response(body === null ? null : JSON.stringify(body), {
@@ -21,7 +21,7 @@ describe('API client', () => {
 
     await expect(createRoom()).resolves.toEqual({ roomCode: 'ABC234', playerToken: 'private-token', role: 'host' })
     await expect(getRoomState('ABC234')).resolves.toEqual({
-      roomCode: 'ABC234', ready: true, resolved: false, round: 3, closed: false,
+      roomCode: 'ABC234', ready: true, resolved: false, round: 3, closed: false, forfeit: false,
       players: [{ role: 'host', wins: 2, submitted: true, wantsNextRound: false }], result: null, moves: [],
     })
   })
@@ -107,11 +107,25 @@ describe('API client', () => {
     close()
     expect(FakeEventSource.instance.close).toHaveBeenCalledOnce()
   })
+
+  it('refreshes participant presence with bearer credentials', async () => {
+    fetch.mockResolvedValue(response(null, { status: 204 }))
+    const controller = new AbortController()
+
+    await refreshPresence('ABC234', 'secret', { signal: controller.signal })
+
+    expect(fetch).toHaveBeenCalledWith('/api/rooms/ABC234/presence', expect.objectContaining({
+      method: 'POST',
+      headers: { Authorization: 'Bearer secret' },
+      signal: controller.signal,
+    }))
+    expect(PRESENCE_HEARTBEAT_MS).toBe(3000)
+  })
 })
 
 function waitingFrontendState() {
   return {
-    roomCode: 'ABC234', ready: false, resolved: false, round: 1, closed: false,
+    roomCode: 'ABC234', ready: false, resolved: false, round: 1, closed: false, forfeit: false,
     players: [{ role: 'host', wins: 0, submitted: false, wantsNextRound: false }], result: null, moves: [],
   }
 }

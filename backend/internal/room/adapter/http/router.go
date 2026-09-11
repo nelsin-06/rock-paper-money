@@ -40,6 +40,7 @@ func NewRouter(service *application.Service, ready func(context.Context) error) 
 	mux.HandleFunc("POST /api/rooms/{code}/validate-session", handler.validateSession)
 	mux.HandleFunc("POST /api/rooms/{code}/next-round", handler.startNextRound)
 	mux.HandleFunc("POST /api/rooms/{code}/leave", handler.leaveRoom)
+	mux.HandleFunc("POST /api/rooms/{code}/presence", handler.refreshPresence)
 	return logRequests(slog.Default(), mux)
 }
 
@@ -133,6 +134,8 @@ func (rt *router) submitMove(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, "room not ready")
 	case errors.Is(err, domain.ErrDuplicateMove):
 		writeError(w, http.StatusConflict, "move already submitted")
+	case errors.Is(err, domain.ErrRoundResolved):
+		writeError(w, http.StatusConflict, "round is already resolved")
 	case errors.Is(err, domain.ErrRoomClosed):
 		writeError(w, http.StatusConflict, "room is closed")
 	case errors.Is(err, application.ErrRoomNotFound):
@@ -258,6 +261,7 @@ func publicRoomState(code string, state domain.State) stateResponse {
 		Resolved: state.Resolved,
 		Round:    state.Round,
 		Closed:   state.Closed,
+		Forfeit:  state.Forfeit,
 		Players:  make([]statePlayer, len(state.Players)),
 	}
 	for i, player := range state.Players {
@@ -272,7 +276,7 @@ func publicRoomState(code string, state domain.State) stateResponse {
 		response.Result = state.Result
 		response.Moves = make([]stateMove, len(state.Moves))
 		for i, move := range state.Moves {
-			response.Moves[i] = stateMove{Role: playerRole(i), Move: move.Move}
+			response.Moves[i] = stateMove{Role: roleForPlayer(state.Players, move.PlayerID), Move: move.Move}
 		}
 	}
 	return response
@@ -334,6 +338,31 @@ func (rt *router) leaveRoom(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 	case errors.Is(err, domain.ErrRoomClosed):
 		writeError(w, http.StatusConflict, "room is closed")
+	case errors.Is(err, domain.ErrGameUnfinished):
+		writeError(w, http.StatusConflict, "game is unfinished")
+	case errors.Is(err, application.ErrRoomNotFound):
+		writeError(w, http.StatusNotFound, "room not found")
+	case errors.Is(err, application.ErrUnauthorized):
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+	default:
+		writeError(w, http.StatusInternalServerError, "internal server error")
+	}
+}
+
+func (rt *router) refreshPresence(w http.ResponseWriter, r *http.Request) {
+	code := normalizeRoomCode(r.PathValue("code"))
+	if code == "" {
+		writeError(w, http.StatusBadRequest, "room code is required")
+		return
+	}
+	token, ok := bearerToken(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	switch err := rt.service.RefreshPresence(r.Context(), code, token); {
+	case err == nil:
+		w.WriteHeader(http.StatusNoContent)
 	case errors.Is(err, application.ErrRoomNotFound):
 		writeError(w, http.StatusNotFound, "room not found")
 	case errors.Is(err, application.ErrUnauthorized):
@@ -385,6 +414,7 @@ type stateResponse struct {
 	Resolved bool          `json:"resolved"`
 	Round    uint64        `json:"round"`
 	Closed   bool          `json:"closed"`
+	Forfeit  bool          `json:"forfeit"`
 	Players  []statePlayer `json:"players"`
 	Result   domain.Result `json:"result,omitempty"`
 	Moves    []stateMove   `json:"moves,omitempty"`
@@ -424,6 +454,15 @@ func playerRole(index int) string {
 		return "host"
 	}
 	return "guest"
+}
+
+func roleForPlayer(players []domain.Player, playerID string) string {
+	for index, player := range players {
+		if player.ID == playerID {
+			return playerRole(index)
+		}
+	}
+	return ""
 }
 
 func decodeJSONBody(r *http.Request, destination any) bool {

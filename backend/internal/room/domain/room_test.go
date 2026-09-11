@@ -23,8 +23,8 @@ func TestRoundLifecycleAndMovePrivacy(t *testing.T) {
 	if !resolved.Resolved || resolved.Result != domain.PlayerOneWins || resolved.Players[0].Wins != 1 || len(resolved.Moves) != 2 {
 		t.Fatalf("resolved state = %#v", resolved)
 	}
-	if err := r.SubmitMove("host", domain.Paper); !errors.Is(err, domain.ErrDuplicateMove) {
-		t.Fatalf("duplicate move error = %v", err)
+	if err := r.SubmitMove("host", domain.Paper); !errors.Is(err, domain.ErrRoundResolved) {
+		t.Fatalf("resolved round move error = %v", err)
 	}
 	if err := r.RequestNextRound("guest", 1); err != nil {
 		t.Fatal(err)
@@ -109,6 +109,11 @@ func TestRestoreRoundTripAndRejectsCorruptState(t *testing.T) {
 
 func TestLeaveClosesRoom(t *testing.T) {
 	r := readyRoom(t)
+	if err := r.Leave("guest"); !errors.Is(err, domain.ErrGameUnfinished) {
+		t.Fatalf("unfinished leave error = %v", err)
+	}
+	_ = r.SubmitMove("host", domain.Rock)
+	_ = r.SubmitMove("guest", domain.Scissors)
 	if err := r.Leave("guest"); err != nil {
 		t.Fatal(err)
 	}
@@ -117,6 +122,38 @@ func TestLeaveClosesRoom(t *testing.T) {
 	}
 	if err := r.SubmitMove("host", domain.Rock); !errors.Is(err, domain.ErrRoomClosed) {
 		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestForfeitAwardsOpponentExactlyOnce(t *testing.T) {
+	r := readyRoom(t)
+	if err := r.Forfeit("guest", 1); err != nil {
+		t.Fatal(err)
+	}
+	state := r.State()
+	if !state.Resolved || !state.Forfeit || state.Result != domain.PlayerOneWins || state.Players[0].Wins != 1 || len(state.Moves) != 0 {
+		t.Fatalf("forfeit state = %#v", state)
+	}
+	if err := r.Forfeit("guest", 1); !errors.Is(err, domain.ErrRoundResolved) {
+		t.Fatalf("duplicate forfeit error = %v", err)
+	}
+	if r.State().Players[0].Wins != 1 {
+		t.Fatalf("duplicate forfeit changed wins: %#v", r.State())
+	}
+	for _, playerID := range []string{"host", "guest"} {
+		if err := r.SubmitMove(playerID, domain.Rock); !errors.Is(err, domain.ErrRoundResolved) {
+			t.Fatalf("%s move after forfeit error = %v", playerID, err)
+		}
+	}
+	if r.State().Players[0].Wins != 1 {
+		t.Fatalf("move after forfeit changed wins: %#v", r.State())
+	}
+	restored, err := domain.Restore(r.PersistenceState())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !restored.State().Forfeit || restored.State().Players[0].Wins != 1 {
+		t.Fatalf("restored forfeit = %#v", restored.State())
 	}
 }
 func readyRoom(t *testing.T) *domain.Room {

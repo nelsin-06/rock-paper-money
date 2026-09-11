@@ -14,6 +14,7 @@ import (
 
 	"example.com/rock-paper-money/internal/room/adapter/memory"
 	"example.com/rock-paper-money/internal/room/application"
+	"example.com/rock-paper-money/internal/room/domain"
 )
 
 func TestHTTPContractAndPrivacy(t *testing.T) {
@@ -40,9 +41,12 @@ func TestHTTPContractAndPrivacy(t *testing.T) {
 		t.Fatalf("resolved state = %s", resolved.Body.String())
 	}
 	assertPrivate(t, resolved.Body.String(), host.PlayerToken, guest.PlayerToken)
+	assertStatus(t, request(t, handler, http.MethodPost, "/api/rooms/ABC234/moves", host.PlayerToken, `{"move":"paper"}`), http.StatusConflict)
 	assertStatus(t, request(t, handler, http.MethodPost, "/api/rooms/ABC234/validate-session", host.PlayerToken, `{"role":"host"}`), http.StatusNoContent)
 	assertStatus(t, request(t, handler, http.MethodPost, "/api/rooms/ABC234/next-round", guest.PlayerToken, `{"round":1}`), http.StatusNoContent)
 	assertStatus(t, request(t, handler, http.MethodPost, "/api/rooms/ABC234/next-round", host.PlayerToken, `{"round":1}`), http.StatusNoContent)
+	assertStatus(t, request(t, handler, http.MethodPost, "/api/rooms/ABC234/moves", host.PlayerToken, `{"move":"paper"}`), http.StatusNoContent)
+	assertStatus(t, request(t, handler, http.MethodPost, "/api/rooms/ABC234/moves", guest.PlayerToken, `{"move":"rock"}`), http.StatusNoContent)
 	assertStatus(t, request(t, handler, http.MethodPost, "/api/rooms/ABC234/leave", guest.PlayerToken, ""), http.StatusNoContent)
 }
 
@@ -76,7 +80,9 @@ func TestAuthenticationAndStableErrors(t *testing.T) {
 func TestValidateSessionChecksClosedRoomBeforeCredentials(t *testing.T) {
 	service := fixedService()
 	handler := NewRouter(service, nil)
-	assertStatus(t, request(t, handler, http.MethodPost, "/api/rooms", "", ""), http.StatusCreated)
+	hostResponse := request(t, handler, http.MethodPost, "/api/rooms", "", "")
+	assertStatus(t, hostResponse, http.StatusCreated)
+	host := credentials(t, hostResponse)
 	guestResponse := request(t, handler, http.MethodPost, "/api/rooms/ABC234/join", "", "")
 	guest := credentials(t, guestResponse)
 
@@ -85,6 +91,8 @@ func TestValidateSessionChecksClosedRoomBeforeCredentials(t *testing.T) {
 		assertStatus(t, response, http.StatusUnauthorized)
 	}
 
+	assertStatus(t, request(t, handler, http.MethodPost, "/api/rooms/ABC234/moves", host.PlayerToken, `{"move":"rock"}`), http.StatusNoContent)
+	assertStatus(t, request(t, handler, http.MethodPost, "/api/rooms/ABC234/moves", guest.PlayerToken, `{"move":"rock"}`), http.StatusNoContent)
 	assertStatus(t, request(t, handler, http.MethodPost, "/api/rooms/ABC234/leave", guest.PlayerToken, ""), http.StatusNoContent)
 	for _, authorization := range []string{"", "Basic invalid", "Bearer invalid"} {
 		response := validateSessionRequestWithAuthorization(t, handler, authorization)
@@ -93,6 +101,21 @@ func TestValidateSessionChecksClosedRoomBeforeCredentials(t *testing.T) {
 			t.Fatalf("closed-room body = %q", response.Body.String())
 		}
 	}
+}
+
+func TestLeaveRejectedDuringUnfinishedGameAndPresenceIsAuthenticated(t *testing.T) {
+	service := fixedService()
+	handler := NewRouter(service, nil)
+	host := credentials(t, request(t, handler, http.MethodPost, "/api/rooms", "", ""))
+	guest := credentials(t, request(t, handler, http.MethodPost, "/api/rooms/ABC234/join", "", ""))
+
+	response := request(t, handler, http.MethodPost, "/api/rooms/ABC234/leave", guest.PlayerToken, "")
+	assertStatus(t, response, http.StatusConflict)
+	if response.Body.String() != "{\"error\":\"game is unfinished\"}\n" {
+		t.Fatalf("body = %q", response.Body.String())
+	}
+	assertStatus(t, request(t, handler, http.MethodPost, "/api/rooms/ABC234/presence", "bad", ""), http.StatusUnauthorized)
+	assertStatus(t, request(t, handler, http.MethodPost, "/api/rooms/ABC234/presence", host.PlayerToken, ""), http.StatusNoContent)
 }
 
 func TestHealthAndReadinessDiffer(t *testing.T) {
@@ -119,6 +142,21 @@ func TestSSEEmitsAuthoritativeRevisions(t *testing.T) {
 	_, _ = service.Join(context.Background(), host.RoomCode)
 	if id := readEvent(t, reader); id != "2" {
 		t.Fatalf("changed id = %s", id)
+	}
+}
+
+func TestPublicStateProjectsSingleForfeitMoveByPlayerIdentity(t *testing.T) {
+	state := domain.State{
+		Code:     "ABC234",
+		Resolved: true,
+		Forfeit:  true,
+		Players:  []domain.Player{{ID: "host-id"}, {ID: "guest-id"}},
+		Moves:    []domain.PlayerMove{{PlayerID: "guest-id", Move: domain.Paper}},
+	}
+
+	response := publicRoomState(state.Code, state)
+	if len(response.Moves) != 1 || response.Moves[0].Role != "guest" || response.Moves[0].Move != domain.Paper {
+		t.Fatalf("projected moves = %#v", response.Moves)
 	}
 }
 

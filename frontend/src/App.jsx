@@ -137,10 +137,14 @@ function RoundResult({ state, role }) {
     <section className="result-panel" aria-live="polite">
       <p className="eyebrow">Round complete</p>
       <h2>{title}</h2>
-      <div className="revealed-moves">
-        <p><span>Your move</span><strong>{moveFor(role)}</strong></p>
-        <p><span>Opponent</span><strong>{moveFor(role === 'host' ? 'guest' : 'host')}</strong></p>
-      </div>
+      {state.forfeit ? (
+        <p>{localWon ? 'Your opponent disconnected and did not return.' : 'You did not reconnect before the grace period ended.'}</p>
+      ) : (
+        <div className="revealed-moves">
+          <p><span>Your move</span><strong>{moveFor(role)}</strong></p>
+          <p><span>Opponent</span><strong>{moveFor(role === 'host' ? 'guest' : 'host')}</strong></p>
+        </div>
+      )}
     </section>
   )
 }
@@ -195,6 +199,30 @@ function Room({ session, onLeave }) {
     }
   }, [session.roomCode, session.role, connectionAttempt, onLeave])
 
+  useEffect(() => {
+    let active = true
+    let presenceController = null
+    const refresh = async () => {
+      if (presenceController) return
+      const requestController = new AbortController()
+      presenceController = requestController
+      try {
+        await api.refreshPresence(session.roomCode, session.playerToken, { signal: requestController.signal })
+      } catch (presenceError) {
+        if (active && !requestController.signal.aborted) setConnectionError(displayError(presenceError))
+      } finally {
+        if (presenceController === requestController) presenceController = null
+      }
+    }
+    refresh()
+    const heartbeat = window.setInterval(refresh, api.PRESENCE_HEARTBEAT_MS)
+    return () => {
+      active = false
+      window.clearInterval(heartbeat)
+      presenceController?.abort()
+    }
+  }, [session.roomCode, session.playerToken])
+
   async function performAction(name, request) {
     if (actionLockRef.current) return
     actionLockRef.current = true
@@ -235,7 +263,7 @@ function Room({ session, onLeave }) {
         </div>
         <button
           className="button button-quiet"
-          disabled={action !== null}
+          disabled={action !== null || !state?.resolved}
           onClick={() => performAction('leave', async () => {
             await api.leaveRoom(session.roomCode, session.playerToken)
             if (mountedRef.current) onLeave()
@@ -311,7 +339,9 @@ function Room({ session, onLeave }) {
         </section>
       )}
 
-      <p className="leave-note">Leaving closes this room for both players.</p>
+      <p className="leave-note">
+        {state?.resolved ? 'Leaving closes this room for both players.' : 'You can leave after the round is finished.'}
+      </p>
     </main>
   )
 }
