@@ -21,6 +21,7 @@ type storedRoom struct {
 	room        *domain.Room
 	revision    uint64
 	credentials map[string]application.CredentialDigest
+	owners      map[string]string
 	presence    map[string]memoryPresence
 }
 
@@ -35,7 +36,7 @@ func New() (*Repository, *Events) {
 	return &Repository{rooms: map[string]*storedRoom{}, events: events}, events
 }
 
-func (r *Repository) Create(_ context.Context, aggregate *domain.Room, digest application.CredentialDigest) (application.Snapshot, error) {
+func (r *Repository) Create(_ context.Context, aggregate *domain.Room, digest application.CredentialDigest, authUserID string) (application.Snapshot, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	state := aggregate.State()
@@ -46,11 +47,11 @@ func (r *Repository) Create(_ context.Context, aggregate *domain.Room, digest ap
 	if err != nil {
 		return application.Snapshot{}, err
 	}
-	r.rooms[state.Code] = &storedRoom{room: storedAggregate, revision: 1, credentials: map[string]application.CredentialDigest{state.Players[0].ID: digest}, presence: map[string]memoryPresence{}}
+	r.rooms[state.Code] = &storedRoom{room: storedAggregate, revision: 1, credentials: map[string]application.CredentialDigest{state.Players[0].ID: digest}, owners: map[string]string{state.Players[0].ID: authUserID}, presence: map[string]memoryPresence{}}
 	return application.Snapshot{State: state, Revision: 1}, nil
 }
 
-func (r *Repository) Join(_ context.Context, code, playerID string, digest application.CredentialDigest, window application.PresenceWindow) (application.Snapshot, []application.PresenceLease, error) {
+func (r *Repository) Join(_ context.Context, code, playerID string, digest application.CredentialDigest, authUserID string, window application.PresenceWindow) (application.Snapshot, []application.PresenceLease, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	stored, err := r.room(code)
@@ -62,10 +63,16 @@ func (r *Repository) Join(_ context.Context, code, playerID string, digest appli
 			return application.Snapshot{}, nil, domain.ErrDuplicatePlayer
 		}
 	}
+	for _, owner := range stored.owners {
+		if owner == authUserID {
+			return application.Snapshot{}, nil, application.ErrAccountSeated
+		}
+	}
 	if err := stored.room.Join(playerID); err != nil {
 		return application.Snapshot{}, nil, err
 	}
 	stored.credentials[playerID] = digest
+	stored.owners[playerID] = authUserID
 	state := stored.room.State()
 	leases := make([]application.PresenceLease, 0, len(state.Players))
 	for _, player := range state.Players {
@@ -76,14 +83,14 @@ func (r *Repository) Join(_ context.Context, code, playerID string, digest appli
 	return r.changed(code, stored), leases, nil
 }
 
-func (r *Repository) Mutate(_ context.Context, code string, digest application.CredentialDigest, mutation application.Mutation) (application.Snapshot, error) {
+func (r *Repository) Mutate(_ context.Context, code string, digest application.CredentialDigest, authUserID string, mutation application.Mutation) (application.Snapshot, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	stored, err := r.room(code)
 	if err != nil {
 		return application.Snapshot{}, err
 	}
-	playerID, ok := authenticate(stored.credentials, digest)
+	playerID, ok := authenticate(stored.credentials, stored.owners, digest, authUserID)
 	if !ok {
 		return application.Snapshot{}, application.ErrUnauthorized
 	}
@@ -108,14 +115,14 @@ func (r *Repository) Snapshot(_ context.Context, code string) (application.Snaps
 	return application.Snapshot{State: stored.room.State(), Revision: stored.revision}, nil
 }
 
-func (r *Repository) Authenticate(_ context.Context, code string, digest application.CredentialDigest) (application.Snapshot, string, error) {
+func (r *Repository) Authenticate(_ context.Context, code string, digest application.CredentialDigest, authUserID string) (application.Snapshot, string, error) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	stored, err := r.room(code)
 	if err != nil {
 		return application.Snapshot{}, "", err
 	}
-	id, ok := authenticate(stored.credentials, digest)
+	id, ok := authenticate(stored.credentials, stored.owners, digest, authUserID)
 	if !ok {
 		return application.Snapshot{}, "", application.ErrUnauthorized
 	}
@@ -127,14 +134,14 @@ func (r *Repository) Authenticate(_ context.Context, code string, digest applica
 	return application.Snapshot{State: state, Revision: stored.revision}, role, nil
 }
 
-func (r *Repository) RefreshPresence(_ context.Context, code string, digest application.CredentialDigest, window application.PresenceWindow) ([]application.PresenceLease, error) {
+func (r *Repository) RefreshPresence(_ context.Context, code string, digest application.CredentialDigest, authUserID string, window application.PresenceWindow) ([]application.PresenceLease, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	stored, err := r.room(code)
 	if err != nil {
 		return nil, err
 	}
-	playerID, ok := authenticate(stored.credentials, digest)
+	playerID, ok := authenticate(stored.credentials, stored.owners, digest, authUserID)
 	if !ok {
 		return nil, application.ErrUnauthorized
 	}
@@ -207,9 +214,9 @@ func (r *Repository) changed(code string, stored *storedRoom) application.Snapsh
 	r.events.Publish(code)
 	return application.Snapshot{State: stored.room.State(), Revision: stored.revision}
 }
-func authenticate(credentials map[string]application.CredentialDigest, digest application.CredentialDigest) (string, bool) {
+func authenticate(credentials map[string]application.CredentialDigest, owners map[string]string, digest application.CredentialDigest, authUserID string) (string, bool) {
 	for id, stored := range credentials {
-		if equalDigest(stored, digest) {
+		if equalDigest(stored, digest) && owners[id] == authUserID && authUserID != "" {
 			return id, true
 		}
 	}

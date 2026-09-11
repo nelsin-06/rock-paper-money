@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"example.com/rock-paper-money/internal/auth"
 	"example.com/rock-paper-money/internal/room/adapter/memory"
 	"example.com/rock-paper-money/internal/room/application"
 	"example.com/rock-paper-money/internal/room/domain"
@@ -19,7 +20,7 @@ import (
 
 func TestHTTPContractAndPrivacy(t *testing.T) {
 	service := fixedService()
-	handler := NewRouter(service, func(context.Context) error { return nil })
+	handler := NewRouter(service, testVerifier{}, func(context.Context) error { return nil })
 	created := request(t, handler, http.MethodPost, "/api/rooms", "", "")
 	assertStatus(t, created, http.StatusCreated)
 	host := credentials(t, created)
@@ -52,7 +53,7 @@ func TestHTTPContractAndPrivacy(t *testing.T) {
 
 func TestAuthenticationAndStableErrors(t *testing.T) {
 	service := fixedService()
-	handler := NewRouter(service, nil)
+	handler := NewRouter(service, testVerifier{}, nil)
 	created := request(t, handler, http.MethodPost, "/api/rooms", "", "")
 	host := credentials(t, created)
 	_ = host
@@ -77,9 +78,22 @@ func TestAuthenticationAndStableErrors(t *testing.T) {
 	}
 }
 
-func TestValidateSessionChecksClosedRoomBeforeCredentials(t *testing.T) {
+func TestProtectedRoutesRequireAccountAndMatchingRoomOwner(t *testing.T) {
+	handler := NewRouter(fixedService(), testVerifier{}, nil)
+
+	withoutAccount := httptest.NewRequest(http.MethodPost, "/api/rooms", nil)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, withoutAccount)
+	assertStatus(t, response, http.StatusUnauthorized)
+
+	host := credentials(t, request(t, handler, http.MethodPost, "/api/rooms", "", ""))
+	wrongOwner := requestAs(t, handler, http.MethodPost, "/api/rooms/ABC234/validate-session", "guest-user", host.PlayerToken, `{"role":"host"}`)
+	assertStatus(t, wrongOwner, http.StatusUnauthorized)
+}
+
+func TestValidateSessionRequiresAccountBeforeCheckingRoom(t *testing.T) {
 	service := fixedService()
-	handler := NewRouter(service, nil)
+	handler := NewRouter(service, testVerifier{}, nil)
 	hostResponse := request(t, handler, http.MethodPost, "/api/rooms", "", "")
 	assertStatus(t, hostResponse, http.StatusCreated)
 	host := credentials(t, hostResponse)
@@ -96,8 +110,8 @@ func TestValidateSessionChecksClosedRoomBeforeCredentials(t *testing.T) {
 	assertStatus(t, request(t, handler, http.MethodPost, "/api/rooms/ABC234/leave", guest.PlayerToken, ""), http.StatusNoContent)
 	for _, authorization := range []string{"", "Basic invalid", "Bearer invalid"} {
 		response := validateSessionRequestWithAuthorization(t, handler, authorization)
-		assertStatus(t, response, http.StatusNotFound)
-		if response.Body.String() != "{\"error\":\"room not found\"}\n" {
+		assertStatus(t, response, http.StatusUnauthorized)
+		if response.Body.String() != "{\"error\":\"unauthorized\"}\n" {
 			t.Fatalf("closed-room body = %q", response.Body.String())
 		}
 	}
@@ -105,7 +119,7 @@ func TestValidateSessionChecksClosedRoomBeforeCredentials(t *testing.T) {
 
 func TestLeaveRejectedDuringUnfinishedGameAndPresenceIsAuthenticated(t *testing.T) {
 	service := fixedService()
-	handler := NewRouter(service, nil)
+	handler := NewRouter(service, testVerifier{}, nil)
 	host := credentials(t, request(t, handler, http.MethodPost, "/api/rooms", "", ""))
 	guest := credentials(t, request(t, handler, http.MethodPost, "/api/rooms/ABC234/join", "", ""))
 
@@ -119,7 +133,7 @@ func TestLeaveRejectedDuringUnfinishedGameAndPresenceIsAuthenticated(t *testing.
 }
 
 func TestHealthAndReadinessDiffer(t *testing.T) {
-	handler := NewRouter(fixedService(), func(context.Context) error { return errors.New("database unavailable") })
+	handler := NewRouter(fixedService(), testVerifier{}, func(context.Context) error { return errors.New("database unavailable") })
 	assertStatus(t, request(t, handler, http.MethodGet, "/api/health", "", ""), 200)
 	response := request(t, handler, http.MethodGet, "/api/ready", "", "")
 	assertStatus(t, response, 503)
@@ -127,8 +141,8 @@ func TestHealthAndReadinessDiffer(t *testing.T) {
 
 func TestSSEEmitsAuthoritativeRevisions(t *testing.T) {
 	service := fixedService()
-	host, _ := service.Create(context.Background())
-	server := httptest.NewServer(NewRouter(service, nil))
+	host, _ := service.Create(context.Background(), "host-user")
+	server := httptest.NewServer(NewRouter(service, testVerifier{}, nil))
 	defer server.Close()
 	response, err := server.Client().Get(server.URL + "/api/rooms/ABC234/events")
 	if err != nil {
@@ -139,7 +153,7 @@ func TestSSEEmitsAuthoritativeRevisions(t *testing.T) {
 	if id := readEvent(t, reader); id != "1" {
 		t.Fatalf("initial id = %s", id)
 	}
-	_, _ = service.Join(context.Background(), host.RoomCode)
+	_, _ = service.Join(context.Background(), host.RoomCode, "guest-user")
 	if id := readEvent(t, reader); id != "2" {
 		t.Fatalf("changed id = %s", id)
 	}
@@ -175,9 +189,21 @@ func fixedService() *application.Service {
 }
 func request(t *testing.T, handler http.Handler, method, path, token, body string) *httptest.ResponseRecorder {
 	t.Helper()
+	account := "host-user"
+	if strings.Contains(path, "/join") || token == "guest-secret-token" {
+		account = "guest-user"
+	}
+	return requestAs(t, handler, method, path, account, token, body)
+}
+
+func requestAs(t *testing.T, handler http.Handler, method, path, account, token, body string) *httptest.ResponseRecorder {
+	t.Helper()
 	req := httptest.NewRequest(method, path, strings.NewReader(body))
+	if account != "" {
+		req.Header.Set("Authorization", "Bearer "+account)
+	}
 	if token != "" {
-		req.Header.Set("Authorization", "Bearer "+token)
+		req.Header.Set("X-Room-Token", token)
 	}
 	response := httptest.NewRecorder()
 	handler.ServeHTTP(response, req)
@@ -190,9 +216,19 @@ func validateSessionRequestWithAuthorization(t *testing.T, handler http.Handler,
 	if authorization != "" {
 		req.Header.Set("Authorization", authorization)
 	}
+	req.Header.Set("X-Room-Token", "host-secret-token")
 	response := httptest.NewRecorder()
 	handler.ServeHTTP(response, req)
 	return response
+}
+
+type testVerifier struct{}
+
+func (testVerifier) Verify(_ context.Context, token string) (auth.Principal, error) {
+	if token != "host-user" && token != "guest-user" {
+		return auth.Principal{}, errors.New("invalid token")
+	}
+	return auth.Principal{Subject: token}, nil
 }
 func assertStatus(t *testing.T, response *httptest.ResponseRecorder, want int) {
 	t.Helper()

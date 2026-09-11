@@ -1,3 +1,5 @@
+import { getAccessToken } from './supabase.js'
+
 export class ApiError extends Error {
   constructor(message, status = 0) {
     super(message)
@@ -64,18 +66,20 @@ function mapRoomState(dto) {
   }
 }
 
-function bearer(token) {
-  return { Authorization: `Bearer ${token}` }
+async function protectedHeaders(roomToken) {
+  const headers = { Authorization: `Bearer ${await getAccessToken()}` }
+  if (roomToken) headers['X-Room-Token'] = roomToken
+  return headers
 }
 
 export async function createRoom({ signal } = {}) {
-  return mapCredentials(await request('/api/rooms', { method: 'POST', signal }), 'host')
+  return mapCredentials(await request('/api/rooms', { method: 'POST', headers: await protectedHeaders(), signal }), 'host')
 }
 
 export async function joinRoom(code, { signal } = {}) {
   const normalized = code.trim().toUpperCase()
   return mapCredentials(
-    await request(`/api/rooms/${encodeURIComponent(normalized)}/join`, { method: 'POST', signal }),
+    await request(`/api/rooms/${encodeURIComponent(normalized)}/join`, { method: 'POST', headers: await protectedHeaders(), signal }),
     'guest',
   )
 }
@@ -88,7 +92,7 @@ export async function getRoomState(code, { signal } = {}) {
 export async function validateSession(code, token, role, { signal } = {}) {
   await request(`/api/rooms/${encodeURIComponent(code)}/validate-session`, {
     method: 'POST',
-    headers: { ...bearer(token), 'Content-Type': 'application/json' },
+    headers: { ...await protectedHeaders(token), 'Content-Type': 'application/json' },
     body: JSON.stringify({ role }),
     signal,
   })
@@ -113,7 +117,7 @@ export function subscribeToRoom(code, { onState, onOpen, onError }) {
 export async function submitMove(code, token, move, { signal } = {}) {
   await request(`/api/rooms/${encodeURIComponent(code)}/moves`, {
     method: 'POST',
-    headers: { ...bearer(token), 'Content-Type': 'application/json' },
+    headers: { ...await protectedHeaders(token), 'Content-Type': 'application/json' },
     body: JSON.stringify({ move }),
     signal,
   })
@@ -122,7 +126,7 @@ export async function submitMove(code, token, move, { signal } = {}) {
 export async function startNextRound(code, token, round, { signal } = {}) {
   await request(`/api/rooms/${encodeURIComponent(code)}/next-round`, {
     method: 'POST',
-    headers: { ...bearer(token), 'Content-Type': 'application/json' },
+    headers: { ...await protectedHeaders(token), 'Content-Type': 'application/json' },
     body: JSON.stringify({ round }),
     signal,
   })
@@ -131,7 +135,7 @@ export async function startNextRound(code, token, round, { signal } = {}) {
 export async function leaveRoom(code, token, { signal } = {}) {
   await request(`/api/rooms/${encodeURIComponent(code)}/leave`, {
     method: 'POST',
-    headers: bearer(token),
+    headers: await protectedHeaders(token),
     signal,
   })
 }
@@ -139,7 +143,7 @@ export async function leaveRoom(code, token, { signal } = {}) {
 export async function refreshPresence(code, token, { signal } = {}) {
   await request(`/api/rooms/${encodeURIComponent(code)}/presence`, {
     method: 'POST',
-    headers: bearer(token),
+    headers: await protectedHeaders(token),
     signal,
   })
 }

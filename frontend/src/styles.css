@@ -40,6 +40,13 @@ button:focus-visible, input:focus-visible {
 .recovery-page h1 { margin: 0.2rem 0 0.6rem; }
 .recovery-page p:not(.eyebrow) { color: var(--muted); }
 .recovery-actions { display: grid; gap: 0.75rem; margin-top: 1.5rem; }
+.auth-card { width: min(100%, 34rem); }
+.auth-card h1 { margin-top: 0; }
+.auth-form { display: grid; gap: 0.75rem; }
+.auth-form input { font-size: 1rem; font-weight: 500; letter-spacing: normal; text-align: left; text-transform: none; }
+.auth-switch { width: 100%; margin-top: 0.75rem; }
+.account-bar { display: flex; min-height: 3.5rem; padding: 0.5rem 1rem; align-items: center; justify-content: flex-end; gap: 1rem; color: var(--muted); }
+.account-bar .button { min-height: 2.5rem; padding: 0.4rem 0.8rem; }
 .eyebrow { margin: 0 0 0.65rem; color: var(--accent); font-size: 0.76rem; font-weight: 800; letter-spacing: 0.16em; text-transform: uppercase; }
 .hero h1 { max-width: 650px; margin: 0; font-size: clamp(3.3rem, 9vw, 7.5rem); line-height: 0.84; letter-spacing: -0.07em; }
 .hero h1 span { color: var(--accent); }

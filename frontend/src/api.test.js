@@ -1,5 +1,9 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { ApiError, createRoom, getRoomState, leaveRoom, PRESENCE_HEARTBEAT_MS, refreshPresence, startNextRound, submitMove, subscribeToRoom, validateSession } from './api.js'
+
+vi.mock('./supabase.js', () => ({ getAccessToken: vi.fn().mockResolvedValue('access-token') }))
+
+import { ApiError, createRoom, getRoomState, joinRoom, leaveRoom, PRESENCE_HEARTBEAT_MS, refreshPresence, startNextRound, submitMove, subscribeToRoom, validateSession } from './api.js'
+import { getAccessToken } from './supabase.js'
 
 function response(body, { status = 200 } = {}) {
   return new Response(body === null ? null : JSON.stringify(body), {
@@ -9,7 +13,10 @@ function response(body, { status = 200 } = {}) {
 }
 
 describe('API client', () => {
-  beforeEach(() => vi.stubGlobal('fetch', vi.fn()))
+  beforeEach(() => {
+    vi.stubGlobal('fetch', vi.fn())
+    getAccessToken.mockReset().mockResolvedValue('access-token')
+  })
 
   it('maps credential and state DTOs into frontend properties', async () => {
     fetch
@@ -24,6 +31,35 @@ describe('API client', () => {
       roomCode: 'ABC234', ready: true, resolved: false, round: 3, closed: false, forfeit: false,
       players: [{ role: 'host', wins: 2, submitted: true, wantsNextRound: false }], result: null, moves: [],
     })
+  })
+
+  it('uses account authorization for create and join without a room credential', async () => {
+    fetch
+      .mockResolvedValueOnce(response({ room_code: 'ABC234', player_token: 'host-token' }, { status: 201 }))
+      .mockResolvedValueOnce(response({ room_code: 'ABC234', player_token: 'guest-token' }, { status: 201 }))
+
+    await createRoom()
+    await joinRoom('abc234')
+
+    expect(fetch).toHaveBeenNthCalledWith(1, '/api/rooms', expect.objectContaining({
+      headers: { Authorization: 'Bearer access-token' },
+    }))
+    expect(fetch).toHaveBeenNthCalledWith(2, '/api/rooms/ABC234/join', expect.objectContaining({
+      headers: { Authorization: 'Bearer access-token' },
+    }))
+  })
+
+  it('reads the current Supabase access token for every protected request', async () => {
+    getAccessToken.mockResolvedValueOnce('first-access-token').mockResolvedValueOnce('refreshed-access-token')
+    fetch
+      .mockResolvedValueOnce(response({ room_code: 'ABC234', player_token: 'first-room-token' }, { status: 201 }))
+      .mockResolvedValueOnce(response({ room_code: 'DEF567', player_token: 'second-room-token' }, { status: 201 }))
+
+    await createRoom()
+    await createRoom()
+
+    expect(fetch.mock.calls[0][1].headers.Authorization).toBe('Bearer first-access-token')
+    expect(fetch.mock.calls[1][1].headers.Authorization).toBe('Bearer refreshed-access-token')
   })
 
   it('uses stable server errors and falls back safely for malformed errors', async () => {
@@ -43,7 +79,7 @@ describe('API client', () => {
 
     expect(fetch).toHaveBeenLastCalledWith('/api/rooms/ABC234/moves', expect.objectContaining({
       method: 'POST',
-      headers: { Authorization: 'Bearer secret', 'Content-Type': 'application/json' },
+      headers: { Authorization: 'Bearer access-token', 'X-Room-Token': 'secret', 'Content-Type': 'application/json' },
       body: '{"move":"paper"}',
     }))
   })
@@ -54,14 +90,14 @@ describe('API client', () => {
     await startNextRound('ABC234', 'secret', 2)
     expect(fetch).toHaveBeenNthCalledWith(1, '/api/rooms/ABC234/next-round', expect.objectContaining({
       method: 'POST',
-      headers: { Authorization: 'Bearer secret', 'Content-Type': 'application/json' },
+      headers: { Authorization: 'Bearer access-token', 'X-Room-Token': 'secret', 'Content-Type': 'application/json' },
       body: '{"round":2}',
     }))
 
     await leaveRoom('ABC234', 'secret')
     expect(fetch).toHaveBeenNthCalledWith(2, '/api/rooms/ABC234/leave', expect.objectContaining({
       method: 'POST',
-      headers: { Authorization: 'Bearer secret' },
+      headers: { Authorization: 'Bearer access-token', 'X-Room-Token': 'secret' },
     }))
   })
 
@@ -72,7 +108,7 @@ describe('API client', () => {
 
     expect(fetch).toHaveBeenCalledWith('/api/rooms/ABC234/validate-session', expect.objectContaining({
       method: 'POST',
-      headers: { Authorization: 'Bearer secret', 'Content-Type': 'application/json' },
+      headers: { Authorization: 'Bearer access-token', 'X-Room-Token': 'secret', 'Content-Type': 'application/json' },
       body: '{"role":"host"}',
     }))
   })
@@ -116,7 +152,7 @@ describe('API client', () => {
 
     expect(fetch).toHaveBeenCalledWith('/api/rooms/ABC234/presence', expect.objectContaining({
       method: 'POST',
-      headers: { Authorization: 'Bearer secret' },
+      headers: { Authorization: 'Bearer access-token', 'X-Room-Token': 'secret' },
       signal: controller.signal,
     }))
     expect(PRESENCE_HEARTBEAT_MS).toBe(3000)

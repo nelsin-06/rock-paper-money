@@ -20,7 +20,7 @@ var errPresenceLeaseCurrent = errors.New("presence lease is still current")
 func NewRepository(pool *pgxpool.Pool) *Repository   { return &Repository{pool: pool} }
 func (r *Repository) Ping(ctx context.Context) error { return r.pool.Ping(ctx) }
 
-func (r *Repository) Create(ctx context.Context, aggregate *domain.Room, digest application.CredentialDigest) (application.Snapshot, error) {
+func (r *Repository) Create(ctx context.Context, aggregate *domain.Room, digest application.CredentialDigest, authUserID string) (application.Snapshot, error) {
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
 		return application.Snapshot{}, err
@@ -35,7 +35,7 @@ func (r *Repository) Create(ctx context.Context, aggregate *domain.Room, digest 
 	if _, err = tx.Exec(ctx, "INSERT INTO room_rounds(room_code,number) VALUES($1,1)", state.Code); err != nil {
 		return application.Snapshot{}, err
 	}
-	if _, err = tx.Exec(ctx, "INSERT INTO room_seats(room_code,role,player_id,credential_digest) VALUES($1,'host',$2,$3)", state.Code, state.Players[0].ID, digest[:]); err != nil {
+	if _, err = tx.Exec(ctx, "INSERT INTO room_seats(room_code,role,player_id,credential_digest,auth_user_id) VALUES($1,'host',$2,$3,$4)", state.Code, state.Players[0].ID, digest[:], authUserID); err != nil {
 		return application.Snapshot{}, err
 	}
 	if err = tx.Commit(ctx); err != nil {
@@ -44,15 +44,22 @@ func (r *Repository) Create(ctx context.Context, aggregate *domain.Room, digest 
 	return application.Snapshot{State: aggregate.State(), Revision: 1}, nil
 }
 
-func (r *Repository) Join(ctx context.Context, code, playerID string, digest application.CredentialDigest, window application.PresenceWindow) (application.Snapshot, []application.PresenceLease, error) {
+func (r *Repository) Join(ctx context.Context, code, playerID string, digest application.CredentialDigest, authUserID string, window application.PresenceWindow) (application.Snapshot, []application.PresenceLease, error) {
 	var leases []application.PresenceLease
-	snapshot, err := r.write(ctx, code, nil, func(tx pgx.Tx, aggregate *domain.Room, _ string) error {
+	snapshot, err := r.write(ctx, code, nil, "", func(tx pgx.Tx, aggregate *domain.Room, _ string) error {
 		if err := aggregate.Join(playerID); err != nil {
 			return err
 		}
-		_, err := tx.Exec(ctx, "INSERT INTO room_seats(room_code,role,player_id,credential_digest) VALUES($1,'guest',$2,$3)", code, playerID, digest[:])
+		var occupied bool
+		if err := tx.QueryRow(ctx, "SELECT EXISTS(SELECT 1 FROM room_seats WHERE room_code=$1 AND auth_user_id=$2)", code, authUserID).Scan(&occupied); err != nil {
+			return err
+		}
+		if occupied {
+			return application.ErrAccountSeated
+		}
+		_, err := tx.Exec(ctx, "INSERT INTO room_seats(room_code,role,player_id,credential_digest,auth_user_id) VALUES($1,'guest',$2,$3,$4)", code, playerID, digest[:], authUserID)
 		if isUnique(err) {
-			return domain.ErrDuplicatePlayer
+			return application.ErrAccountSeated
 		}
 		if err != nil {
 			return err
@@ -80,11 +87,11 @@ func (r *Repository) Join(ctx context.Context, code, playerID string, digest app
 	return snapshot, leases, err
 }
 
-func (r *Repository) Mutate(ctx context.Context, code string, digest application.CredentialDigest, mutation application.Mutation) (application.Snapshot, error) {
-	return r.write(ctx, code, &digest, func(_ pgx.Tx, aggregate *domain.Room, id string) error { return mutation(aggregate, id) })
+func (r *Repository) Mutate(ctx context.Context, code string, digest application.CredentialDigest, authUserID string, mutation application.Mutation) (application.Snapshot, error) {
+	return r.write(ctx, code, &digest, authUserID, func(_ pgx.Tx, aggregate *domain.Room, id string) error { return mutation(aggregate, id) })
 }
 
-func (r *Repository) write(ctx context.Context, code string, digest *application.CredentialDigest, change func(pgx.Tx, *domain.Room, string) error) (application.Snapshot, error) {
+func (r *Repository) write(ctx context.Context, code string, digest *application.CredentialDigest, authUserID string, change func(pgx.Tx, *domain.Room, string) error) (application.Snapshot, error) {
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
 		return application.Snapshot{}, err
@@ -104,7 +111,7 @@ func (r *Repository) write(ctx context.Context, code string, digest *application
 	playerID := ""
 	if digest != nil {
 		var role string
-		err = tx.QueryRow(ctx, "SELECT player_id,role FROM room_seats WHERE room_code=$1 AND credential_digest=$2", code, digest[:]).Scan(&playerID, &role)
+		err = tx.QueryRow(ctx, "SELECT player_id,role FROM room_seats WHERE room_code=$1 AND credential_digest=$2 AND auth_user_id=$3", code, digest[:], authUserID).Scan(&playerID, &role)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return application.Snapshot{}, application.ErrUnauthorized
 		} else if err != nil {
@@ -150,7 +157,7 @@ func (r *Repository) Snapshot(ctx context.Context, code string) (application.Sna
 	return application.Snapshot{State: aggregate.State(), Revision: revision}, nil
 }
 
-func (r *Repository) Authenticate(ctx context.Context, code string, digest application.CredentialDigest) (application.Snapshot, string, error) {
+func (r *Repository) Authenticate(ctx context.Context, code string, digest application.CredentialDigest, authUserID string) (application.Snapshot, string, error) {
 	tx, err := r.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
 	if err != nil {
 		return application.Snapshot{}, "", err
@@ -163,7 +170,7 @@ func (r *Repository) Authenticate(ctx context.Context, code string, digest appli
 		return application.Snapshot{}, "", err
 	}
 	var role string
-	if err = tx.QueryRow(ctx, "SELECT role FROM room_seats WHERE room_code=$1 AND credential_digest=$2", code, digest[:]).Scan(&role); errors.Is(err, pgx.ErrNoRows) {
+	if err = tx.QueryRow(ctx, "SELECT role FROM room_seats WHERE room_code=$1 AND credential_digest=$2 AND auth_user_id=$3", code, digest[:], authUserID).Scan(&role); errors.Is(err, pgx.ErrNoRows) {
 		return application.Snapshot{}, "", application.ErrUnauthorized
 	} else if err != nil {
 		return application.Snapshot{}, "", err
@@ -178,7 +185,7 @@ func (r *Repository) Authenticate(ctx context.Context, code string, digest appli
 	return application.Snapshot{State: aggregate.State(), Revision: revision}, role, nil
 }
 
-func (r *Repository) RefreshPresence(ctx context.Context, code string, digest application.CredentialDigest, window application.PresenceWindow) ([]application.PresenceLease, error) {
+func (r *Repository) RefreshPresence(ctx context.Context, code string, digest application.CredentialDigest, authUserID string, window application.PresenceWindow) ([]application.PresenceLease, error) {
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
 		return nil, err
@@ -192,7 +199,7 @@ func (r *Repository) RefreshPresence(ctx context.Context, code string, digest ap
 		return nil, err
 	}
 	var playerID string
-	if err = tx.QueryRow(ctx, "SELECT player_id FROM room_seats WHERE room_code=$1 AND credential_digest=$2", code, digest[:]).Scan(&playerID); errors.Is(err, pgx.ErrNoRows) {
+	if err = tx.QueryRow(ctx, "SELECT player_id FROM room_seats WHERE room_code=$1 AND credential_digest=$2 AND auth_user_id=$3", code, digest[:], authUserID).Scan(&playerID); errors.Is(err, pgx.ErrNoRows) {
 		return nil, application.ErrUnauthorized
 	} else if err != nil {
 		return nil, err
@@ -236,7 +243,7 @@ func (r *Repository) RefreshPresence(ctx context.Context, code string, digest ap
 }
 
 func (r *Repository) ForfeitExpired(ctx context.Context, lease application.PresenceLease, now time.Time) (application.Snapshot, bool, error) {
-	snapshot, err := r.write(ctx, lease.RoomCode, nil, func(tx pgx.Tx, aggregate *domain.Room, _ string) error {
+	snapshot, err := r.write(ctx, lease.RoomCode, nil, "", func(tx pgx.Tx, aggregate *domain.Room, _ string) error {
 		var generation uint64
 		var deadline time.Time
 		if queryErr := tx.QueryRow(ctx, "SELECT generation,deadline FROM room_presence WHERE room_code=$1 AND player_id=$2 FOR UPDATE", lease.RoomCode, lease.PlayerID).Scan(&generation, &deadline); errors.Is(queryErr, pgx.ErrNoRows) {

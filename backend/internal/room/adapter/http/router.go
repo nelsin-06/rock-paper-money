@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"example.com/rock-paper-money/internal/auth"
 	"example.com/rock-paper-money/internal/room/application"
 	"example.com/rock-paper-money/internal/room/domain"
 )
@@ -22,25 +23,26 @@ const (
 )
 
 type router struct {
-	service *application.Service
-	ready   func(context.Context) error
+	service  *application.Service
+	verifier auth.Verifier
+	ready    func(context.Context) error
 }
 
-func NewRouter(service *application.Service, ready func(context.Context) error) http.Handler {
-	handler := &router{service: service, ready: ready}
+func NewRouter(service *application.Service, verifier auth.Verifier, ready func(context.Context) error) http.Handler {
+	handler := &router{service: service, verifier: verifier, ready: ready}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/health", health)
 	mux.HandleFunc("GET /api/ready", handler.readiness)
-	mux.HandleFunc("POST /api/rooms", handler.createRoom)
-	mux.HandleFunc("POST /api/rooms/{code}/join", handler.joinRoom)
-	mux.HandleFunc("POST /api/rooms/{code}/moves", handler.submitMove)
+	mux.HandleFunc("POST /api/rooms", handler.protected(handler.createRoom))
+	mux.HandleFunc("POST /api/rooms/{code}/join", handler.protected(handler.joinRoom))
+	mux.HandleFunc("POST /api/rooms/{code}/moves", handler.protected(handler.submitMove))
 	mux.HandleFunc("GET /api/rooms/{code}/state", handler.roomState)
 	mux.HandleFunc("GET /api/rooms/{code}/events", handler.roomEvents)
-	mux.HandleFunc("POST /api/rooms/{code}/validate-session", handler.validateSession)
-	mux.HandleFunc("POST /api/rooms/{code}/next-round", handler.startNextRound)
-	mux.HandleFunc("POST /api/rooms/{code}/leave", handler.leaveRoom)
-	mux.HandleFunc("POST /api/rooms/{code}/presence", handler.refreshPresence)
+	mux.HandleFunc("POST /api/rooms/{code}/validate-session", handler.protected(handler.validateSession))
+	mux.HandleFunc("POST /api/rooms/{code}/next-round", handler.protected(handler.startNextRound))
+	mux.HandleFunc("POST /api/rooms/{code}/leave", handler.protected(handler.leaveRoom))
+	mux.HandleFunc("POST /api/rooms/{code}/presence", handler.protected(handler.refreshPresence))
 	return logRequests(slog.Default(), mux)
 }
 
@@ -61,8 +63,24 @@ func (rt *router) readiness(w http.ResponseWriter, r *http.Request) {
 	}{Status: "ok"})
 }
 
-func (rt *router) createRoom(w http.ResponseWriter, r *http.Request) {
-	credentials, err := rt.service.Create(r.Context())
+func (rt *router) protected(next func(http.ResponseWriter, *http.Request, auth.Principal)) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		token, ok := bearerToken(r)
+		if !ok || rt.verifier == nil {
+			writeError(w, http.StatusUnauthorized, "unauthorized")
+			return
+		}
+		principal, err := rt.verifier.Verify(r.Context(), token)
+		if err != nil || principal.Subject == "" {
+			writeError(w, http.StatusUnauthorized, "unauthorized")
+			return
+		}
+		next(w, r, principal)
+	}
+}
+
+func (rt *router) createRoom(w http.ResponseWriter, r *http.Request, principal auth.Principal) {
+	credentials, err := rt.service.Create(r.Context(), principal.Subject)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "internal server error")
 		return
@@ -70,14 +88,14 @@ func (rt *router) createRoom(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, roomCredentials{RoomCode: credentials.RoomCode, PlayerToken: credentials.PlayerToken})
 }
 
-func (rt *router) joinRoom(w http.ResponseWriter, r *http.Request) {
+func (rt *router) joinRoom(w http.ResponseWriter, r *http.Request, principal auth.Principal) {
 	code := normalizeRoomCode(r.PathValue("code"))
 	if code == "" {
 		writeError(w, http.StatusBadRequest, "room code is required")
 		return
 	}
 
-	credentials, err := rt.service.Join(r.Context(), code)
+	credentials, err := rt.service.Join(r.Context(), code, principal.Subject)
 	switch {
 	case err == nil:
 		writeJSON(w, http.StatusCreated, roomCredentials{RoomCode: code, PlayerToken: credentials.PlayerToken})
@@ -91,22 +109,25 @@ func (rt *router) joinRoom(w http.ResponseWriter, r *http.Request) {
 	case errors.Is(err, application.ErrRoomNotFound):
 		writeError(w, http.StatusNotFound, "room not found")
 		return
+	case errors.Is(err, application.ErrAccountSeated):
+		writeError(w, http.StatusConflict, "account already occupies a seat")
+		return
 	default:
 		writeError(w, http.StatusInternalServerError, "internal server error")
 	}
 }
 
-func (rt *router) submitMove(w http.ResponseWriter, r *http.Request) {
+func (rt *router) submitMove(w http.ResponseWriter, r *http.Request, principal auth.Principal) {
 	code, _, ok := rt.findRoom(r.Context(), w, r.PathValue("code"))
 	if !ok {
 		return
 	}
-	token, ok := bearerToken(r)
+	token, ok := roomToken(r)
 	if !ok {
 		writeError(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
-	if _, _, err := rt.service.Authenticate(r.Context(), code, token); err != nil {
+	if _, _, err := rt.service.Authenticate(r.Context(), code, token, principal.Subject); err != nil {
 		writeError(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
@@ -127,7 +148,7 @@ func (rt *router) submitMove(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	switch err := rt.service.SubmitMove(r.Context(), code, token, request.Move); {
+	switch err := rt.service.SubmitMove(r.Context(), code, token, principal.Subject, request.Move); {
 	case err == nil:
 		w.WriteHeader(http.StatusNoContent)
 	case errors.Is(err, domain.ErrRoomNotReady):
@@ -156,7 +177,7 @@ func (rt *router) roomState(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, publicRoomState(code, state))
 }
 
-func (rt *router) validateSession(w http.ResponseWriter, r *http.Request) {
+func (rt *router) validateSession(w http.ResponseWriter, r *http.Request, principal auth.Principal) {
 	code, state, found := rt.findRoom(r.Context(), w, r.PathValue("code"))
 	if !found {
 		return
@@ -165,12 +186,12 @@ func (rt *router) validateSession(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "room not found")
 		return
 	}
-	token, valid := bearerToken(r)
+	token, valid := roomToken(r)
 	if !valid {
 		writeError(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
-	_, role, err := rt.service.Authenticate(r.Context(), code, token)
+	_, role, err := rt.service.Authenticate(r.Context(), code, token, principal.Subject)
 	if errors.Is(err, application.ErrRoomNotFound) {
 		writeError(w, http.StatusNotFound, "room not found")
 		return
@@ -282,17 +303,17 @@ func publicRoomState(code string, state domain.State) stateResponse {
 	return response
 }
 
-func (rt *router) startNextRound(w http.ResponseWriter, r *http.Request) {
+func (rt *router) startNextRound(w http.ResponseWriter, r *http.Request, principal auth.Principal) {
 	code, _, ok := rt.findRoom(r.Context(), w, r.PathValue("code"))
 	if !ok {
 		return
 	}
-	token, ok := bearerToken(r)
+	token, ok := roomToken(r)
 	if !ok {
 		writeError(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
-	if _, _, err := rt.service.Authenticate(r.Context(), code, token); err != nil {
+	if _, _, err := rt.service.Authenticate(r.Context(), code, token, principal.Subject); err != nil {
 		writeError(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
@@ -302,7 +323,7 @@ func (rt *router) startNextRound(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	switch err := rt.service.RequestNextRound(r.Context(), code, token, request.Round); {
+	switch err := rt.service.RequestNextRound(r.Context(), code, token, principal.Subject, request.Round); {
 	case err == nil:
 		w.WriteHeader(http.StatusNoContent)
 	case errors.Is(err, domain.ErrRoundNotResolved):
@@ -322,18 +343,18 @@ func (rt *router) startNextRound(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (rt *router) leaveRoom(w http.ResponseWriter, r *http.Request) {
+func (rt *router) leaveRoom(w http.ResponseWriter, r *http.Request, principal auth.Principal) {
 	code, _, ok := rt.findRoom(r.Context(), w, r.PathValue("code"))
 	if !ok {
 		return
 	}
-	token, ok := bearerToken(r)
+	token, ok := roomToken(r)
 	if !ok {
 		writeError(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
 
-	switch err := rt.service.Leave(r.Context(), code, token); {
+	switch err := rt.service.Leave(r.Context(), code, token, principal.Subject); {
 	case err == nil:
 		w.WriteHeader(http.StatusNoContent)
 	case errors.Is(err, domain.ErrRoomClosed):
@@ -349,18 +370,18 @@ func (rt *router) leaveRoom(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (rt *router) refreshPresence(w http.ResponseWriter, r *http.Request) {
+func (rt *router) refreshPresence(w http.ResponseWriter, r *http.Request, principal auth.Principal) {
 	code := normalizeRoomCode(r.PathValue("code"))
 	if code == "" {
 		writeError(w, http.StatusBadRequest, "room code is required")
 		return
 	}
-	token, ok := bearerToken(r)
+	token, ok := roomToken(r)
 	if !ok {
 		writeError(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
-	switch err := rt.service.RefreshPresence(r.Context(), code, token); {
+	switch err := rt.service.RefreshPresence(r.Context(), code, token, principal.Subject); {
 	case err == nil:
 		w.WriteHeader(http.StatusNoContent)
 	case errors.Is(err, application.ErrRoomNotFound):
@@ -447,6 +468,14 @@ func bearerToken(r *http.Request) (string, bool) {
 		return "", false
 	}
 	return token, true
+}
+
+func roomToken(r *http.Request) (string, bool) {
+	values := r.Header.Values("X-Room-Token")
+	if len(values) != 1 || values[0] == "" || strings.ContainsAny(values[0], " \t\r\n") {
+		return "", false
+	}
+	return values[0], true
 }
 
 func playerRole(index int) string {

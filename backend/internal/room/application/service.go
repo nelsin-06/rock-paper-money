@@ -20,6 +20,7 @@ var (
 	ErrDuplicateRoom = errors.New("room code already exists")
 	ErrRoomNotFound  = errors.New("room code was not found")
 	ErrUnauthorized  = errors.New("invalid room credential")
+	ErrAccountSeated = errors.New("account already occupies a seat")
 )
 
 type Snapshot struct {
@@ -31,12 +32,12 @@ type Mutation func(*domain.Room, string) error
 
 // Repository is an application-owned port for atomic room operations.
 type Repository interface {
-	Create(context.Context, *domain.Room, CredentialDigest) (Snapshot, error)
-	Join(context.Context, string, string, CredentialDigest, PresenceWindow) (Snapshot, []PresenceLease, error)
-	Mutate(context.Context, string, CredentialDigest, Mutation) (Snapshot, error)
+	Create(context.Context, *domain.Room, CredentialDigest, string) (Snapshot, error)
+	Join(context.Context, string, string, CredentialDigest, string, PresenceWindow) (Snapshot, []PresenceLease, error)
+	Mutate(context.Context, string, CredentialDigest, string, Mutation) (Snapshot, error)
 	Snapshot(context.Context, string) (Snapshot, error)
-	Authenticate(context.Context, string, CredentialDigest) (Snapshot, string, error)
-	RefreshPresence(context.Context, string, CredentialDigest, PresenceWindow) ([]PresenceLease, error)
+	Authenticate(context.Context, string, CredentialDigest, string) (Snapshot, string, error)
+	RefreshPresence(context.Context, string, CredentialDigest, string, PresenceWindow) ([]PresenceLease, error)
 	ForfeitExpired(context.Context, PresenceLease, time.Time) (Snapshot, bool, error)
 }
 
@@ -153,7 +154,10 @@ func NewServiceWithPresenceConfig(repository Repository, events Events, code, to
 	return &Service{repository: repository, events: events, generateCode: code, generateToken: token, generatePlayerID: playerID, now: config.Now, schedule: config.Schedule, gracePeriod: config.GracePeriod, heartbeatInterval: config.HeartbeatInterval, retryDelay: config.RetryDelay, maxRetries: config.MaxRetries, reportError: config.ReportError, presenceTimers: map[string]scheduledPresence{}, presenceVersions: map[string]presenceVersion{}}
 }
 
-func (s *Service) Create(ctx context.Context) (Credentials, error) {
+func (s *Service) Create(ctx context.Context, authUserID string) (Credentials, error) {
+	if authUserID == "" {
+		return Credentials{}, ErrUnauthorized
+	}
 	for range 8 {
 		code, err := s.generateCode()
 		if err != nil {
@@ -167,7 +171,7 @@ func (s *Service) Create(ctx context.Context) (Credentials, error) {
 		if err != nil {
 			return Credentials{}, err
 		}
-		if _, err = s.repository.Create(ctx, r, DigestToken(token)); err != nil {
+		if _, err = s.repository.Create(ctx, r, DigestToken(token), authUserID); err != nil {
 			if errors.Is(err, ErrDuplicateRoom) {
 				continue
 			}
@@ -178,14 +182,17 @@ func (s *Service) Create(ctx context.Context) (Credentials, error) {
 	return Credentials{}, ErrDuplicateRoom
 }
 
-func (s *Service) Join(ctx context.Context, code string) (Credentials, error) {
+func (s *Service) Join(ctx context.Context, code, authUserID string) (Credentials, error) {
+	if authUserID == "" {
+		return Credentials{}, ErrUnauthorized
+	}
 	for range 8 {
 		token, id, err := s.identity()
 		if err != nil {
 			return Credentials{}, err
 		}
 		now := s.now()
-		_, leases, err := s.repository.Join(ctx, code, id, DigestToken(token), s.presenceWindow(now))
+		_, leases, err := s.repository.Join(ctx, code, id, DigestToken(token), authUserID, s.presenceWindow(now))
 		if errors.Is(err, domain.ErrDuplicatePlayer) {
 			continue
 		}
@@ -203,27 +210,27 @@ func (s *Service) Join(ctx context.Context, code string) (Credentials, error) {
 func (s *Service) Snapshot(ctx context.Context, code string) (Snapshot, error) {
 	return s.repository.Snapshot(ctx, code)
 }
-func (s *Service) Authenticate(ctx context.Context, code, token string) (Snapshot, string, error) {
-	return s.repository.Authenticate(ctx, code, DigestToken(token))
+func (s *Service) Authenticate(ctx context.Context, code, token, authUserID string) (Snapshot, string, error) {
+	return s.repository.Authenticate(ctx, code, DigestToken(token), authUserID)
 }
-func (s *Service) SubmitMove(ctx context.Context, code, token string, move domain.Move) error {
-	_, err := s.repository.Mutate(ctx, code, DigestToken(token), func(r *domain.Room, id string) error { return r.SubmitMove(id, move) })
+func (s *Service) SubmitMove(ctx context.Context, code, token, authUserID string, move domain.Move) error {
+	_, err := s.repository.Mutate(ctx, code, DigestToken(token), authUserID, func(r *domain.Room, id string) error { return r.SubmitMove(id, move) })
 	return err
 }
-func (s *Service) RequestNextRound(ctx context.Context, code, token string, round uint64) error {
-	_, err := s.repository.Mutate(ctx, code, DigestToken(token), func(r *domain.Room, id string) error { return r.RequestNextRound(id, round) })
+func (s *Service) RequestNextRound(ctx context.Context, code, token, authUserID string, round uint64) error {
+	_, err := s.repository.Mutate(ctx, code, DigestToken(token), authUserID, func(r *domain.Room, id string) error { return r.RequestNextRound(id, round) })
 	return err
 }
-func (s *Service) Leave(ctx context.Context, code, token string) error {
-	_, err := s.repository.Mutate(ctx, code, DigestToken(token), func(r *domain.Room, id string) error { return r.Leave(id) })
+func (s *Service) Leave(ctx context.Context, code, token, authUserID string) error {
+	_, err := s.repository.Mutate(ctx, code, DigestToken(token), authUserID, func(r *domain.Room, id string) error { return r.Leave(id) })
 	return err
 }
 
 // RefreshPresence renews an authenticated participant and reschedules the
 // authoritative leases for both seats so an expired opponent is reconsidered.
-func (s *Service) RefreshPresence(ctx context.Context, code, token string) error {
+func (s *Service) RefreshPresence(ctx context.Context, code, token, authUserID string) error {
 	now := s.now()
-	leases, err := s.repository.RefreshPresence(ctx, code, DigestToken(token), s.presenceWindow(now))
+	leases, err := s.repository.RefreshPresence(ctx, code, DigestToken(token), authUserID, s.presenceWindow(now))
 	if err != nil {
 		return err
 	}
