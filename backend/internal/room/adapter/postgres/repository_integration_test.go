@@ -121,7 +121,7 @@ func TestPostgresAllowsLegacyNullableSeatsButRejectsDuplicateAccountSeats(t *tes
 	}
 	now := time.Now()
 	deadline := now.Add(13 * time.Second)
-	_, _, err := repository.Join(ctx, "OWN234", "guest-id", application.DigestToken("guest-token"), owner, application.PresenceWindow{ObservedAt: now, ProofAfter: deadline, Deadline: deadline, EvaluateAt: deadline.Add(3 * time.Second)})
+	_, _, err := repository.JoinFunded(ctx, "OWN234", "guest-id", application.DigestToken("guest-token"), owner, application.PresenceWindow{ObservedAt: now, ProofAfter: deadline, Deadline: deadline, EvaluateAt: deadline.Add(3 * time.Second)})
 	if !errors.Is(err, application.ErrAccountSeated) {
 		t.Fatalf("same-account join error = %v", err)
 	}
@@ -134,6 +134,12 @@ func TestPostgresConcurrentJoinAllowsOneGuest(t *testing.T) {
 	if _, err := repository.Create(context.Background(), aggregate, application.DigestToken("host-token"), "00000000-0000-4000-8000-000000000001"); err != nil {
 		t.Fatal(err)
 	}
+	for index := 1; index <= 3; index++ {
+		owner := fmt.Sprintf("00000000-0000-4000-8000-%012d", index)
+		if _, err := repository.Recharge(context.Background(), owner, 1_000, fmt.Sprintf("concurrent-join-funding-%d", index)); err != nil {
+			t.Fatal(err)
+		}
+	}
 	start := make(chan struct{})
 	errs := make(chan error, 2)
 	for i := range 2 {
@@ -141,7 +147,7 @@ func TestPostgresConcurrentJoinAllowsOneGuest(t *testing.T) {
 			<-start
 			now := time.Now()
 			deadline := now.Add(13 * time.Second)
-			_, _, err := repository.Join(context.Background(), "JOIN23", fmt.Sprintf("guest-%d", i), application.DigestToken(fmt.Sprintf("token-%d", i)), fmt.Sprintf("00000000-0000-4000-8000-%012d", i+2), application.PresenceWindow{ObservedAt: now, ProofAfter: deadline, Deadline: deadline, EvaluateAt: deadline.Add(3 * time.Second)})
+			_, _, err := repository.JoinFunded(context.Background(), "JOIN23", fmt.Sprintf("guest-%d", i), application.DigestToken(fmt.Sprintf("token-%d", i)), fmt.Sprintf("00000000-0000-4000-8000-%012d", i+2), application.PresenceWindow{ObservedAt: now, ProofAfter: deadline, Deadline: deadline, EvaluateAt: deadline.Add(3 * time.Second)})
 			errs <- err
 		}()
 	}
@@ -159,6 +165,74 @@ func TestPostgresConcurrentJoinAllowsOneGuest(t *testing.T) {
 	}
 	if success != 1 || full != 1 {
 		t.Fatalf("success=%d full=%d", success, full)
+	}
+}
+
+func TestPostgresPaidRoundIsAtomicBalancedAndDurable(t *testing.T) {
+	pool := integrationPool(t)
+	ctx := context.Background()
+	repository := postgres.NewRepository(pool)
+	hostOwner := "00000000-0000-4000-8000-000000000001"
+	guestOwner := "00000000-0000-4000-8000-000000000002"
+	hostDigest := application.DigestToken("wallet-host-token")
+	guestDigest := application.DigestToken("wallet-guest-token")
+	aggregate, _ := domain.New("WAL234", "wallet-host")
+	if _, err := repository.Recharge(ctx, hostOwner, 100, "wallet-host-credit"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repository.Recharge(ctx, guestOwner, 49, "wallet-guest-partial-credit"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repository.Create(ctx, aggregate, hostDigest, hostOwner); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	deadline := now.Add(13 * time.Second)
+	window := application.PresenceWindow{ObservedAt: now, ProofAfter: deadline, Deadline: deadline, EvaluateAt: deadline.Add(3 * time.Second)}
+	if _, _, err := repository.JoinFunded(ctx, "WAL234", "wallet-guest", guestDigest, guestOwner, window); !errors.Is(err, application.ErrInsufficientFunds) {
+		t.Fatalf("underfunded join error=%v", err)
+	}
+	var seats int
+	var funded bool
+	if err := pool.QueryRow(ctx, "SELECT count(*) FROM room_seats WHERE room_code='WAL234'").Scan(&seats); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, "SELECT funded FROM room_rounds WHERE room_code='WAL234' AND number=1").Scan(&funded); err != nil {
+		t.Fatal(err)
+	}
+	hostBalance, _ := repository.Balance(ctx, hostOwner)
+	if seats != 1 || funded || hostBalance != 100 {
+		t.Fatalf("failed funding left seats=%d funded=%v host_balance=%d", seats, funded, hostBalance)
+	}
+	if _, err := repository.Recharge(ctx, guestOwner, 1, "wallet-guest-final-credit"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := repository.JoinFunded(ctx, "WAL234", "wallet-guest", guestDigest, guestOwner, window); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repository.SubmitMoveAndSettle(ctx, "WAL234", hostDigest, hostOwner, domain.Rock); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repository.SubmitMoveAndSettle(ctx, "WAL234", guestDigest, guestOwner, domain.Scissors); err != nil {
+		t.Fatal(err)
+	}
+	guestBalance, _ := repository.Balance(ctx, guestOwner)
+	var houseBalance, escrowBalance, historyCount, unbalanced int64
+	if err := pool.QueryRow(ctx, "SELECT balance FROM wallet_accounts WHERE account_id='house'").Scan(&houseBalance); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, "SELECT balance FROM wallet_accounts WHERE account_id='escrow:WAL234:1'").Scan(&escrowBalance); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, "SELECT count(*) FROM game_round_history WHERE room_code='WAL234'").Scan(&historyCount); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, "SELECT count(*) FROM (SELECT transaction_id FROM wallet_postings GROUP BY transaction_id HAVING sum(amount) <> 0) unbalanced").Scan(&unbalanced); err != nil {
+		t.Fatal(err)
+	}
+	hostBalance, _ = repository.Balance(ctx, hostOwner)
+	if hostBalance != 125 || guestBalance != 0 || houseBalance != 25 || escrowBalance != 0 || historyCount != 1 || unbalanced != 0 {
+		t.Fatalf("balances host=%d guest=%d house=%d escrow=%d history=%d unbalanced=%d", hostBalance, guestBalance, houseBalance, escrowBalance, historyCount, unbalanced)
 	}
 }
 
@@ -352,7 +426,7 @@ func integrationPool(t *testing.T) *pgxpool.Pool {
 	if err = postgres.Migrate(context.Background(), pool); err != nil {
 		t.Fatal(err)
 	}
-	if _, err = pool.Exec(context.Background(), "TRUNCATE room_rooms CASCADE"); err != nil {
+	if _, err = pool.Exec(context.Background(), "TRUNCATE room_rooms,game_round_history,wallet_postings,wallet_transactions,wallet_accounts CASCADE; INSERT INTO wallet_accounts(account_id,account_type) VALUES('house','house'),('mint','mint')"); err != nil {
 		t.Fatal(err)
 	}
 	return pool
@@ -367,7 +441,13 @@ func fixedService(repository application.Repository, events application.Events) 
 		values = values[1:]
 		return value, nil
 	}
-	return application.NewServiceWithGenerators(repository, events, func() (string, error) { return "PGT234", nil }, next, next)
+	service := application.NewServiceWithGenerators(repository, events, func() (string, error) { return "PGT234", nil }, next, next)
+	for index, owner := range []string{"00000000-0000-4000-8000-000000000001", "00000000-0000-4000-8000-000000000002"} {
+		if _, err := service.Recharge(context.Background(), owner, 1_000, fmt.Sprintf("postgres-test-funding-%d", index)); err != nil {
+			panic(err)
+		}
+	}
+	return service
 }
 
 func postgresLeaseForPlayer(t *testing.T, leases []application.PresenceLease, playerID string) application.PresenceLease {

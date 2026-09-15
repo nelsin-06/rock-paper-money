@@ -244,7 +244,7 @@ func (r *Room) Leave(playerID string) error {
 	if !r.hasPlayer(playerID) {
 		return ErrUnknownPlayer
 	}
-	if !r.resolved {
+	if !r.resolved && len(r.players) == 2 {
 		return ErrGameUnfinished
 	}
 	r.closed = true

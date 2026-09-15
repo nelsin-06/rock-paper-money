@@ -39,7 +39,8 @@ docker compose exec postgres createdb -U rock_paper_money rock_paper_money_test
 Create the backend's local environment file, then use its startup script.
 `DATABASE_URL` and `SUPABASE_URL` are required. `SUPABASE_JWT_AUDIENCE` defaults
 to `authenticated`. Schema migrations are embedded in the binary and applied
-safely during startup.
+safely during startup. Structured logs are appended to `LOG_FILE`, which defaults
+to the ignored local file `backend/server.log` when started from `backend`.
 
 ```bash
 cd backend
@@ -87,6 +88,19 @@ TEST_DATABASE_URL='postgres://rock_paper_money:rock_paper_money@localhost:5432/r
 `GET /api/health` is process liveness. `GET /api/ready` checks PostgreSQL and
 the required notification listener, returning `503` when the backend cannot
 serve traffic consistently.
+
+Every HTTP response includes a server-generated `X-Request-ID`, which also
+appears in request and error logs. API errors use `status`, `code`, `message`,
+and `meta { time, requestId }`. Allowlisted game-rule errors may also include
+`rawError`; authentication, malformed-input, and internal errors never do.
+
+Authenticated accounts receive a zero-balance coin wallet lazily on first use.
+`GET /api/wallet` returns the caller's balance, and `POST /api/wallet/recharges`
+adds a positive whole-coin amount to that same wallet. Recharge requests require
+a unique `Idempotency-Key` header so retries cannot credit twice. Each player
+stakes 50 coins per funded round. Wins and forfeits pay 75 coins to the winner
+and 25 to the house; draws refund both stakes. `GET /api/analytics/rounds` is
+read-only and available to every authenticated account.
 
 Run the frontend tests:
 

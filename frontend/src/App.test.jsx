@@ -1,8 +1,8 @@
 import { StrictMode } from 'react'
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
-import { GameApp as App } from './App.jsx'
+import { AccountPanel, GameApp as App } from './App.jsx'
 import * as api from './api.js'
 import { APP_VERSION, STORAGE_KEY } from './storage.js'
 
@@ -44,6 +44,8 @@ function streamRoomState(initialState) {
 }
 
 describe('core room flow', () => {
+  afterEach(() => vi.restoreAllMocks())
+
   beforeEach(() => {
     localStorage.clear()
     api.createRoom.mockReset()
@@ -56,6 +58,50 @@ describe('core room flow', () => {
     api.leaveRoom.mockReset()
     api.refreshPresence.mockReset()
     api.refreshPresence.mockResolvedValue()
+    api.getWallet.mockReset()
+    api.getRoundAnalytics.mockReset()
+    api.rechargeWallet.mockReset()
+  })
+
+  it('shows wallet analytics and applies a positive self-recharge', async () => {
+    api.getWallet.mockResolvedValue({ balance: '40' })
+    api.getRoundAnalytics.mockResolvedValue({
+      totalHouseEarnings: '25',
+      rounds: [{ roomCode: 'ABC234', round: 1, result: 'player_one_wins', winnerRole: 'host', forfeit: false, houseEarnings: '25' }],
+    })
+    api.rechargeWallet.mockResolvedValue({ balance: '100' })
+    const onBalance = vi.fn()
+    vi.spyOn(crypto, 'randomUUID').mockReturnValue('recharge-key')
+
+    render(<AccountPanel onBalance={onBalance} />)
+
+    expect(await screen.findByText('40 coins')).toBeInTheDocument()
+    expect(screen.getByText('Total house earnings').parentElement).toHaveTextContent('25 coins')
+    expect(screen.getByText('Host won')).toBeInTheDocument()
+    await userEvent.type(screen.getByLabelText('Recharge amount'), '60')
+    await userEvent.click(screen.getByRole('button', { name: 'Add coins' }))
+
+    expect(api.rechargeWallet).toHaveBeenCalledWith('60', 'recharge-key')
+    expect(await screen.findByText('100 coins')).toBeInTheDocument()
+    expect(onBalance).toHaveBeenLastCalledWith('100')
+  })
+
+  it('reuses the recharge idempotency key after an ambiguous failure', async () => {
+    api.getWallet.mockResolvedValue({ balance: '0' })
+    api.getRoundAnalytics.mockResolvedValue({ totalHouseEarnings: '0', rounds: [] })
+    api.rechargeWallet.mockRejectedValueOnce(new Error('Connection lost')).mockResolvedValueOnce({ balance: '50' })
+    vi.spyOn(crypto, 'randomUUID').mockReturnValue('stable-retry-key')
+
+    render(<AccountPanel onBalance={() => {}} />)
+    await screen.findByText('0 coins')
+    await userEvent.type(screen.getByLabelText('Recharge amount'), '50')
+    await userEvent.click(screen.getByRole('button', { name: 'Add coins' }))
+    expect(await screen.findByRole('alert')).toHaveTextContent('Connection lost')
+    await userEvent.click(screen.getByRole('button', { name: 'Add coins' }))
+
+    expect(api.rechargeWallet).toHaveBeenNthCalledWith(1, '50', 'stable-retry-key')
+    expect(api.rechargeWallet).toHaveBeenNthCalledWith(2, '50', 'stable-retry-key')
+    expect(await screen.findByText('50 coins')).toBeInTheDocument()
   })
 
   it('shows home and creates a room while persisting private credentials', async () => {
@@ -82,6 +128,16 @@ describe('core room flow', () => {
 
     await screen.findByRole('heading', { name: 'Choose your move' })
     expect(api.joinRoom).toHaveBeenCalledWith('ABC234')
+  })
+
+  it('keeps free room creation available but blocks joining below the 50-coin stake', async () => {
+    render(<App walletBalance="49" />)
+
+    await userEvent.type(screen.getByLabelText(/six-character room code/i), 'ABC234')
+
+    expect(screen.getByRole('button', { name: 'Create room' })).toBeEnabled()
+    expect(screen.getByRole('button', { name: 'Join room' })).toBeDisabled()
+    expect(screen.getByText(/creating a room is free/i)).toBeInTheDocument()
   })
 
   it('locks same-tick duplicate create attempts', async () => {
@@ -173,6 +229,30 @@ describe('core room flow', () => {
     expect(screen.getByText('Move locked')).toBeInTheDocument()
   })
 
+  it('shows the choosing animation only during an unresolved ready round', async () => {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(persistedHostSession))
+    streamRoomState(waitingState)
+    render(<App />)
+
+    await screen.findByRole('heading', { name: /waiting for a guest/i })
+    expect(screen.queryByRole('img', { name: 'Players choosing their moves' })).not.toBeInTheDocument()
+
+    act(() => activeStream.onState(readyState))
+    const animation = await screen.findByRole('img', { name: 'Players choosing their moves' })
+    expect(animation.querySelectorAll('img')).toHaveLength(2)
+
+    act(() => activeStream.onState({
+      ...readyState,
+      players: [{ ...readyState.players[0], submitted: true }, readyState.players[1]],
+    }))
+    expect(screen.getByRole('heading', { name: 'Move submitted' })).toBeInTheDocument()
+    expect(screen.getByRole('img', { name: 'Players choosing their moves' })).toBeInTheDocument()
+
+    act(() => activeStream.onState(resolvedState))
+    expect(await screen.findByRole('heading', { name: 'You won' })).toBeInTheDocument()
+    expect(screen.queryByRole('img', { name: 'Players choosing their moves' })).not.toBeInTheDocument()
+  })
+
   it('shows both next-round decisions and starts only after the other player accepts', async () => {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(persistedHostSession))
     const resolved = {
@@ -227,6 +307,23 @@ describe('core room flow', () => {
     await userEvent.click(leave)
     expect(api.leaveRoom).not.toHaveBeenCalled()
     expect(screen.getByText('You can leave after the round is finished.')).toBeInTheDocument()
+  })
+
+  it('allows the sole waiting player to leave', async () => {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(persistedHostSession))
+    streamRoomState(waitingState)
+    api.leaveRoom.mockResolvedValue()
+    render(<App />)
+
+    await screen.findByRole('heading', { name: /waiting for a guest/i })
+    const leave = screen.getByRole('button', { name: 'Leave room' })
+    expect(leave).toBeEnabled()
+    expect(screen.getByText('You can leave while waiting for an opponent.')).toBeInTheDocument()
+    await userEvent.click(leave)
+
+    expect(api.leaveRoom).toHaveBeenCalledWith('ABC234', 'host-secret')
+    expect(screen.getByRole('button', { name: 'Create room' })).toBeInTheDocument()
+    expect(localStorage.getItem(STORAGE_KEY)).toBeNull()
   })
 
   it('closes the room locally after a finished-game leave succeeds', async () => {

@@ -17,10 +17,20 @@ import (
 )
 
 var (
-	ErrDuplicateRoom = errors.New("room code already exists")
-	ErrRoomNotFound  = errors.New("room code was not found")
-	ErrUnauthorized  = errors.New("invalid room credential")
-	ErrAccountSeated = errors.New("account already occupies a seat")
+	ErrDuplicateRoom       = errors.New("room code already exists")
+	ErrRoomNotFound        = errors.New("room code was not found")
+	ErrUnauthorized        = errors.New("invalid room credential")
+	ErrAccountSeated       = errors.New("account already occupies a seat")
+	ErrInsufficientFunds   = errors.New("insufficient coin balance")
+	ErrInvalidCoinAmount   = errors.New("coin amount must be a positive integer")
+	ErrIdempotencyRequired = errors.New("idempotency key is required")
+	ErrIdempotencyConflict = errors.New("idempotency key was already used with different data")
+)
+
+const (
+	RoundStake   int64 = 50
+	WinnerPayout int64 = 75
+	HousePayout  int64 = 25
 )
 
 type Snapshot struct {
@@ -33,12 +43,32 @@ type Mutation func(*domain.Room, string) error
 // Repository is an application-owned port for atomic room operations.
 type Repository interface {
 	Create(context.Context, *domain.Room, CredentialDigest, string) (Snapshot, error)
-	Join(context.Context, string, string, CredentialDigest, string, PresenceWindow) (Snapshot, []PresenceLease, error)
+	JoinFunded(context.Context, string, string, CredentialDigest, string, PresenceWindow) (Snapshot, []PresenceLease, error)
+	SubmitMoveAndSettle(context.Context, string, CredentialDigest, string, domain.Move) (Snapshot, error)
+	RequestNextRoundAndFund(context.Context, string, CredentialDigest, string, uint64) (Snapshot, error)
 	Mutate(context.Context, string, CredentialDigest, string, Mutation) (Snapshot, error)
 	Snapshot(context.Context, string) (Snapshot, error)
 	Authenticate(context.Context, string, CredentialDigest, string) (Snapshot, string, error)
 	RefreshPresence(context.Context, string, CredentialDigest, string, PresenceWindow) ([]PresenceLease, error)
 	ForfeitExpired(context.Context, PresenceLease, time.Time) (Snapshot, bool, error)
+	Balance(context.Context, string) (int64, error)
+	Recharge(context.Context, string, int64, string) (int64, error)
+	Analytics(context.Context) (Analytics, error)
+}
+
+type PlayedRound struct {
+	RoomCode      string
+	Round         uint64
+	Result        domain.Result
+	WinnerRole    string
+	Forfeit       bool
+	HouseEarnings int64
+	ResolvedAt    time.Time
+}
+
+type Analytics struct {
+	TotalHouseEarnings int64
+	Rounds             []PlayedRound
 }
 
 type Events interface {
@@ -158,6 +188,9 @@ func (s *Service) Create(ctx context.Context, authUserID string) (Credentials, e
 	if authUserID == "" {
 		return Credentials{}, ErrUnauthorized
 	}
+	if _, err := s.repository.Balance(ctx, authUserID); err != nil {
+		return Credentials{}, err
+	}
 	for range 8 {
 		code, err := s.generateCode()
 		if err != nil {
@@ -192,7 +225,7 @@ func (s *Service) Join(ctx context.Context, code, authUserID string) (Credential
 			return Credentials{}, err
 		}
 		now := s.now()
-		_, leases, err := s.repository.Join(ctx, code, id, DigestToken(token), authUserID, s.presenceWindow(now))
+		_, leases, err := s.repository.JoinFunded(ctx, code, id, DigestToken(token), authUserID, s.presenceWindow(now))
 		if errors.Is(err, domain.ErrDuplicatePlayer) {
 			continue
 		}
@@ -214,16 +247,43 @@ func (s *Service) Authenticate(ctx context.Context, code, token, authUserID stri
 	return s.repository.Authenticate(ctx, code, DigestToken(token), authUserID)
 }
 func (s *Service) SubmitMove(ctx context.Context, code, token, authUserID string, move domain.Move) error {
-	_, err := s.repository.Mutate(ctx, code, DigestToken(token), authUserID, func(r *domain.Room, id string) error { return r.SubmitMove(id, move) })
+	_, err := s.repository.SubmitMoveAndSettle(ctx, code, DigestToken(token), authUserID, move)
 	return err
 }
 func (s *Service) RequestNextRound(ctx context.Context, code, token, authUserID string, round uint64) error {
-	_, err := s.repository.Mutate(ctx, code, DigestToken(token), authUserID, func(r *domain.Room, id string) error { return r.RequestNextRound(id, round) })
+	_, err := s.repository.RequestNextRoundAndFund(ctx, code, DigestToken(token), authUserID, round)
 	return err
 }
 func (s *Service) Leave(ctx context.Context, code, token, authUserID string) error {
 	_, err := s.repository.Mutate(ctx, code, DigestToken(token), authUserID, func(r *domain.Room, id string) error { return r.Leave(id) })
 	return err
+}
+
+func (s *Service) Balance(ctx context.Context, authUserID string) (int64, error) {
+	if authUserID == "" {
+		return 0, ErrUnauthorized
+	}
+	return s.repository.Balance(ctx, authUserID)
+}
+
+func (s *Service) Recharge(ctx context.Context, authUserID string, amount int64, idempotencyKey string) (int64, error) {
+	if authUserID == "" {
+		return 0, ErrUnauthorized
+	}
+	if amount <= 0 {
+		return 0, ErrInvalidCoinAmount
+	}
+	if idempotencyKey == "" || len(idempotencyKey) > 128 {
+		return 0, ErrIdempotencyRequired
+	}
+	return s.repository.Recharge(ctx, authUserID, amount, idempotencyKey)
+}
+
+func (s *Service) Analytics(ctx context.Context, authUserID string) (Analytics, error) {
+	if authUserID == "" {
+		return Analytics{}, ErrUnauthorized
+	}
+	return s.repository.Analytics(ctx)
 }
 
 // RefreshPresence renews an authenticated participant and reschedules the

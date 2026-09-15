@@ -3,6 +3,8 @@ package memory_test
 import (
 	"context"
 	"errors"
+	"fmt"
+	"math"
 	"testing"
 	"time"
 
@@ -38,16 +40,39 @@ func TestRepositoryRollsBackFailedMutation(t *testing.T) {
 	}
 }
 
+func TestRechargeRejectsBalanceOverflowWithoutRecordingIdempotency(t *testing.T) {
+	repository, _ := memory.New()
+	ctx := context.Background()
+	const owner = "overflow-user"
+
+	if balance, err := repository.Recharge(ctx, owner, math.MaxInt64-1, "initial"); err != nil || balance != math.MaxInt64-1 {
+		t.Fatalf("initial recharge balance=%d error=%v", balance, err)
+	}
+	if balance, err := repository.Recharge(ctx, owner, 2, "retryable"); !errors.Is(err, application.ErrInvalidCoinAmount) || balance != 0 {
+		t.Fatalf("overflowing recharge balance=%d error=%v", balance, err)
+	}
+	if balance, err := repository.Balance(ctx, owner); err != nil || balance != math.MaxInt64-1 {
+		t.Fatalf("balance after rejected recharge=%d error=%v", balance, err)
+	}
+	if balance, err := repository.Recharge(ctx, owner, 1, "retryable"); err != nil || balance != math.MaxInt64 {
+		t.Fatalf("max-safe retry balance=%d error=%v", balance, err)
+	}
+	if balance, err := repository.Recharge(ctx, owner, 1, "retryable"); err != nil || balance != math.MaxInt64 {
+		t.Fatalf("idempotent retry balance=%d error=%v", balance, err)
+	}
+}
+
 func TestSkewedLastHeartbeatsDoNotFabricateWinner(t *testing.T) {
 	repository, _ := memory.New()
 	aggregate, _ := domain.New("ABC234", "host-id")
 	if _, err := repository.Create(context.Background(), aggregate, application.DigestToken("host-token"), "host-user"); err != nil {
 		t.Fatal(err)
 	}
+	fundPlayers(t, repository)
 	observed := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
 	deadline := observed.Add(13 * time.Second)
 	window := application.PresenceWindow{ObservedAt: observed, ProofAfter: deadline, Deadline: deadline, EvaluateAt: deadline.Add(3 * time.Second)}
-	_, leases, err := repository.Join(context.Background(), "ABC234", "guest-id", application.DigestToken("guest-token"), "guest-user", window)
+	_, leases, err := repository.JoinFunded(context.Background(), "ABC234", "guest-id", application.DigestToken("guest-token"), "guest-user", window)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -76,10 +101,11 @@ func TestRefreshReconstructsExpiredOpponentAndPreservesGenerationsAcrossRounds(t
 	if _, err := repository.Create(context.Background(), aggregate, hostDigest, "host-user"); err != nil {
 		t.Fatal(err)
 	}
+	fundPlayers(t, repository)
 	observed := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
 	deadline := observed.Add(13 * time.Second)
 	window := application.PresenceWindow{ObservedAt: observed, ProofAfter: deadline, Deadline: deadline, EvaluateAt: deadline.Add(3 * time.Second)}
-	_, initial, err := repository.Join(context.Background(), "ABC234", "guest-id", guestDigest, "guest-user", window)
+	_, initial, err := repository.JoinFunded(context.Background(), "ABC234", "guest-id", guestDigest, "guest-user", window)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -104,14 +130,10 @@ func TestRefreshReconstructsExpiredOpponentAndPreservesGenerationsAcrossRounds(t
 		t.Fatalf("reconnected-host forfeit changed=%v error=%v", changed, err)
 	}
 
-	if _, err = repository.Mutate(context.Background(), "ABC234", guestDigest, "guest-user", func(room *domain.Room, playerID string) error {
-		return room.RequestNextRound(playerID, 1)
-	}); err != nil {
+	if _, err = repository.RequestNextRoundAndFund(context.Background(), "ABC234", guestDigest, "guest-user", 1); err != nil {
 		t.Fatal(err)
 	}
-	if _, err = repository.Mutate(context.Background(), "ABC234", hostDigest, "host-user", func(room *domain.Room, playerID string) error {
-		return room.RequestNextRound(playerID, 1)
-	}); err != nil {
+	if _, err = repository.RequestNextRoundAndFund(context.Background(), "ABC234", hostDigest, "host-user", 1); err != nil {
 		t.Fatal(err)
 	}
 	nextRound, err := repository.RefreshPresence(context.Background(), "ABC234", hostDigest, "host-user", hostWindow)
@@ -121,6 +143,15 @@ func TestRefreshReconstructsExpiredOpponentAndPreservesGenerationsAcrossRounds(t
 	nextGuestLease := memoryLeaseForPlayer(t, nextRound, "guest-id")
 	if nextGuestLease.Round != 2 || nextGuestLease.Generation <= guestLease.Generation || !nextGuestLease.Active {
 		t.Fatalf("next-round guest lease = %#v, previous = %#v", nextGuestLease, guestLease)
+	}
+}
+
+func fundPlayers(t *testing.T, repository *memory.Repository) {
+	t.Helper()
+	for index, owner := range []string{"host-user", "guest-user"} {
+		if _, err := repository.Recharge(context.Background(), owner, 1_000, fmt.Sprintf("fund-%d", index)); err != nil {
+			t.Fatal(err)
+		}
 	}
 }
 

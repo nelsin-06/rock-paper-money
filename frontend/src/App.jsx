@@ -1,5 +1,7 @@
-import { useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import * as api from './api.js'
+import firstMove from './assets/first-move.png'
+import secondMove from './assets/second-move.png'
 import { clearSession, loadSession, saveSession } from './storage.js'
 import { supabase } from './supabase.js'
 
@@ -13,7 +15,99 @@ function displayError(error) {
   return error instanceof Error ? error.message : 'Something went wrong. Please try again.'
 }
 
-function Home({ onEnterRoom }) {
+const ECONOMY_CHANGED_EVENT = 'rock-paper-money:economy-changed'
+
+function signalEconomyChanged() {
+  window.dispatchEvent(new Event(ECONOMY_CHANGED_EVENT))
+}
+
+export function AccountPanel({ onBalance }) {
+  const [balance, setBalance] = useState(null)
+  const [amount, setAmount] = useState('')
+  const [analytics, setAnalytics] = useState({ totalHouseEarnings: '0', rounds: [] })
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState('')
+  const pendingRechargeRef = useRef(null)
+
+  const refresh = useCallback(async () => {
+    try {
+      const [wallet, report] = await Promise.all([api.getWallet(), api.getRoundAnalytics()])
+      setBalance(wallet.balance)
+      onBalance(wallet.balance)
+      setAnalytics(report)
+      setError('')
+    } catch (requestError) {
+      setError(displayError(requestError))
+    }
+  }, [onBalance])
+
+  useEffect(() => {
+    const initialRefresh = window.setTimeout(refresh, 0)
+    window.addEventListener(ECONOMY_CHANGED_EVENT, refresh)
+    return () => {
+      window.clearTimeout(initialRefresh)
+      window.removeEventListener(ECONOMY_CHANGED_EVENT, refresh)
+    }
+  }, [refresh])
+
+  async function recharge(event) {
+    event.preventDefault()
+    if (!/^[1-9]\d*$/.test(amount)) {
+      setError('Enter a positive whole coin amount.')
+      return
+    }
+    setBusy(true)
+    setError('')
+    if (pendingRechargeRef.current?.amount !== amount) {
+      pendingRechargeRef.current = { amount, key: crypto.randomUUID() }
+    }
+    try {
+      const wallet = await api.rechargeWallet(amount, pendingRechargeRef.current.key)
+      setBalance(wallet.balance)
+      onBalance(wallet.balance)
+      setAmount('')
+      pendingRechargeRef.current = null
+    } catch (requestError) {
+      setError(displayError(requestError))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <aside className="economy-panel" aria-label="Coin wallet and round analytics">
+      <section className="wallet-card">
+        <div><p className="eyebrow">Coin wallet</p><strong>{balance ?? '…'} coins</strong></div>
+        <form className="recharge-form" onSubmit={recharge}>
+          <label htmlFor="recharge-amount">Recharge amount</label>
+          <input id="recharge-amount" inputMode="numeric" pattern="[1-9][0-9]*" value={amount} onChange={(event) => {
+            setAmount(event.target.value.replace(/\D/g, ''))
+            pendingRechargeRef.current = null
+          }} placeholder="100" />
+          <button className="button button-secondary" disabled={busy || !amount}>{busy ? 'Recharging…' : 'Add coins'}</button>
+        </form>
+        {error && <div className="notice notice-error" role="alert">{error}</div>}
+      </section>
+      <section className="analytics-card" aria-labelledby="analytics-title">
+        <div className="house-banner"><span>Total house earnings</span><strong>{analytics.totalHouseEarnings} coins</strong></div>
+        <h2 id="analytics-title">Played rounds</h2>
+        {analytics.rounds.length === 0 ? <p>No paid rounds have been played yet.</p> : (
+          <div className="analytics-list">
+            {analytics.rounds.map((round) => (
+              <article key={`${round.roomCode}:${round.round}`}>
+                <strong>{round.roomCode} · Round {round.round}</strong>
+                <span>{round.result === 'draw' ? 'Draw' : `${round.winnerRole === 'host' ? 'Host' : 'Guest'} won${round.forfeit ? ' by forfeit' : ''}`}</span>
+                <span>House: {round.houseEarnings} coins</span>
+              </article>
+            ))}
+          </div>
+        )}
+      </section>
+    </aside>
+  )
+}
+
+function Home({ onEnterRoom, walletBalance }) {
   const [code, setCode] = useState('')
   const [busy, setBusy] = useState(null)
   const [error, setError] = useState('')
@@ -26,6 +120,7 @@ function Home({ onEnterRoom }) {
     setError('')
     try {
       const session = await action()
+      signalEconomyChanged()
       saveSession(session)
       onEnterRoom(session)
     } catch (requestError) {
@@ -43,6 +138,8 @@ function Home({ onEnterRoom }) {
     }
     enter(() => api.joinRoom(code), 'guest')
   }
+
+  const insufficientForRound = walletBalance !== null && BigInt(walletBalance) < 50n
 
   return (
     <main className="page home-page">
@@ -69,10 +166,11 @@ function Home({ onEnterRoom }) {
             spellCheck="false"
             inputMode="text"
           />
-          <button className="button button-secondary" disabled={busy !== null || code.length !== 6}>
+          <button className="button button-secondary" disabled={busy !== null || code.length !== 6 || insufficientForRound}>
             {busy === 'guest' ? 'Joining room…' : 'Join room'}
           </button>
         </form>
+        {insufficientForRound && <div className="notice notice-error">Creating a room is free, but you need at least 50 coins before a round can be funded. Recharge to join another room.</div>}
         {error && <div className="notice notice-error" role="alert">{error}</div>}
       </section>
     </main>
@@ -150,7 +248,16 @@ function RoundResult({ state, role }) {
   )
 }
 
-function Room({ session, onLeave }) {
+function ChoosingAnimation() {
+  return (
+    <div className="choosing-animation" role="img" aria-label="Players choosing their moves">
+      <img className="choosing-frame choosing-frame-first" src={firstMove} alt="" />
+      <img className="choosing-frame choosing-frame-second" src={secondMove} alt="" />
+    </div>
+  )
+}
+
+function Room({ session, onLeave, walletBalance }) {
   const [state, setState] = useState(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
@@ -160,6 +267,7 @@ function Room({ session, onLeave }) {
   const [connectionError, setConnectionError] = useState('')
   const actionLockRef = useRef(false)
   const mountedRef = useRef(true)
+  const previousEconomyStateRef = useRef(null)
 
   useEffect(() => {
     mountedRef.current = true
@@ -182,6 +290,11 @@ function Room({ session, onLeave }) {
           return
         }
         setState(nextState)
+        const previous = previousEconomyStateRef.current
+        if (previous && ((!previous.ready && nextState.ready) || (!previous.resolved && nextState.resolved) || previous.round !== nextState.round)) {
+          signalEconomyChanged()
+        }
+        previousEconomyStateRef.current = nextState
         const serverPlayer = nextState.players.find((player) => player.role === session.role)
         if (serverPlayer?.submitted) setMovePending(false)
         setConnectionError('')
@@ -247,6 +360,8 @@ function Room({ session, onLeave }) {
   const hasSubmitted = (currentPlayer?.submitted ?? false) || movePending
   const opponent = state?.players.find((player) => player.role !== session.role)
   const wantsNextRound = currentPlayer?.wantsNextRound ?? false
+  const canLeave = state?.resolved || (state?.ready === false && state.players.length === 1)
+  const insufficientForRound = walletBalance !== null && BigInt(walletBalance) < 50n
 
   function retryConnection() {
     setLoading(true)
@@ -264,7 +379,7 @@ function Room({ session, onLeave }) {
         </div>
         <button
           className="button button-quiet"
-          disabled={action !== null || !state?.resolved}
+          disabled={action !== null || !canLeave}
           onClick={() => performAction('leave', async () => {
             await api.leaveRoom(session.roomCode, session.playerToken)
             if (mountedRef.current) onLeave()
@@ -291,6 +406,7 @@ function Room({ session, onLeave }) {
           <p className="eyebrow">Room is open</p>
           <h2>Waiting for a guest</h2>
           <p>Keep this page open while your opponent joins with the code above.</p>
+          {insufficientForRound && <div className="notice notice-error">Recharge to at least 50 coins before a guest can fund this round.</div>}
         </section>
       )}
 
@@ -299,6 +415,7 @@ function Room({ session, onLeave }) {
           <p className="eyebrow">Current round</p>
           <h2 id="round-title">{hasSubmitted ? 'Move submitted' : 'Choose your move'}</h2>
           <p>{hasSubmitted ? 'Your choice is hidden. Waiting for your opponent.' : 'Your move stays secret until both players submit.'}</p>
+          <ChoosingAnimation />
           <div className="move-grid" aria-label="Choose a move">
             {MOVES.map((move) => (
               <button
@@ -328,7 +445,7 @@ function Room({ session, onLeave }) {
           </p>
           <button
             className="button button-primary"
-            disabled={action !== null || wantsNextRound}
+            disabled={action !== null || wantsNextRound || insufficientForRound}
             onClick={() => performAction('next', () => api.startNextRound(session.roomCode, session.playerToken, state.round))}
           >
             {action === 'next'
@@ -337,17 +454,22 @@ function Room({ session, onLeave }) {
                 ? 'Waiting for opponent…'
                 : opponent?.wantsNextRound ? 'Accept next round' : 'Request next round'}
           </button>
+          {insufficientForRound && <div className="notice notice-error">Recharge to at least 50 coins before accepting another paid round.</div>}
         </section>
       )}
 
       <p className="leave-note">
-        {state?.resolved ? 'Leaving closes this room for both players.' : 'You can leave after the round is finished.'}
+        {state?.resolved
+          ? 'Leaving closes this room for both players.'
+          : state?.ready === false && state.players.length === 1
+            ? 'You can leave while waiting for an opponent.'
+            : 'You can leave after the round is finished.'}
       </p>
     </main>
   )
 }
 
-export function GameApp() {
+export function GameApp({ walletBalance = null }) {
   const [session, setSession] = useState(() => loadSession())
   const [sessionReady, setSessionReady] = useState(() => !session)
   const [validationError, setValidationError] = useState('')
@@ -402,9 +524,9 @@ export function GameApp() {
   }
 
   return session ? (
-    <Room key={`${session.roomCode}:${session.playerToken}`} session={session} onLeave={leaveRoom} />
+    <Room key={`${session.roomCode}:${session.playerToken}`} session={session} onLeave={leaveRoom} walletBalance={walletBalance} />
   ) : (
-    <Home onEnterRoom={enterRoom} />
+    <Home onEnterRoom={enterRoom} walletBalance={walletBalance} />
   )
 }
 
@@ -467,6 +589,7 @@ export default function App() {
   const [loading, setLoading] = useState(Boolean(supabase))
   const [pendingEmail, setPendingEmail] = useState('')
   const [error, setError] = useState(supabase ? '' : 'Supabase authentication is not configured.')
+  const [walletBalance, setWalletBalance] = useState(null)
 
   useEffect(() => {
     if (!supabase) {
@@ -536,7 +659,8 @@ export default function App() {
         <button className="button button-quiet" onClick={signOut}>Sign out</button>
       </div>
       {error && <div className="page notice notice-error" role="alert">{error}</div>}
-      <GameApp />
+      <AccountPanel onBalance={setWalletBalance} />
+      <GameApp walletBalance={walletBalance} />
     </div>
   )
 }

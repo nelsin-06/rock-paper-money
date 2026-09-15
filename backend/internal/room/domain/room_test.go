@@ -125,6 +125,19 @@ func TestLeaveClosesRoom(t *testing.T) {
 	}
 }
 
+func TestSoleWaitingPlayerMayLeave(t *testing.T) {
+	r, err := domain.New("ROOM", "host")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Leave("host"); err != nil {
+		t.Fatalf("waiting host leave error = %v", err)
+	}
+	if !r.State().Closed {
+		t.Fatal("waiting room not closed")
+	}
+}
+
 func TestForfeitAwardsOpponentExactlyOnce(t *testing.T) {
 	r := readyRoom(t)
 	if err := r.Forfeit("guest", 1); err != nil {

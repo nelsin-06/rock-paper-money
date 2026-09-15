@@ -5,6 +5,7 @@ import (
 	"crypto/subtle"
 	"errors"
 	"fmt"
+	"math"
 	"sync"
 	"time"
 
@@ -13,9 +14,12 @@ import (
 )
 
 type Repository struct {
-	mu     sync.RWMutex
-	rooms  map[string]*storedRoom
-	events *Events
+	mu        sync.RWMutex
+	rooms     map[string]*storedRoom
+	events    *Events
+	wallets   map[string]int64
+	recharges map[string]memoryRecharge
+	history   []application.PlayedRound
 }
 type storedRoom struct {
 	room        *domain.Room
@@ -23,6 +27,12 @@ type storedRoom struct {
 	credentials map[string]application.CredentialDigest
 	owners      map[string]string
 	presence    map[string]memoryPresence
+	funded      map[uint64]bool
+}
+
+type memoryRecharge struct {
+	owner  string
+	amount int64
 }
 
 type memoryPresence struct {
@@ -33,13 +43,14 @@ type memoryPresence struct {
 
 func New() (*Repository, *Events) {
 	events := NewEvents()
-	return &Repository{rooms: map[string]*storedRoom{}, events: events}, events
+	return &Repository{rooms: map[string]*storedRoom{}, events: events, wallets: map[string]int64{"house": 0}, recharges: map[string]memoryRecharge{}}, events
 }
 
 func (r *Repository) Create(_ context.Context, aggregate *domain.Room, digest application.CredentialDigest, authUserID string) (application.Snapshot, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	state := aggregate.State()
+	r.ensureWallet(authUserID)
 	if _, exists := r.rooms[state.Code]; exists {
 		return application.Snapshot{}, fmt.Errorf("%w: %q", application.ErrDuplicateRoom, state.Code)
 	}
@@ -47,11 +58,11 @@ func (r *Repository) Create(_ context.Context, aggregate *domain.Room, digest ap
 	if err != nil {
 		return application.Snapshot{}, err
 	}
-	r.rooms[state.Code] = &storedRoom{room: storedAggregate, revision: 1, credentials: map[string]application.CredentialDigest{state.Players[0].ID: digest}, owners: map[string]string{state.Players[0].ID: authUserID}, presence: map[string]memoryPresence{}}
+	r.rooms[state.Code] = &storedRoom{room: storedAggregate, revision: 1, credentials: map[string]application.CredentialDigest{state.Players[0].ID: digest}, owners: map[string]string{state.Players[0].ID: authUserID}, presence: map[string]memoryPresence{}, funded: map[uint64]bool{}}
 	return application.Snapshot{State: state, Revision: 1}, nil
 }
 
-func (r *Repository) Join(_ context.Context, code, playerID string, digest application.CredentialDigest, authUserID string, window application.PresenceWindow) (application.Snapshot, []application.PresenceLease, error) {
+func (r *Repository) JoinFunded(_ context.Context, code, playerID string, digest application.CredentialDigest, authUserID string, window application.PresenceWindow) (application.Snapshot, []application.PresenceLease, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	stored, err := r.room(code)
@@ -68,9 +79,18 @@ func (r *Repository) Join(_ context.Context, code, playerID string, digest appli
 			return application.Snapshot{}, nil, application.ErrAccountSeated
 		}
 	}
-	if err := stored.room.Join(playerID); err != nil {
+	working, err := domain.Restore(stored.room.PersistenceState())
+	if err != nil {
 		return application.Snapshot{}, nil, err
 	}
+	if err := working.Join(playerID); err != nil {
+		return application.Snapshot{}, nil, err
+	}
+	r.ensureWallet(authUserID)
+	if err := r.fundRound(stored, code, working.State().Round, authUserID); err != nil {
+		return application.Snapshot{}, nil, err
+	}
+	stored.room = working
 	stored.credentials[playerID] = digest
 	stored.owners[playerID] = authUserID
 	state := stored.room.State()
@@ -81,6 +101,65 @@ func (r *Repository) Join(_ context.Context, code, playerID string, digest appli
 		leases = append(leases, application.PresenceLease{RoomCode: code, PlayerID: player.ID, Round: state.Round, Generation: generation, Deadline: window.Deadline, EvaluateAt: window.EvaluateAt, ProofAfter: window.ProofAfter, Active: true})
 	}
 	return r.changed(code, stored), leases, nil
+}
+
+func (r *Repository) SubmitMoveAndSettle(_ context.Context, code string, digest application.CredentialDigest, authUserID string, move domain.Move) (application.Snapshot, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	stored, err := r.room(code)
+	if err != nil {
+		return application.Snapshot{}, err
+	}
+	playerID, ok := authenticate(stored.credentials, stored.owners, digest, authUserID)
+	if !ok {
+		return application.Snapshot{}, application.ErrUnauthorized
+	}
+	working, err := domain.Restore(stored.room.PersistenceState())
+	if err != nil {
+		return application.Snapshot{}, err
+	}
+	wasResolved := working.State().Resolved
+	if err = working.SubmitMove(playerID, move); err != nil {
+		return application.Snapshot{}, err
+	}
+	if !stored.funded[working.State().Round] {
+		if err = r.fundRound(stored, code, working.State().Round, ""); err != nil {
+			return application.Snapshot{}, err
+		}
+	}
+	if !wasResolved && working.State().Resolved {
+		r.settleRound(stored, code, working.State())
+	}
+	stored.room = working
+	return r.changed(code, stored), nil
+}
+
+func (r *Repository) RequestNextRoundAndFund(_ context.Context, code string, digest application.CredentialDigest, authUserID string, round uint64) (application.Snapshot, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	stored, err := r.room(code)
+	if err != nil {
+		return application.Snapshot{}, err
+	}
+	playerID, ok := authenticate(stored.credentials, stored.owners, digest, authUserID)
+	if !ok {
+		return application.Snapshot{}, application.ErrUnauthorized
+	}
+	working, err := domain.Restore(stored.room.PersistenceState())
+	if err != nil {
+		return application.Snapshot{}, err
+	}
+	previousRound := working.State().Round
+	if err = working.RequestNextRound(playerID, round); err != nil {
+		return application.Snapshot{}, err
+	}
+	if working.State().Round > previousRound {
+		if err = r.fundRound(stored, code, working.State().Round, ""); err != nil {
+			return application.Snapshot{}, err
+		}
+	}
+	stored.room = working
+	return r.changed(code, stored), nil
 }
 
 func (r *Repository) Mutate(_ context.Context, code string, digest application.CredentialDigest, authUserID string, mutation application.Mutation) (application.Snapshot, error) {
@@ -198,9 +277,110 @@ func (r *Repository) ForfeitExpired(_ context.Context, lease application.Presenc
 		}
 		return application.Snapshot{}, false, err
 	}
+	if !stored.funded[working.State().Round] {
+		if err = r.fundRound(stored, lease.RoomCode, working.State().Round, ""); err != nil {
+			return application.Snapshot{}, false, err
+		}
+	}
+	r.settleRound(stored, lease.RoomCode, working.State())
 	stored.room = working
 	return r.changed(lease.RoomCode, stored), true, nil
 }
+
+func (r *Repository) Balance(_ context.Context, authUserID string) (int64, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.ensureWallet(authUserID)
+	return r.wallets[authUserID], nil
+}
+
+func (r *Repository) Recharge(_ context.Context, authUserID string, amount int64, key string) (int64, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	businessKey := authUserID + ":" + key
+	if previous, ok := r.recharges[businessKey]; ok {
+		if previous.owner != authUserID || previous.amount != amount {
+			return 0, application.ErrIdempotencyConflict
+		}
+		return r.wallets[authUserID], nil
+	}
+	r.ensureWallet(authUserID)
+	if amount > math.MaxInt64-r.wallets[authUserID] {
+		return 0, application.ErrInvalidCoinAmount
+	}
+	r.wallets[authUserID] += amount
+	r.recharges[businessKey] = memoryRecharge{owner: authUserID, amount: amount}
+	return r.wallets[authUserID], nil
+}
+
+func (r *Repository) Analytics(_ context.Context) (application.Analytics, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	rounds := append([]application.PlayedRound(nil), r.history...)
+	return application.Analytics{TotalHouseEarnings: r.wallets["house"], Rounds: rounds}, nil
+}
+
+func (r *Repository) ensureWallet(authUserID string) {
+	if _, ok := r.wallets[authUserID]; !ok {
+		r.wallets[authUserID] = 0
+	}
+}
+
+func (r *Repository) fundRound(stored *storedRoom, code string, round uint64, joiningOwner string) error {
+	if stored.funded[round] {
+		return nil
+	}
+	owners := make([]string, 0, 2)
+	for _, player := range stored.room.State().Players {
+		owners = append(owners, stored.owners[player.ID])
+	}
+	if joiningOwner != "" {
+		owners = append(owners, joiningOwner)
+	}
+	if len(owners) != 2 {
+		return domain.ErrRoomNotReady
+	}
+	for _, owner := range owners {
+		r.ensureWallet(owner)
+		if r.wallets[owner] < application.RoundStake {
+			return application.ErrInsufficientFunds
+		}
+	}
+	for _, owner := range owners {
+		r.wallets[owner] -= application.RoundStake
+	}
+	r.wallets[escrowKey(code, round)] = application.RoundStake * 2
+	stored.funded[round] = true
+	return nil
+}
+
+func (r *Repository) settleRound(stored *storedRoom, code string, state domain.State) {
+	escrow := escrowKey(code, state.Round)
+	if r.wallets[escrow] == 0 {
+		return
+	}
+	playerOwners := []string{stored.owners[state.Players[0].ID], stored.owners[state.Players[1].ID]}
+	houseEarnings := int64(0)
+	winnerRole := ""
+	if state.Result == domain.Draw {
+		r.wallets[playerOwners[0]] += application.RoundStake
+		r.wallets[playerOwners[1]] += application.RoundStake
+	} else {
+		winner := 0
+		winnerRole = "host"
+		if state.Result == domain.PlayerTwoWins {
+			winner = 1
+			winnerRole = "guest"
+		}
+		r.wallets[playerOwners[winner]] += application.WinnerPayout
+		r.wallets["house"] += application.HousePayout
+		houseEarnings = application.HousePayout
+	}
+	r.wallets[escrow] = 0
+	r.history = append([]application.PlayedRound{{RoomCode: code, Round: state.Round, Result: state.Result, WinnerRole: winnerRole, Forfeit: state.Forfeit, HouseEarnings: houseEarnings, ResolvedAt: time.Now().UTC()}}, r.history...)
+}
+
+func escrowKey(code string, round uint64) string { return fmt.Sprintf("escrow:%s:%d", code, round) }
 
 func (r *Repository) room(code string) (*storedRoom, error) {
 	stored, ok := r.rooms[code]

@@ -27,6 +27,9 @@ func (r *Repository) Create(ctx context.Context, aggregate *domain.Room, digest 
 	}
 	defer tx.Rollback(ctx)
 	state := aggregate.PersistenceState()
+	if err = ensureUserWallet(ctx, tx, authUserID); err != nil {
+		return application.Snapshot{}, err
+	}
 	if _, err = tx.Exec(ctx, "INSERT INTO room_rooms(code) VALUES($1)", state.Code); isUnique(err) {
 		return application.Snapshot{}, application.ErrDuplicateRoom
 	} else if err != nil {
@@ -44,7 +47,7 @@ func (r *Repository) Create(ctx context.Context, aggregate *domain.Room, digest 
 	return application.Snapshot{State: aggregate.State(), Revision: 1}, nil
 }
 
-func (r *Repository) Join(ctx context.Context, code, playerID string, digest application.CredentialDigest, authUserID string, window application.PresenceWindow) (application.Snapshot, []application.PresenceLease, error) {
+func (r *Repository) JoinFunded(ctx context.Context, code, playerID string, digest application.CredentialDigest, authUserID string, window application.PresenceWindow) (application.Snapshot, []application.PresenceLease, error) {
 	var leases []application.PresenceLease
 	snapshot, err := r.write(ctx, code, nil, "", func(tx pgx.Tx, aggregate *domain.Room, _ string) error {
 		if err := aggregate.Join(playerID); err != nil {
@@ -56,6 +59,9 @@ func (r *Repository) Join(ctx context.Context, code, playerID string, digest app
 		}
 		if occupied {
 			return application.ErrAccountSeated
+		}
+		if err := fundRound(ctx, tx, code, aggregate.State().Round, authUserID); err != nil {
+			return err
 		}
 		_, err := tx.Exec(ctx, "INSERT INTO room_seats(room_code,role,player_id,credential_digest,auth_user_id) VALUES($1,'guest',$2,$3,$4)", code, playerID, digest[:], authUserID)
 		if isUnique(err) {
@@ -85,6 +91,35 @@ func (r *Repository) Join(ctx context.Context, code, playerID string, digest app
 		return rows.Err()
 	})
 	return snapshot, leases, err
+}
+
+func (r *Repository) SubmitMoveAndSettle(ctx context.Context, code string, digest application.CredentialDigest, authUserID string, move domain.Move) (application.Snapshot, error) {
+	return r.write(ctx, code, &digest, authUserID, func(tx pgx.Tx, aggregate *domain.Room, playerID string) error {
+		state := aggregate.State()
+		if err := fundRound(ctx, tx, code, state.Round, ""); err != nil {
+			return err
+		}
+		if err := aggregate.SubmitMove(playerID, move); err != nil {
+			return err
+		}
+		if !state.Resolved && aggregate.State().Resolved {
+			return settleRound(ctx, tx, code, aggregate.State())
+		}
+		return nil
+	})
+}
+
+func (r *Repository) RequestNextRoundAndFund(ctx context.Context, code string, digest application.CredentialDigest, authUserID string, round uint64) (application.Snapshot, error) {
+	return r.write(ctx, code, &digest, authUserID, func(tx pgx.Tx, aggregate *domain.Room, playerID string) error {
+		previousRound := aggregate.State().Round
+		if err := aggregate.RequestNextRound(playerID, round); err != nil {
+			return err
+		}
+		if aggregate.State().Round > previousRound {
+			return fundRound(ctx, tx, code, aggregate.State().Round, "")
+		}
+		return nil
+	})
 }
 
 func (r *Repository) Mutate(ctx context.Context, code string, digest application.CredentialDigest, authUserID string, mutation application.Mutation) (application.Snapshot, error) {
@@ -261,18 +296,113 @@ func (r *Repository) ForfeitExpired(ctx context.Context, lease application.Prese
 		if !remainingConnected {
 			return errPresenceLeaseCurrent
 		}
+		if fundErr := fundRound(ctx, tx, lease.RoomCode, aggregate.State().Round, ""); fundErr != nil {
+			return fundErr
+		}
 		if forfeitErr := aggregate.Forfeit(lease.PlayerID, lease.Round); forfeitErr != nil {
 			if errors.Is(forfeitErr, domain.ErrStaleRound) || errors.Is(forfeitErr, domain.ErrRoundResolved) || errors.Is(forfeitErr, domain.ErrRoomClosed) {
 				return errPresenceLeaseCurrent
 			}
 			return forfeitErr
 		}
-		return nil
+		return settleRound(ctx, tx, lease.RoomCode, aggregate.State())
 	})
 	if errors.Is(err, errPresenceLeaseCurrent) {
 		return application.Snapshot{}, false, nil
 	}
 	return snapshot, err == nil, err
+}
+
+func (r *Repository) Balance(ctx context.Context, authUserID string) (int64, error) {
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback(ctx)
+	if err = ensureUserWallet(ctx, tx, authUserID); err != nil {
+		return 0, err
+	}
+	var balance int64
+	if err = tx.QueryRow(ctx, "SELECT balance FROM wallet_accounts WHERE account_id=$1", userAccountID(authUserID)).Scan(&balance); err != nil {
+		return 0, err
+	}
+	if err = tx.Commit(ctx); err != nil {
+		return 0, err
+	}
+	return balance, nil
+}
+
+func (r *Repository) Recharge(ctx context.Context, authUserID string, amount int64, idempotencyKey string) (int64, error) {
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback(ctx)
+	if err = ensureUserWallet(ctx, tx, authUserID); err != nil {
+		return 0, err
+	}
+	userAccount := userAccountID(authUserID)
+	if err = lockWallets(ctx, tx, []string{"mint", userAccount}); err != nil {
+		return 0, err
+	}
+	businessKey := "recharge:" + authUserID + ":" + idempotencyKey
+	var existingOwner string
+	var existingAmount int64
+	err = tx.QueryRow(ctx, "SELECT auth_user_id::text,amount FROM wallet_transactions WHERE business_key=$1", businessKey).Scan(&existingOwner, &existingAmount)
+	if err == nil {
+		if existingOwner != authUserID || existingAmount != amount {
+			return 0, application.ErrIdempotencyConflict
+		}
+		var balance int64
+		if err = tx.QueryRow(ctx, "SELECT balance FROM wallet_accounts WHERE account_id=$1", userAccount).Scan(&balance); err != nil {
+			return 0, err
+		}
+		if err = tx.Commit(ctx); err != nil {
+			return 0, err
+		}
+		return balance, nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return 0, err
+	}
+	var transactionID int64
+	if err = tx.QueryRow(ctx, "INSERT INTO wallet_transactions(business_key,transaction_type,auth_user_id,amount) VALUES($1,'recharge',$2,$3) RETURNING transaction_id", businessKey, authUserID, amount).Scan(&transactionID); err != nil {
+		return 0, err
+	}
+	if _, err = tx.Exec(ctx, "INSERT INTO wallet_postings(transaction_id,account_id,amount) VALUES($1,'mint',$2),($1,$3,$4)", transactionID, -amount, userAccount, amount); err != nil {
+		return 0, err
+	}
+	var balance int64
+	if err = tx.QueryRow(ctx, "UPDATE wallet_accounts SET balance=balance+$2 WHERE account_id=$1 RETURNING balance", userAccount, amount).Scan(&balance); err != nil {
+		return 0, err
+	}
+	if _, err = tx.Exec(ctx, "UPDATE wallet_accounts SET balance=balance-$1 WHERE account_id='mint'", amount); err != nil {
+		return 0, err
+	}
+	if err = tx.Commit(ctx); err != nil {
+		return 0, err
+	}
+	return balance, nil
+}
+
+func (r *Repository) Analytics(ctx context.Context) (application.Analytics, error) {
+	var analytics application.Analytics
+	if err := r.pool.QueryRow(ctx, "SELECT balance FROM wallet_accounts WHERE account_id='house'").Scan(&analytics.TotalHouseEarnings); err != nil {
+		return application.Analytics{}, err
+	}
+	rows, err := r.pool.Query(ctx, "SELECT room_code,round_number,result,COALESCE(winner_role,''),forfeited,house_earnings,resolved_at FROM game_round_history ORDER BY resolved_at DESC,room_code,round_number DESC LIMIT 500")
+	if err != nil {
+		return application.Analytics{}, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var played application.PlayedRound
+		if err = rows.Scan(&played.RoomCode, &played.Round, &played.Result, &played.WinnerRole, &played.Forfeit, &played.HouseEarnings, &played.ResolvedAt); err != nil {
+			return application.Analytics{}, err
+		}
+		analytics.Rounds = append(analytics.Rounds, played)
+	}
+	return analytics, rows.Err()
 }
 
 type queryer interface {
@@ -428,6 +558,203 @@ func save(ctx context.Context, tx pgx.Tx, aggregate *domain.Room, roles map[stri
 	}
 	return nil
 }
+
+func ensureUserWallet(ctx context.Context, tx pgx.Tx, authUserID string) error {
+	_, err := tx.Exec(ctx, "INSERT INTO wallet_accounts(account_id,account_type,auth_user_id) VALUES($1,'user',$2) ON CONFLICT (auth_user_id) DO NOTHING", userAccountID(authUserID), authUserID)
+	return err
+}
+
+func userAccountID(authUserID string) string { return "user:" + authUserID }
+
+func escrowAccountID(code string, round uint64) string {
+	return fmt.Sprintf("escrow:%s:%d", code, round)
+}
+
+func lockWallets(ctx context.Context, tx pgx.Tx, accountIDs []string) error {
+	rows, err := tx.Query(ctx, "SELECT account_id FROM wallet_accounts WHERE account_id=ANY($1) ORDER BY account_id FOR UPDATE", accountIDs)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	count := 0
+	for rows.Next() {
+		count++
+	}
+	if err = rows.Err(); err != nil {
+		return err
+	}
+	if count != len(accountIDs) {
+		return errors.New("wallet account set is incomplete")
+	}
+	return nil
+}
+
+func fundRound(ctx context.Context, tx pgx.Tx, code string, round uint64, joiningAuthUserID string) error {
+	if _, err := tx.Exec(ctx, "INSERT INTO room_rounds(room_code,number) VALUES($1,$2) ON CONFLICT (room_code,number) DO NOTHING", code, round); err != nil {
+		return err
+	}
+	var funded bool
+	if err := tx.QueryRow(ctx, "SELECT funded FROM room_rounds WHERE room_code=$1 AND number=$2", code, round).Scan(&funded); err != nil {
+		return err
+	}
+	if funded {
+		return nil
+	}
+	rows, err := tx.Query(ctx, "SELECT auth_user_id::text FROM room_seats WHERE room_code=$1 ORDER BY role", code)
+	if err != nil {
+		return err
+	}
+	owners := make([]string, 0, 2)
+	for rows.Next() {
+		var owner *string
+		if err = rows.Scan(&owner); err != nil {
+			rows.Close()
+			return err
+		}
+		if owner == nil || *owner == "" {
+			rows.Close()
+			return application.ErrUnauthorized
+		}
+		owners = append(owners, *owner)
+	}
+	if err = rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	rows.Close()
+	if joiningAuthUserID != "" {
+		owners = append(owners, joiningAuthUserID)
+	}
+	if len(owners) != 2 {
+		return domain.ErrRoomNotReady
+	}
+	accountIDs := []string{userAccountID(owners[0]), userAccountID(owners[1])}
+	for _, owner := range owners {
+		if err = ensureUserWallet(ctx, tx, owner); err != nil {
+			return err
+		}
+	}
+	escrow := escrowAccountID(code, round)
+	if _, err = tx.Exec(ctx, "INSERT INTO wallet_accounts(account_id,account_type,room_code,round_number) VALUES($1,'escrow',$2,$3) ON CONFLICT (room_code,round_number) DO NOTHING", escrow, code, round); err != nil {
+		return err
+	}
+	accountIDs = append(accountIDs, escrow)
+	if err = lockWallets(ctx, tx, accountIDs); err != nil {
+		return err
+	}
+	for _, accountID := range accountIDs[:2] {
+		var balance int64
+		if err = tx.QueryRow(ctx, "SELECT balance FROM wallet_accounts WHERE account_id=$1", accountID).Scan(&balance); err != nil {
+			return err
+		}
+		if balance < application.RoundStake {
+			return application.ErrInsufficientFunds
+		}
+	}
+	businessKey := fmt.Sprintf("stake:%s:%d", code, round)
+	var transactionID int64
+	err = tx.QueryRow(ctx, "INSERT INTO wallet_transactions(business_key,transaction_type) VALUES($1,'stake') ON CONFLICT (business_key) DO NOTHING RETURNING transaction_id", businessKey).Scan(&transactionID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		_, err = tx.Exec(ctx, "UPDATE room_rounds SET funded=true WHERE room_code=$1 AND number=$2", code, round)
+		return err
+	}
+	if err != nil {
+		return err
+	}
+	if _, err = tx.Exec(ctx, "INSERT INTO wallet_postings(transaction_id,account_id,amount) VALUES($1,$2,$4),($1,$3,$4),($1,$5,$6)", transactionID, accountIDs[0], accountIDs[1], -application.RoundStake, escrow, application.RoundStake*2); err != nil {
+		return err
+	}
+	if _, err = tx.Exec(ctx, "UPDATE wallet_accounts SET balance=balance-$2 WHERE account_id=ANY($1)", accountIDs[:2], application.RoundStake); err != nil {
+		return err
+	}
+	if _, err = tx.Exec(ctx, "UPDATE wallet_accounts SET balance=balance+$2 WHERE account_id=$1", escrow, application.RoundStake*2); err != nil {
+		return err
+	}
+	_, err = tx.Exec(ctx, "UPDATE room_rounds SET funded=true WHERE room_code=$1 AND number=$2", code, round)
+	return err
+}
+
+func settleRound(ctx context.Context, tx pgx.Tx, code string, state domain.State) error {
+	var alreadyRecorded bool
+	if err := tx.QueryRow(ctx, "SELECT EXISTS(SELECT 1 FROM game_round_history WHERE room_code=$1 AND round_number=$2)", code, state.Round).Scan(&alreadyRecorded); err != nil || alreadyRecorded {
+		return err
+	}
+	rows, err := tx.Query(ctx, "SELECT role,'user:' || auth_user_id::text FROM room_seats WHERE room_code=$1 ORDER BY CASE role WHEN 'host' THEN 0 ELSE 1 END", code)
+	if err != nil {
+		return err
+	}
+	accounts := make([]string, 0, 2)
+	for rows.Next() {
+		var role, accountID string
+		if err = rows.Scan(&role, &accountID); err != nil {
+			rows.Close()
+			return err
+		}
+		accounts = append(accounts, accountID)
+	}
+	if err = rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	rows.Close()
+	if len(accounts) != 2 {
+		return domain.ErrRoomNotReady
+	}
+	escrow := escrowAccountID(code, state.Round)
+	lockIDs := []string{"house", accounts[0], accounts[1], escrow}
+	if err = lockWallets(ctx, tx, lockIDs); err != nil {
+		return err
+	}
+	var escrowBalance int64
+	if err = tx.QueryRow(ctx, "SELECT balance FROM wallet_accounts WHERE account_id=$1", escrow).Scan(&escrowBalance); err != nil {
+		return err
+	}
+	if escrowBalance != application.RoundStake*2 {
+		return errors.New("funded round escrow has invalid balance")
+	}
+	var transactionID int64
+	businessKey := fmt.Sprintf("settlement:%s:%d", code, state.Round)
+	err = tx.QueryRow(ctx, "INSERT INTO wallet_transactions(business_key,transaction_type) VALUES($1,'settlement') ON CONFLICT (business_key) DO NOTHING RETURNING transaction_id", businessKey).Scan(&transactionID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	winnerRole := ""
+	houseEarnings := int64(0)
+	if state.Result == domain.Draw {
+		if _, err = tx.Exec(ctx, "INSERT INTO wallet_postings(transaction_id,account_id,amount) VALUES($1,$2,$3),($1,$4,$5),($1,$6,$5)", transactionID, escrow, -application.RoundStake*2, accounts[0], application.RoundStake, accounts[1]); err != nil {
+			return err
+		}
+		if _, err = tx.Exec(ctx, "UPDATE wallet_accounts SET balance=balance+$2 WHERE account_id=ANY($1)", accounts, application.RoundStake); err != nil {
+			return err
+		}
+	} else {
+		winnerAccount := accounts[0]
+		winnerRole = "host"
+		if state.Result == domain.PlayerTwoWins {
+			winnerAccount = accounts[1]
+			winnerRole = "guest"
+		}
+		houseEarnings = application.HousePayout
+		if _, err = tx.Exec(ctx, "INSERT INTO wallet_postings(transaction_id,account_id,amount) VALUES($1,$2,$3),($1,$4,$5),($1,'house',$6)", transactionID, escrow, -application.RoundStake*2, winnerAccount, application.WinnerPayout, application.HousePayout); err != nil {
+			return err
+		}
+		if _, err = tx.Exec(ctx, "UPDATE wallet_accounts SET balance=balance+$2 WHERE account_id=$1", winnerAccount, application.WinnerPayout); err != nil {
+			return err
+		}
+		if _, err = tx.Exec(ctx, "UPDATE wallet_accounts SET balance=balance+$1 WHERE account_id='house'", application.HousePayout); err != nil {
+			return err
+		}
+	}
+	if _, err = tx.Exec(ctx, "UPDATE wallet_accounts SET balance=0 WHERE account_id=$1", escrow); err != nil {
+		return err
+	}
+	_, err = tx.Exec(ctx, "INSERT INTO game_round_history(room_code,round_number,host_account_id,guest_account_id,result,winner_role,forfeited,house_earnings) VALUES($1,$2,$3,$4,$5,NULLIF($6,''),$7,$8)", code, state.Round, accounts[0], accounts[1], state.Result, winnerRole, state.Forfeit, houseEarnings)
+	return err
+}
+
 func isUnique(err error) bool {
 	var pgErr *pgconn.PgError
 	return errors.As(err, &pgErr) && pgErr.Code == "23505"

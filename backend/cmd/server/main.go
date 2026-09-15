@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"log/slog"
 	"net/http"
@@ -26,6 +27,17 @@ func main() {
 }
 
 func run() error {
+	logPath := os.Getenv("LOG_FILE")
+	if logPath == "" {
+		logPath = "server.log"
+	}
+	logger, logFile, err := openLogger(logPath, os.Stderr)
+	if err != nil {
+		return err
+	}
+	defer logFile.Close()
+	slog.SetDefault(logger)
+
 	databaseURL := os.Getenv("DATABASE_URL")
 	if databaseURL == "" {
 		return errors.New("DATABASE_URL is required")
@@ -60,7 +72,7 @@ func run() error {
 	}
 	cancelStartup()
 	repository := postgres.NewRepository(pool)
-	events := postgres.NewEvents(pool, slog.Default())
+	events := postgres.NewEvents(pool, logger)
 	if err := events.Start(root); err != nil {
 		return fmt.Errorf("start database notification listener: %w", err)
 	}
@@ -73,15 +85,24 @@ func run() error {
 	}
 	server := &http.Server{
 		Addr:              "0.0.0.0:" + port,
-		Handler:           roomhttp.NewRouter(rooms, verifier, ready),
+		Handler:           roomhttp.NewRouter(rooms, verifier, ready, logger),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
 		WriteTimeout:      10 * time.Second,
 		IdleTimeout:       60 * time.Second,
 	}
 
-	log.Printf("server listening on %s", server.Addr)
+	logger.Info("server listening", "address", server.Addr)
 	return serveHTTP(root, server, server.ListenAndServe)
+}
+
+func openLogger(path string, console io.Writer) (*slog.Logger, *os.File, error) {
+	file, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o640)
+	if err != nil {
+		return nil, nil, fmt.Errorf("open log file %q: %w", path, err)
+	}
+	logger := slog.New(slog.NewJSONHandler(io.MultiWriter(console, file), nil))
+	return logger, file, nil
 }
 
 func serveHTTP(ctx context.Context, server *http.Server, listen func() error) error {

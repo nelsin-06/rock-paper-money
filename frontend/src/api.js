@@ -1,10 +1,13 @@
 import { getAccessToken } from './supabase.js'
 
 export class ApiError extends Error {
-  constructor(message, status = 0) {
+  constructor(message, status = 0, { code = '', requestId = '', rawError } = {}) {
     super(message)
     this.name = 'ApiError'
     this.status = status
+    this.code = code
+    this.requestId = requestId
+    if (typeof rawError === 'string' && rawError) this.rawError = rawError
   }
 }
 
@@ -19,14 +22,29 @@ async function request(path, options = {}) {
   }
 
   if (!response.ok) {
-    let message = `Request failed (${response.status}).`
+    const fallback = new ApiError(`Request failed (${response.status}).`, response.status, {
+      requestId: response.headers.get('X-Request-ID') ?? '',
+    })
+    let body
     try {
-      const body = await response.json()
-      if (typeof body.error === 'string' && body.error) message = body.error
+      body = await response.json()
     } catch {
       // Keep the status-based fallback when an upstream response is not JSON.
     }
-    throw new ApiError(message, response.status)
+    if (
+      body?.status === response.status &&
+      typeof body.code === 'string' && body.code &&
+      typeof body.message === 'string' && body.message &&
+      typeof body.meta?.time === 'string' && body.meta.time &&
+      typeof body.meta?.requestId === 'string' && body.meta.requestId
+    ) {
+      throw new ApiError(body.message, response.status, {
+        code: body.code,
+        requestId: body.meta.requestId,
+        rawError: body.rawError,
+      })
+    }
+    throw fallback
   }
 
   if (response.status === 204) return null
@@ -64,6 +82,13 @@ function mapRoomState(dto) {
     result: dto.result ?? null,
     moves: (dto.moves ?? []).map((move) => ({ role: move.role, move: move.move })),
   }
+}
+
+function coinValue(value, field) {
+  if (typeof value !== 'string' || !/^\d+$/.test(value)) {
+    throw new ApiError(`The game server returned an invalid ${field}.`)
+  }
+  return value
 }
 
 async function protectedHeaders(roomToken) {
@@ -146,4 +171,39 @@ export async function refreshPresence(code, token, { signal } = {}) {
     headers: await protectedHeaders(token),
     signal,
   })
+}
+
+export async function getWallet({ signal } = {}) {
+  const dto = await request('/api/wallet', { headers: await protectedHeaders(), signal })
+  return { balance: coinValue(dto?.balance, 'wallet balance') }
+}
+
+export async function rechargeWallet(amount, idempotencyKey, { signal } = {}) {
+  if (typeof amount !== 'string' || !/^[1-9]\d*$/.test(amount)) {
+    throw new ApiError('Enter a positive whole coin amount.')
+  }
+  const dto = await request('/api/wallet/recharges', {
+    method: 'POST',
+    headers: { ...await protectedHeaders(), 'Content-Type': 'application/json', 'Idempotency-Key': idempotencyKey },
+    body: `{"amount":${amount}}`,
+    signal,
+  })
+  return { balance: coinValue(dto?.balance, 'wallet balance') }
+}
+
+export async function getRoundAnalytics({ signal } = {}) {
+  const dto = await request('/api/analytics/rounds', { headers: await protectedHeaders(), signal })
+  if (!Array.isArray(dto?.rounds)) throw new ApiError('The game server returned invalid round analytics.')
+  return {
+    totalHouseEarnings: coinValue(dto.total_house_earnings, 'house earnings'),
+    rounds: dto.rounds.map((round) => ({
+      roomCode: round.room_code,
+      round: round.round,
+      result: round.result,
+      winnerRole: round.winner_role || null,
+      forfeit: round.forfeit,
+      houseEarnings: coinValue(round.house_earnings, 'round house earnings'),
+      resolvedAt: round.resolved_at,
+    })),
+  }
 }

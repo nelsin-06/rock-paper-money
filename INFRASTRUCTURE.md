@@ -42,6 +42,15 @@ share that transaction. A failed command rolls back every effect. Database
 primary keys, foreign keys, uniqueness constraints, and checks provide a second
 line of invariant enforcement.
 
+Paid round operations lock the room first, then lock wallet accounts in sorted
+account-ID order. The same transaction funds per-round escrow, applies the room
+transition, settles an immutable balanced ledger, records durable round history,
+increments the revision, and publishes the invalidation notification. User,
+house, escrow, and recharge-mint accounts are separate, so unsettled stakes and
+new coin issuance never appear as earned house revenue. Financial accounts and
+history deliberately do not reference room cleanup or `auth.users` through
+foreign keys.
+
 Supabase access tokens are Bearer credentials and establish account identity.
 Create, join, session validation, and every mutation require a verified token.
 Seat-owned operations additionally require the random 256-bit room credential
@@ -67,6 +76,7 @@ an SSE reconnect always receives a fresh snapshot.
 | `SUPABASE_URL` | yes | Supabase HTTPS project origin and JWT issuer base |
 | `SUPABASE_JWT_AUDIENCE` | no | Expected JWT audience; defaults to `authenticated` |
 | `PORT` | no | HTTP port; defaults to `8080` |
+| `LOG_FILE` | no | Append-only JSON log path; defaults to `server.log` in the process working directory |
 | `TEST_DATABASE_URL` | tests only | Enables destructive integration tests against a dedicated database |
 
 The frontend requires `VITE_SUPABASE_URL` and
@@ -106,6 +116,17 @@ it is not a production deployment manifest.
 - `GET /api/ready`: PostgreSQL and notification-listener readiness; returns
   `503` when the required database cannot be reached or the dedicated LISTEN
   connection is reconnecting.
+- Every request receives a new server-generated `X-Request-ID`. The same value
+  is included in API error metadata and structured request/error logs; incoming
+  request ID headers are not trusted as correlation identities.
+- Logs are written as JSON to stderr and appended to `LOG_FILE`. Startup fails
+  if that file cannot be opened. The deployment operator owns external rotation,
+  retention, archival, permissions, and disk-capacity monitoring; rotate with a
+  mechanism that preserves or recreates the configured writable path before
+  restarting the process.
+- Logs intentionally omit query strings, request/response bodies, authorization
+  headers, and room credentials. Internal errors and recovered panics return a
+  fixed non-disclosing response while producing a structured `ERROR` entry.
 - Shutdown on `SIGINT`/`SIGTERM` stops accepting HTTP traffic, drains requests
   for up to ten seconds, cancels the dedicated notification listener, and then
   closes the pool.
@@ -129,7 +150,7 @@ TEST_DATABASE_URL='postgres://...' go test ./internal/room/adapter/postgres
 go test ./...
 ```
 
-Integration tests truncate room tables and MUST use an isolated test database.
+Integration tests truncate room, wallet, ledger, and analytics tables and MUST use an isolated test database.
 They cover reconstruction after repository recreation, concurrent mutations,
 duplicate protection, digest-only credentials, revisions, and cross-instance
 notifications.

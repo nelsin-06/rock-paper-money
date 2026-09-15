@@ -1,11 +1,45 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 )
+
+func TestOpenLoggerWritesStructuredEntriesToConsoleAndFile(t *testing.T) {
+	var console bytes.Buffer
+	path := filepath.Join(t.TempDir(), "server.log")
+	logger, file, err := openLogger(path, &console)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logger.Error("request failed", "request_id", "request-123", "status", 500)
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	contents, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, output := range map[string]string{"console": console.String(), "file": string(contents)} {
+		if !strings.Contains(output, `"level":"ERROR"`) || !strings.Contains(output, `"request_id":"request-123"`) || !strings.Contains(output, `"status":500`) {
+			t.Fatalf("%s output = %s", name, output)
+		}
+	}
+}
+
+func TestOpenLoggerFailsWhenRequestedPathCannotBeOpened(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "missing", "server.log")
+	if _, _, err := openLogger(path, &bytes.Buffer{}); err == nil {
+		t.Fatal("openLogger() error = nil, want path error")
+	}
+}
 
 func TestServeHTTPReportsUnexpectedRuntimeError(t *testing.T) {
 	want := errors.New("bind failed")

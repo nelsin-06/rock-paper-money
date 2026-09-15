@@ -2,13 +2,13 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 vi.mock('./supabase.js', () => ({ getAccessToken: vi.fn().mockResolvedValue('access-token') }))
 
-import { ApiError, createRoom, getRoomState, joinRoom, leaveRoom, PRESENCE_HEARTBEAT_MS, refreshPresence, startNextRound, submitMove, subscribeToRoom, validateSession } from './api.js'
+import { ApiError, createRoom, getRoomState, getRoundAnalytics, getWallet, joinRoom, leaveRoom, PRESENCE_HEARTBEAT_MS, rechargeWallet, refreshPresence, startNextRound, submitMove, subscribeToRoom, validateSession } from './api.js'
 import { getAccessToken } from './supabase.js'
 
-function response(body, { status = 200 } = {}) {
+function response(body, { status = 200, requestId = 'request-123' } = {}) {
   return new Response(body === null ? null : JSON.stringify(body), {
     status,
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', 'X-Request-ID': requestId },
   })
 }
 
@@ -64,11 +64,27 @@ describe('API client', () => {
 
   it('uses stable server errors and falls back safely for malformed errors', async () => {
     fetch
-      .mockResolvedValueOnce(response({ error: 'room is full' }, { status: 409 }))
+      .mockResolvedValueOnce(response({
+        status: 409,
+        code: 'room_full',
+        message: 'Room is full.',
+        meta: { time: '2026-09-11T10:00:00Z', requestId: 'request-123' },
+        rawError: 'room already has two players',
+      }, { status: 409 }))
       .mockResolvedValueOnce(new Response('bad gateway', { status: 502 }))
 
-    await expect(createRoom()).rejects.toMatchObject({ message: 'room is full', status: 409 })
+    await expect(createRoom()).rejects.toMatchObject({
+      message: 'Room is full.', status: 409, code: 'room_full', requestId: 'request-123', rawError: 'room already has two players',
+    })
     await expect(createRoom()).rejects.toMatchObject({ message: 'Request failed (502).', status: 502 })
+  })
+
+  it('rejects malformed error contracts without losing status-based recovery data', async () => {
+    fetch.mockResolvedValue(response({ status: 401, code: 'unauthorized', message: 'Leaked detail' }, { status: 401, requestId: 'header-request' }))
+
+    await expect(validateSession('ABC234', 'secret', 'host')).rejects.toMatchObject({
+      message: 'Request failed (401).', status: 401, code: '', requestId: 'header-request',
+    })
   })
 
   it('reports network failures and sends authenticated move JSON', async () => {
@@ -156,6 +172,28 @@ describe('API client', () => {
       signal: controller.signal,
     }))
     expect(PRESENCE_HEARTBEAT_MS).toBe(3000)
+  })
+
+  it('maps exact coin strings and sends an idempotent self-recharge', async () => {
+    fetch
+      .mockResolvedValueOnce(response({ balance: '9007199254740993' }))
+      .mockResolvedValueOnce(response({ balance: '9007199254741043' }))
+      .mockResolvedValueOnce(response({
+        total_house_earnings: '25',
+        rounds: [{ room_code: 'ABC234', round: 1, result: 'player_one_wins', winner_role: 'host', forfeit: false, house_earnings: '25', resolved_at: '2026-09-14T12:00:00Z' }],
+      }))
+
+    await expect(getWallet()).resolves.toEqual({ balance: '9007199254740993' })
+    await expect(rechargeWallet('50', 'retry-key')).resolves.toEqual({ balance: '9007199254741043' })
+    await expect(getRoundAnalytics()).resolves.toMatchObject({
+      totalHouseEarnings: '25',
+      rounds: [{ roomCode: 'ABC234', winnerRole: 'host', houseEarnings: '25' }],
+    })
+    expect(fetch).toHaveBeenNthCalledWith(2, '/api/wallet/recharges', expect.objectContaining({
+      method: 'POST',
+      headers: { Authorization: 'Bearer access-token', 'Content-Type': 'application/json', 'Idempotency-Key': 'retry-key' },
+      body: '{"amount":50}',
+    }))
   })
 })
 
