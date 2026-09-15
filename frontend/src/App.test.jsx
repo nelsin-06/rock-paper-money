@@ -2,7 +2,7 @@ import { StrictMode } from 'react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
-import { AccountPanel, GameApp as App } from './App.jsx'
+import { AccountPanel, ERROR_NOTICE_DURATION_MS, ErrorNotice, GameApp as App } from './App.jsx'
 import * as api from './api.js'
 import { APP_VERSION, STORAGE_KEY } from './storage.js'
 
@@ -130,14 +130,14 @@ describe('core room flow', () => {
     expect(api.joinRoom).toHaveBeenCalledWith('ABC234')
   })
 
-  it('keeps free room creation available but blocks joining below the 50-coin stake', async () => {
+  it('blocks room creation and joining below the 50-coin requirement', async () => {
     render(<App walletBalance="49" />)
 
     await userEvent.type(screen.getByLabelText(/six-character room code/i), 'ABC234')
 
-    expect(screen.getByRole('button', { name: 'Create room' })).toBeEnabled()
+    expect(screen.getByRole('button', { name: 'Create room' })).toBeDisabled()
     expect(screen.getByRole('button', { name: 'Join room' })).toBeDisabled()
-    expect(screen.getByText(/creating a room is free/i)).toBeInTheDocument()
+    expect(screen.getByText(/need at least 50 coins to create or join/i)).toBeInTheDocument()
   })
 
   it('locks same-tick duplicate create attempts', async () => {
@@ -479,5 +479,46 @@ describe('core room flow', () => {
     expect(screen.getByRole('button', { name: 'Create room' })).toBeInTheDocument()
     expect(localStorage.getItem(STORAGE_KEY)).toBeNull()
     expect(api.subscribeToRoom).not.toHaveBeenCalled()
+  })
+})
+
+describe('error notice', () => {
+  afterEach(() => {
+    vi.useRealTimers()
+    vi.restoreAllMocks()
+  })
+
+  it('can be dismissed with an accessible control', () => {
+    const onDismiss = vi.fn()
+    render(<ErrorNotice message="Move failed" onDismiss={onDismiss} />)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Dismiss error' }))
+
+    expect(onDismiss).toHaveBeenCalledOnce()
+  })
+
+  it('automatically dismisses and resets the delay for a subsequent error', () => {
+    vi.useFakeTimers()
+    const onDismiss = vi.fn()
+    const { rerender } = render(<ErrorNotice message="First error" onDismiss={onDismiss} />)
+
+    act(() => vi.advanceTimersByTime(ERROR_NOTICE_DURATION_MS - 1000))
+    rerender(<ErrorNotice message="Second error" onDismiss={onDismiss} />)
+    act(() => vi.advanceTimersByTime(1001))
+    expect(onDismiss).not.toHaveBeenCalled()
+
+    act(() => vi.advanceTimersByTime(ERROR_NOTICE_DURATION_MS - 1001))
+    expect(onDismiss).toHaveBeenCalledOnce()
+  })
+
+  it('cleans up its timer when unmounted', () => {
+    vi.useFakeTimers()
+    const onDismiss = vi.fn()
+    const { unmount } = render(<ErrorNotice message="Temporary error" onDismiss={onDismiss} />)
+
+    unmount()
+    act(() => vi.advanceTimersByTime(ERROR_NOTICE_DURATION_MS))
+
+    expect(onDismiss).not.toHaveBeenCalled()
   })
 })

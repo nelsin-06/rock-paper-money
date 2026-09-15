@@ -51,6 +51,9 @@ func (r *Repository) Create(_ context.Context, aggregate *domain.Room, digest ap
 	defer r.mu.Unlock()
 	state := aggregate.State()
 	r.ensureWallet(authUserID)
+	if r.wallets[authUserID] < application.RoundStake {
+		return application.Snapshot{}, application.ErrInsufficientFunds
+	}
 	if _, exists := r.rooms[state.Code]; exists {
 		return application.Snapshot{}, fmt.Errorf("%w: %q", application.ErrDuplicateRoom, state.Code)
 	}

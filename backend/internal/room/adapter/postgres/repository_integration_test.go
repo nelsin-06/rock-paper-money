@@ -116,6 +116,9 @@ func TestPostgresAllowsLegacyNullableSeatsButRejectsDuplicateAccountSeats(t *tes
 	repository := postgres.NewRepository(pool)
 	aggregate, _ := domain.New("OWN234", "host-id")
 	owner := "00000000-0000-4000-8000-000000000001"
+	if _, err := repository.Recharge(ctx, owner, application.RoundStake, "owner-create-funding"); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := repository.Create(ctx, aggregate, application.DigestToken("host-token"), owner); err != nil {
 		t.Fatal(err)
 	}
@@ -131,14 +134,14 @@ func TestPostgresConcurrentJoinAllowsOneGuest(t *testing.T) {
 	pool := integrationPool(t)
 	repository := postgres.NewRepository(pool)
 	aggregate, _ := domain.New("JOIN23", "host-id")
-	if _, err := repository.Create(context.Background(), aggregate, application.DigestToken("host-token"), "00000000-0000-4000-8000-000000000001"); err != nil {
-		t.Fatal(err)
-	}
 	for index := 1; index <= 3; index++ {
 		owner := fmt.Sprintf("00000000-0000-4000-8000-%012d", index)
 		if _, err := repository.Recharge(context.Background(), owner, 1_000, fmt.Sprintf("concurrent-join-funding-%d", index)); err != nil {
 			t.Fatal(err)
 		}
+	}
+	if _, err := repository.Create(context.Background(), aggregate, application.DigestToken("host-token"), "00000000-0000-4000-8000-000000000001"); err != nil {
+		t.Fatal(err)
 	}
 	start := make(chan struct{})
 	errs := make(chan error, 2)
@@ -177,6 +180,9 @@ func TestPostgresPaidRoundIsAtomicBalancedAndDurable(t *testing.T) {
 	hostDigest := application.DigestToken("wallet-host-token")
 	guestDigest := application.DigestToken("wallet-guest-token")
 	aggregate, _ := domain.New("WAL234", "wallet-host")
+	if _, err := repository.Create(ctx, aggregate, hostDigest, hostOwner); !errors.Is(err, application.ErrInsufficientFunds) {
+		t.Fatalf("underfunded create error=%v", err)
+	}
 	if _, err := repository.Recharge(ctx, hostOwner, 100, "wallet-host-credit"); err != nil {
 		t.Fatal(err)
 	}

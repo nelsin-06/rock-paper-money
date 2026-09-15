@@ -85,6 +85,19 @@ func TestAuthenticationAndStableErrors(t *testing.T) {
 	}
 }
 
+func TestSubmitMoveUsesSingleAuthoritativeRepositoryMutation(t *testing.T) {
+	repository := &submitOnlyRepository{}
+	service := application.NewService(repository, nil)
+	handler := NewRouter(service, testVerifier{}, nil, nil)
+
+	response := requestAs(t, handler, http.MethodPost, "/api/rooms/ABC234/moves", "host-user", "room-token", `{"move":"rock"}`)
+
+	assertStatus(t, response, http.StatusNoContent)
+	if repository.calls != 1 {
+		t.Fatalf("SubmitMoveAndSettle calls = %d, want 1", repository.calls)
+	}
+}
+
 func TestWalletRechargeIsSelfScopedAndIdempotent(t *testing.T) {
 	handler := NewRouter(fixedService(), testVerifier{}, nil, nil)
 	initial := requestAs(t, handler, http.MethodGet, "/api/wallet", "host-user", "", "")
@@ -111,6 +124,25 @@ func TestWalletRechargeIsSelfScopedAndIdempotent(t *testing.T) {
 	guest := requestAs(t, handler, http.MethodGet, "/api/wallet", "guest-user", "", "")
 	if !strings.Contains(guest.Body.String(), `"balance":"1005"`) {
 		t.Fatalf("guest wallet was changed=%s", guest.Body.String())
+	}
+}
+
+func TestCreateRoomRejectsInsufficientBalanceWithSafeError(t *testing.T) {
+	repository, events := memory.New()
+	service := application.NewServiceWithGenerators(
+		repository,
+		events,
+		func() (string, error) { return "LOW234", nil },
+		func() (string, error) { return "unused-token", nil },
+		func() (string, error) { return "unused-player", nil },
+	)
+	handler := NewRouter(service, testVerifier{}, nil, nil)
+
+	response := requestAs(t, handler, http.MethodPost, "/api/rooms", "host-user", "", "")
+	assertStatus(t, response, http.StatusConflict)
+	assertAPIError(t, response, "insufficient_balance", "Insufficient coin balance.", true)
+	if strings.Contains(response.Body.String(), "host-user") {
+		t.Fatalf("error exposed account identity: %s", response.Body.String())
 	}
 }
 
@@ -147,6 +179,9 @@ func TestRouteInternalErrorLogsCauseOnceWithoutDisclosingIt(t *testing.T) {
 		func() (string, error) { return "unused-token", nil },
 		func() (string, error) { return "unused-id", nil },
 	)
+	if _, err := service.Recharge(context.Background(), "host-user", application.RoundStake, "internal-error-test-funding"); err != nil {
+		t.Fatal(err)
+	}
 	var logs bytes.Buffer
 	logger := slog.New(slog.NewJSONHandler(&logs, nil))
 	handler := NewRouter(service, testVerifier{}, nil, logger)
@@ -337,6 +372,16 @@ func validateSessionRequestWithAuthorization(t *testing.T, handler http.Handler,
 }
 
 type testVerifier struct{}
+
+type submitOnlyRepository struct {
+	application.Repository
+	calls int
+}
+
+func (r *submitOnlyRepository) SubmitMoveAndSettle(context.Context, string, application.CredentialDigest, string, domain.Move) (application.Snapshot, error) {
+	r.calls++
+	return application.Snapshot{}, nil
+}
 
 func (testVerifier) Verify(_ context.Context, token string) (auth.Principal, error) {
 	if token != "host-user" && token != "guest-user" {

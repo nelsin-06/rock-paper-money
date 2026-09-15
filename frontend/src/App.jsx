@@ -16,9 +16,35 @@ function displayError(error) {
 }
 
 const ECONOMY_CHANGED_EVENT = 'rock-paper-money:economy-changed'
+export const ERROR_NOTICE_DURATION_MS = 5000
 
 function signalEconomyChanged() {
   window.dispatchEvent(new Event(ECONOMY_CHANGED_EVENT))
+}
+
+export function ErrorNotice({ message, onDismiss, children }) {
+  const dismissRef = useRef(onDismiss)
+
+  useEffect(() => {
+    dismissRef.current = onDismiss
+  }, [onDismiss])
+
+  useEffect(() => {
+    if (!message) return undefined
+    const timeout = window.setTimeout(() => dismissRef.current(), ERROR_NOTICE_DURATION_MS)
+    return () => window.clearTimeout(timeout)
+  }, [message])
+
+  if (!message) return null
+  return (
+    <div className="notice notice-error" role="alert">
+      <span>{message}</span>
+      <div className="notice-actions">
+        {children}
+        <button className="notice-dismiss" type="button" aria-label="Dismiss error" onClick={onDismiss}>×</button>
+      </div>
+    </div>
+  )
 }
 
 export function AccountPanel({ onBalance }) {
@@ -86,7 +112,7 @@ export function AccountPanel({ onBalance }) {
           }} placeholder="100" />
           <button className="button button-secondary" disabled={busy || !amount}>{busy ? 'Recharging…' : 'Add coins'}</button>
         </form>
-        {error && <div className="notice notice-error" role="alert">{error}</div>}
+        <ErrorNotice message={error} onDismiss={() => setError('')} />
       </section>
       <section className="analytics-card" aria-labelledby="analytics-title">
         <div className="house-banner"><span>Total house earnings</span><strong>{analytics.totalHouseEarnings} coins</strong></div>
@@ -150,7 +176,7 @@ function Home({ onEnterRoom, walletBalance }) {
       </section>
 
       <section className="entry-card" aria-label="Enter a game">
-        <button className="button button-primary" disabled={busy !== null} onClick={() => enter(api.createRoom, 'host')}>
+        <button className="button button-primary" disabled={busy !== null || insufficientForRound} onClick={() => enter(api.createRoom, 'host')}>
           {busy === 'host' ? 'Creating room…' : 'Create room'}
         </button>
         <div className="divider"><span>or join</span></div>
@@ -170,8 +196,8 @@ function Home({ onEnterRoom, walletBalance }) {
             {busy === 'guest' ? 'Joining room…' : 'Join room'}
           </button>
         </form>
-        {insufficientForRound && <div className="notice notice-error">Creating a room is free, but you need at least 50 coins before a round can be funded. Recharge to join another room.</div>}
-        {error && <div className="notice notice-error" role="alert">{error}</div>}
+        {insufficientForRound && <div className="notice notice-error">You need at least 50 coins to create or join a room. Creating a room does not charge coins.</div>}
+        <ErrorNotice message={error} onDismiss={() => setError('')} />
       </section>
     </main>
   )
@@ -391,12 +417,12 @@ function Room({ session, onLeave, walletBalance }) {
 
       <Scoreboard players={state?.players} role={session.role} resolved={state?.resolved} />
 
-      {(error || connectionError) && (
-        <div className="notice notice-error" role="alert">
-          <span>{error || connectionError}</span>
-          {connectionError && <button onClick={retryConnection}>Retry</button>}
-        </div>
-      )}
+      <ErrorNotice
+        message={error || connectionError}
+        onDismiss={() => error ? setError('') : setConnectionError('')}
+      >
+        {connectionError && <button type="button" onClick={retryConnection}>Retry</button>}
+      </ErrorNotice>
 
       {loading && !state && <section className="game-panel centered" aria-live="polite"><div className="loader" /><h2>Loading room…</h2></section>}
 
@@ -530,7 +556,7 @@ export function GameApp({ walletBalance = null }) {
   )
 }
 
-function AuthForm({ initialError, onAuthenticated, onPending }) {
+function AuthForm({ initialError, onAuthenticated, onPending, onDismissInitialError }) {
   const [mode, setMode] = useState('login')
   const [email, setEmail] = useState('')
   const [password, setPassword] = useState('')
@@ -578,7 +604,10 @@ function AuthForm({ initialError, onAuthenticated, onPending }) {
         }}>
           {mode === 'login' ? 'Need an account? Register' : 'Already have an account? Sign in'}
         </button>
-        {(error || initialError) && <div className="notice notice-error" role="alert">{error || initialError}</div>}
+        <ErrorNotice
+          message={error || initialError}
+          onDismiss={() => error ? setError('') : onDismissInitialError()}
+        />
       </section>
     </main>
   )
@@ -650,7 +679,7 @@ export default function App() {
       </main>
     )
   }
-  if (!authSession) return <AuthForm initialError={error} onAuthenticated={setAuthSession} onPending={setPendingEmail} />
+  if (!authSession) return <AuthForm initialError={error} onAuthenticated={setAuthSession} onPending={setPendingEmail} onDismissInitialError={() => setError('')} />
 
   return (
     <div className="authenticated-app">
@@ -658,7 +687,9 @@ export default function App() {
         <span>Signed in</span>
         <button className="button button-quiet" onClick={signOut}>Sign out</button>
       </div>
-      {error && <div className="page notice notice-error" role="alert">{error}</div>}
+      <div className="page account-error">
+        <ErrorNotice message={error} onDismiss={() => setError('')} />
+      </div>
       <AccountPanel onBalance={setWalletBalance} />
       <GameApp walletBalance={walletBalance} />
     </div>

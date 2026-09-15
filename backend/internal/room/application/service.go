@@ -188,8 +188,12 @@ func (s *Service) Create(ctx context.Context, authUserID string) (Credentials, e
 	if authUserID == "" {
 		return Credentials{}, ErrUnauthorized
 	}
-	if _, err := s.repository.Balance(ctx, authUserID); err != nil {
+	balance, err := s.repository.Balance(ctx, authUserID)
+	if err != nil {
 		return Credentials{}, err
+	}
+	if balance < RoundStake {
+		return Credentials{}, ErrInsufficientFunds
 	}
 	for range 8 {
 		code, err := s.generateCode()

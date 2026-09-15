@@ -101,11 +101,14 @@ func (rt *router) protected(next func(http.ResponseWriter, *http.Request, auth.P
 
 func (rt *router) createRoom(w http.ResponseWriter, r *http.Request, principal auth.Principal) {
 	credentials, err := rt.service.Create(r.Context(), principal.Subject)
-	if err != nil {
+	switch {
+	case err == nil:
+		writeJSON(w, http.StatusCreated, roomCredentials{RoomCode: credentials.RoomCode, PlayerToken: credentials.PlayerToken})
+	case errors.Is(err, application.ErrInsufficientFunds):
+		writeAPIError(w, r, errorInsufficientFunds)
+	default:
 		writeInternalError(w, r, "create_room", err)
-		return
 	}
-	writeJSON(w, http.StatusCreated, roomCredentials{RoomCode: credentials.RoomCode, PlayerToken: credentials.PlayerToken})
 }
 
 func (rt *router) joinRoom(w http.ResponseWriter, r *http.Request, principal auth.Principal) {
@@ -141,8 +144,9 @@ func (rt *router) joinRoom(w http.ResponseWriter, r *http.Request, principal aut
 }
 
 func (rt *router) submitMove(w http.ResponseWriter, r *http.Request, principal auth.Principal) {
-	code, _, ok := rt.findRoom(r, w, r.PathValue("code"))
-	if !ok {
+	code := normalizeRoomCode(r.PathValue("code"))
+	if code == "" {
+		writeAPIError(w, r, errorRoomCodeRequired)
 		return
 	}
 	token, ok := roomToken(r)
@@ -150,11 +154,6 @@ func (rt *router) submitMove(w http.ResponseWriter, r *http.Request, principal a
 		writeAPIError(w, r, errorUnauthorized)
 		return
 	}
-	if _, _, err := rt.service.Authenticate(r.Context(), code, token, principal.Subject); err != nil {
-		writeAPIError(w, r, errorUnauthorized)
-		return
-	}
-
 	var request moveRequest
 	decoder := json.NewDecoder(r.Body)
 	decoder.DisallowUnknownFields()

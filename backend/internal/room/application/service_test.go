@@ -63,6 +63,30 @@ func TestServiceBindsRoomCredentialsToAccountIdentity(t *testing.T) {
 	}
 }
 
+func TestCreateRequiresRoundStakeWithoutChargingIt(t *testing.T) {
+	service := unfundedTestService()
+	ctx := context.Background()
+
+	if _, err := service.Create(ctx, "host-user"); !errors.Is(err, application.ErrInsufficientFunds) {
+		t.Fatalf("zero-balance create error = %v", err)
+	}
+	if _, err := service.Recharge(ctx, "host-user", application.RoundStake-1, "partial-create-funding"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.Create(ctx, "host-user"); !errors.Is(err, application.ErrInsufficientFunds) {
+		t.Fatalf("underfunded create error = %v", err)
+	}
+	if _, err := service.Recharge(ctx, "host-user", 1, "final-create-funding"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.Create(ctx, "host-user"); err != nil {
+		t.Fatal(err)
+	}
+	if balance, err := service.Balance(ctx, "host-user"); err != nil || balance != application.RoundStake {
+		t.Fatalf("balance after create = %d, error = %v; want %d", balance, err, application.RoundStake)
+	}
+}
+
 func TestPaidRoundsRechargeAndSettlementPolicy(t *testing.T) {
 	service := unfundedTestService()
 	ctx := context.Background()

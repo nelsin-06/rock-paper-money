@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestOpenLoggerWritesStructuredEntriesToConsoleAndFile(t *testing.T) {
@@ -70,5 +71,15 @@ func TestServeHTTPGracefulShutdownIsSuccessful(t *testing.T) {
 	cancel()
 	if err := serveHTTPWithShutdown(ctx, listen, shutdown); err != nil {
 		t.Fatalf("serveHTTPWithShutdown() error = %v, want nil", err)
+	}
+}
+
+func TestHTTPServerAllowsDatabaseBackedCommandsPastPreviousWriteDeadline(t *testing.T) {
+	server := newHTTPServer("9090", http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	if server.WriteTimeout != 30*time.Second {
+		t.Fatalf("WriteTimeout = %v, want 30s", server.WriteTimeout)
+	}
+	if server.WriteTimeout <= 10*time.Second {
+		t.Fatalf("WriteTimeout = %v, must exceed the previous 10s deadline", server.WriteTimeout)
 	}
 }

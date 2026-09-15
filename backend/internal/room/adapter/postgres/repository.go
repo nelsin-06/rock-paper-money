@@ -30,6 +30,17 @@ func (r *Repository) Create(ctx context.Context, aggregate *domain.Room, digest 
 	if err = ensureUserWallet(ctx, tx, authUserID); err != nil {
 		return application.Snapshot{}, err
 	}
+	accountID := userAccountID(authUserID)
+	if err = lockWallets(ctx, tx, []string{accountID}); err != nil {
+		return application.Snapshot{}, err
+	}
+	var balance int64
+	if err = tx.QueryRow(ctx, "SELECT balance FROM wallet_accounts WHERE account_id=$1", accountID).Scan(&balance); err != nil {
+		return application.Snapshot{}, err
+	}
+	if balance < application.RoundStake {
+		return application.Snapshot{}, application.ErrInsufficientFunds
+	}
 	if _, err = tx.Exec(ctx, "INSERT INTO room_rooms(code) VALUES($1)", state.Code); isUnique(err) {
 		return application.Snapshot{}, application.ErrDuplicateRoom
 	} else if err != nil {

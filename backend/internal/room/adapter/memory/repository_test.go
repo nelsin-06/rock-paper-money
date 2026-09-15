@@ -20,6 +20,9 @@ func TestRepositoryRollsBackFailedMutation(t *testing.T) {
 		t.Fatal(err)
 	}
 	digest := application.DigestToken("host-token")
+	if _, err = repository.Recharge(context.Background(), "host-user", application.RoundStake, "create-funding"); err != nil {
+		t.Fatal(err)
+	}
 	if _, err = repository.Create(context.Background(), aggregate, digest, "host-user"); err != nil {
 		t.Fatal(err)
 	}
@@ -37,6 +40,29 @@ func TestRepositoryRollsBackFailedMutation(t *testing.T) {
 	}
 	if snapshot.Revision != 1 || len(snapshot.State.Players) != 1 {
 		t.Fatalf("failed mutation changed snapshot: %#v", snapshot)
+	}
+}
+
+func TestRepositoryCreateRequiresBalanceWithoutDebiting(t *testing.T) {
+	repository, _ := memory.New()
+	ctx := context.Background()
+	aggregate, _ := domain.New("LOW234", "host-id")
+	digest := application.DigestToken("host-token")
+
+	if _, err := repository.Recharge(ctx, "host-user", application.RoundStake-1, "partial-funding"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repository.Create(ctx, aggregate, digest, "host-user"); !errors.Is(err, application.ErrInsufficientFunds) {
+		t.Fatalf("underfunded create error = %v", err)
+	}
+	if _, err := repository.Recharge(ctx, "host-user", 1, "final-funding"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repository.Create(ctx, aggregate, digest, "host-user"); err != nil {
+		t.Fatal(err)
+	}
+	if balance, err := repository.Balance(ctx, "host-user"); err != nil || balance != application.RoundStake {
+		t.Fatalf("balance after create = %d, error = %v; want %d", balance, err, application.RoundStake)
 	}
 }
 
@@ -65,10 +91,10 @@ func TestRechargeRejectsBalanceOverflowWithoutRecordingIdempotency(t *testing.T)
 func TestSkewedLastHeartbeatsDoNotFabricateWinner(t *testing.T) {
 	repository, _ := memory.New()
 	aggregate, _ := domain.New("ABC234", "host-id")
+	fundPlayers(t, repository)
 	if _, err := repository.Create(context.Background(), aggregate, application.DigestToken("host-token"), "host-user"); err != nil {
 		t.Fatal(err)
 	}
-	fundPlayers(t, repository)
 	observed := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
 	deadline := observed.Add(13 * time.Second)
 	window := application.PresenceWindow{ObservedAt: observed, ProofAfter: deadline, Deadline: deadline, EvaluateAt: deadline.Add(3 * time.Second)}
@@ -98,10 +124,10 @@ func TestRefreshReconstructsExpiredOpponentAndPreservesGenerationsAcrossRounds(t
 	aggregate, _ := domain.New("ABC234", "host-id")
 	hostDigest := application.DigestToken("host-token")
 	guestDigest := application.DigestToken("guest-token")
+	fundPlayers(t, repository)
 	if _, err := repository.Create(context.Background(), aggregate, hostDigest, "host-user"); err != nil {
 		t.Fatal(err)
 	}
-	fundPlayers(t, repository)
 	observed := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
 	deadline := observed.Add(13 * time.Second)
 	window := application.PresenceWindow{ObservedAt: observed, ProofAfter: deadline, Deadline: deadline, EvaluateAt: deadline.Add(3 * time.Second)}

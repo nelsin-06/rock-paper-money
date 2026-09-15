@@ -20,6 +20,11 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
+const (
+	serverReadTimeout  = 10 * time.Second
+	serverWriteTimeout = 30 * time.Second
+)
+
 func main() {
 	if err := run(); err != nil {
 		log.Fatal(err)
@@ -83,17 +88,21 @@ func run() error {
 		}
 		return events.Ready()
 	}
-	server := &http.Server{
-		Addr:              "0.0.0.0:" + port,
-		Handler:           roomhttp.NewRouter(rooms, verifier, ready, logger),
-		ReadHeaderTimeout: 5 * time.Second,
-		ReadTimeout:       10 * time.Second,
-		WriteTimeout:      10 * time.Second,
-		IdleTimeout:       60 * time.Second,
-	}
+	server := newHTTPServer(port, roomhttp.NewRouter(rooms, verifier, ready, logger))
 
 	logger.Info("server listening", "address", server.Addr)
 	return serveHTTP(root, server, server.ListenAndServe)
+}
+
+func newHTTPServer(port string, handler http.Handler) *http.Server {
+	return &http.Server{
+		Addr:              "0.0.0.0:" + port,
+		Handler:           handler,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       serverReadTimeout,
+		WriteTimeout:      serverWriteTimeout,
+		IdleTimeout:       60 * time.Second,
+	}
 }
 
 func openLogger(path string, console io.Writer) (*slog.Logger, *os.File, error) {
