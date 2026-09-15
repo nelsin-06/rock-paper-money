@@ -14,24 +14,24 @@ import (
 
 func TestServiceUsesOpaqueCredentialsAndRevisions(t *testing.T) {
 	service := testService()
-	host, err := service.Create(context.Background())
+	host, err := service.Create(context.Background(), "host-user")
 	if err != nil {
 		t.Fatal(err)
 	}
-	guest, err := service.Join(context.Background(), host.RoomCode)
+	guest, err := service.Join(context.Background(), host.RoomCode, "guest-user")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if host.PlayerToken == guest.PlayerToken {
 		t.Fatal("tokens reused")
 	}
-	if _, _, err = service.Authenticate(context.Background(), host.RoomCode, host.PlayerToken); err != nil {
+	if _, _, err = service.Authenticate(context.Background(), host.RoomCode, host.PlayerToken, "host-user"); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err = service.Authenticate(context.Background(), host.RoomCode, "wrong"); !errors.Is(err, application.ErrUnauthorized) {
+	if _, _, err = service.Authenticate(context.Background(), host.RoomCode, "wrong", "host-user"); !errors.Is(err, application.ErrUnauthorized) {
 		t.Fatalf("error = %v", err)
 	}
-	if err = service.SubmitMove(context.Background(), host.RoomCode, host.PlayerToken, domain.Rock); err != nil {
+	if err = service.SubmitMove(context.Background(), host.RoomCode, host.PlayerToken, "host-user", domain.Rock); err != nil {
 		t.Fatal(err)
 	}
 	snapshot, err := service.Snapshot(context.Background(), host.RoomCode)
@@ -48,10 +48,24 @@ func TestServiceUsesOpaqueCredentialsAndRevisions(t *testing.T) {
 	}
 }
 
+func TestServiceBindsRoomCredentialsToAccountIdentity(t *testing.T) {
+	service := testService()
+	host, err := service.Create(context.Background(), "host-user")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = service.Join(context.Background(), host.RoomCode, "host-user"); !errors.Is(err, application.ErrAccountSeated) {
+		t.Fatalf("same-account join error = %v", err)
+	}
+	if _, _, err = service.Authenticate(context.Background(), host.RoomCode, host.PlayerToken, "other-user"); !errors.Is(err, application.ErrUnauthorized) {
+		t.Fatalf("cross-account authentication error = %v", err)
+	}
+}
+
 func TestConcurrentMovesResolveExactlyOnce(t *testing.T) {
 	service := testService()
-	host, _ := service.Create(context.Background())
-	guest, _ := service.Join(context.Background(), host.RoomCode)
+	host, _ := service.Create(context.Background(), "host-user")
+	guest, _ := service.Join(context.Background(), host.RoomCode, "guest-user")
 	start := make(chan struct{})
 	errs := make(chan error, 2)
 	var wg sync.WaitGroup
@@ -59,12 +73,12 @@ func TestConcurrentMovesResolveExactlyOnce(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		<-start
-		errs <- service.SubmitMove(context.Background(), host.RoomCode, host.PlayerToken, domain.Rock)
+		errs <- service.SubmitMove(context.Background(), host.RoomCode, host.PlayerToken, "host-user", domain.Rock)
 	}()
 	go func() {
 		defer wg.Done()
 		<-start
-		errs <- service.SubmitMove(context.Background(), host.RoomCode, guest.PlayerToken, domain.Scissors)
+		errs <- service.SubmitMove(context.Background(), host.RoomCode, guest.PlayerToken, "guest-user", domain.Scissors)
 	}()
 	close(start)
 	wg.Wait()
@@ -82,7 +96,7 @@ func TestConcurrentMovesResolveExactlyOnce(t *testing.T) {
 
 func TestSubscriptionCoalescesChanges(t *testing.T) {
 	service := testService()
-	host, _ := service.Create(context.Background())
+	host, _ := service.Create(context.Background(), "host-user")
 	initial, changes, unsubscribe, err := service.Subscribe(context.Background(), host.RoomCode)
 	if err != nil {
 		t.Fatal(err)
@@ -91,7 +105,7 @@ func TestSubscriptionCoalescesChanges(t *testing.T) {
 	if initial.Revision != 1 {
 		t.Fatalf("revision = %d", initial.Revision)
 	}
-	_, _ = service.Join(context.Background(), host.RoomCode)
+	_, _ = service.Join(context.Background(), host.RoomCode, "guest-user")
 	select {
 	case <-changes:
 	case <-time.After(time.Second):
@@ -102,18 +116,18 @@ func TestSubscriptionCoalescesChanges(t *testing.T) {
 func TestPresenceWaitsFullGraceAndAwardsRefreshingOpponent(t *testing.T) {
 	service, scheduler, host, _ := newTimedGame(t)
 	scheduler.advance(4 * time.Second)
-	if err := service.RefreshPresence(context.Background(), host.RoomCode, host.PlayerToken); err != nil {
+	if err := service.RefreshPresence(context.Background(), host.RoomCode, host.PlayerToken, "host-user"); err != nil {
 		t.Fatal(err)
 	}
 	scheduler.advance(6 * time.Second)
-	if err := service.RefreshPresence(context.Background(), host.RoomCode, host.PlayerToken); err != nil {
+	if err := service.RefreshPresence(context.Background(), host.RoomCode, host.PlayerToken, "host-user"); err != nil {
 		t.Fatal(err)
 	}
 	scheduler.advance(2900 * time.Millisecond)
 	assertUnresolved(t, service, host.RoomCode)
 	scheduler.advance(2100 * time.Millisecond)
 	assertUnresolved(t, service, host.RoomCode)
-	if err := service.RefreshPresence(context.Background(), host.RoomCode, host.PlayerToken); err != nil {
+	if err := service.RefreshPresence(context.Background(), host.RoomCode, host.PlayerToken, "host-user"); err != nil {
 		t.Fatal(err)
 	}
 	scheduler.advance(time.Second)
@@ -134,10 +148,10 @@ func TestReconnectInvalidatesStaleExpiry(t *testing.T) {
 	service, scheduler, host, guest := newTimedGame(t)
 	staleGuestTimer := scheduler.timers[1]
 	scheduler.advance(12 * time.Second)
-	if err := service.RefreshPresence(context.Background(), host.RoomCode, host.PlayerToken); err != nil {
+	if err := service.RefreshPresence(context.Background(), host.RoomCode, host.PlayerToken, "host-user"); err != nil {
 		t.Fatal(err)
 	}
-	if err := service.RefreshPresence(context.Background(), host.RoomCode, guest.PlayerToken); err != nil {
+	if err := service.RefreshPresence(context.Background(), host.RoomCode, guest.PlayerToken, "guest-user"); err != nil {
 		t.Fatal(err)
 	}
 	scheduler.advance(4 * time.Second)
@@ -150,7 +164,7 @@ func TestReconnectAfterBothPlayersExpireReevaluatesAbsentOpponent(t *testing.T) 
 	scheduler.advance(16 * time.Second)
 	assertUnresolved(t, service, host.RoomCode)
 
-	if err := service.RefreshPresence(context.Background(), host.RoomCode, host.PlayerToken); err != nil {
+	if err := service.RefreshPresence(context.Background(), host.RoomCode, host.PlayerToken, "host-user"); err != nil {
 		t.Fatal(err)
 	}
 	scheduler.advance(0)
@@ -169,25 +183,25 @@ func TestJoinActivatesBothPlayersWithoutAnotherHostHeartbeat(t *testing.T) {
 	now := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
 	scheduler := &fakeScheduler{now: &now}
 	service := configuredTestService(repository, events, &now, scheduler, nil)
-	host, _ := service.Create(context.Background())
-	if err := service.RefreshPresence(context.Background(), host.RoomCode, host.PlayerToken); err != nil {
+	host, _ := service.Create(context.Background(), "host-user")
+	if err := service.RefreshPresence(context.Background(), host.RoomCode, host.PlayerToken, "host-user"); err != nil {
 		t.Fatal(err)
 	}
 	scheduler.advance(time.Second)
-	guest, err := service.Join(context.Background(), host.RoomCode)
+	guest, err := service.Join(context.Background(), host.RoomCode, "guest-user")
 	if err != nil {
 		t.Fatal(err)
 	}
 	scheduler.advance(4 * time.Second)
-	if err = service.RefreshPresence(context.Background(), host.RoomCode, guest.PlayerToken); err != nil {
+	if err = service.RefreshPresence(context.Background(), host.RoomCode, guest.PlayerToken, "guest-user"); err != nil {
 		t.Fatal(err)
 	}
 	scheduler.advance(6 * time.Second)
-	if err = service.RefreshPresence(context.Background(), host.RoomCode, guest.PlayerToken); err != nil {
+	if err = service.RefreshPresence(context.Background(), host.RoomCode, guest.PlayerToken, "guest-user"); err != nil {
 		t.Fatal(err)
 	}
 	scheduler.advance(4 * time.Second)
-	if err = service.RefreshPresence(context.Background(), host.RoomCode, guest.PlayerToken); err != nil {
+	if err = service.RefreshPresence(context.Background(), host.RoomCode, guest.PlayerToken, "guest-user"); err != nil {
 		t.Fatal(err)
 	}
 	scheduler.advance(2 * time.Second)
@@ -224,9 +238,9 @@ func TestOutOfOrderRefreshCannotReplaceNewerTimer(t *testing.T) {
 	}
 	service := configuredTestService(repository, nil, &now, scheduler, nil)
 	firstResult := make(chan error, 1)
-	go func() { firstResult <- service.RefreshPresence(context.Background(), "ABC234", "token") }()
+	go func() { firstResult <- service.RefreshPresence(context.Background(), "ABC234", "token", "user") }()
 	<-firstStarted
-	if err := service.RefreshPresence(context.Background(), "ABC234", "token"); err != nil {
+	if err := service.RefreshPresence(context.Background(), "ABC234", "token", "user"); err != nil {
 		t.Fatal(err)
 	}
 	close(releaseFirst)
@@ -260,10 +274,10 @@ func TestNewRoundAcceptsLowerGenerationFromNewLeaseEpoch(t *testing.T) {
 		return application.Snapshot{}, false, nil
 	}
 	service := configuredTestService(repository, nil, &now, scheduler, nil)
-	if err := service.RefreshPresence(context.Background(), "ABC234", "token"); err != nil {
+	if err := service.RefreshPresence(context.Background(), "ABC234", "token", "user"); err != nil {
 		t.Fatal(err)
 	}
-	if err := service.RefreshPresence(context.Background(), "ABC234", "token"); err != nil {
+	if err := service.RefreshPresence(context.Background(), "ABC234", "token", "user"); err != nil {
 		t.Fatal(err)
 	}
 	scheduler.advance(16 * time.Second)
@@ -289,7 +303,7 @@ func TestExpiryFailureRetriesAreBoundedAndReported(t *testing.T) {
 	}
 	var reported []error
 	service := configuredTestService(repository, nil, &now, scheduler, func(err error) { reported = append(reported, err) })
-	if err := service.RefreshPresence(context.Background(), "ABC234", "token"); err != nil {
+	if err := service.RefreshPresence(context.Background(), "ABC234", "token", "user"); err != nil {
 		t.Fatal(err)
 	}
 	scheduler.advance(16 * time.Second)
@@ -314,7 +328,7 @@ func TestExpiryFailureStopsAfterRetryLimit(t *testing.T) {
 	}
 	reported := 0
 	service := configuredTestService(repository, nil, &now, scheduler, func(error) { reported++ })
-	if err := service.RefreshPresence(context.Background(), "ABC234", "token"); err != nil {
+	if err := service.RefreshPresence(context.Background(), "ABC234", "token", "user"); err != nil {
 		t.Fatal(err)
 	}
 	scheduler.advance(16 * time.Second)
@@ -332,11 +346,11 @@ func newTimedGame(t *testing.T) (*application.Service, *fakeScheduler, applicati
 	now := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
 	scheduler := &fakeScheduler{now: &now}
 	service := configuredTestService(repository, events, &now, scheduler, nil)
-	host, err := service.Create(context.Background())
+	host, err := service.Create(context.Background(), "host-user")
 	if err != nil {
 		t.Fatal(err)
 	}
-	guest, err := service.Join(context.Background(), host.RoomCode)
+	guest, err := service.Join(context.Background(), host.RoomCode, "guest-user")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -359,7 +373,7 @@ type presenceRepositoryStub struct {
 	forfeit func(context.Context, application.PresenceLease, time.Time) (application.Snapshot, bool, error)
 }
 
-func (r *presenceRepositoryStub) RefreshPresence(ctx context.Context, code string, digest application.CredentialDigest, window application.PresenceWindow) ([]application.PresenceLease, error) {
+func (r *presenceRepositoryStub) RefreshPresence(ctx context.Context, code string, digest application.CredentialDigest, _ string, window application.PresenceWindow) ([]application.PresenceLease, error) {
 	return r.refresh(ctx, code, digest, window)
 }
 

@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import * as api from './api.js'
 import { clearSession, loadSession, saveSession } from './storage.js'
+import { supabase } from './supabase.js'
 
 const MOVES = [
   { value: 'rock', label: 'Rock', symbol: '●' },
@@ -346,7 +347,7 @@ function Room({ session, onLeave }) {
   )
 }
 
-export default function App() {
+export function GameApp() {
   const [session, setSession] = useState(() => loadSession())
   const [sessionReady, setSessionReady] = useState(() => !session)
   const [validationError, setValidationError] = useState('')
@@ -404,5 +405,138 @@ export default function App() {
     <Room key={`${session.roomCode}:${session.playerToken}`} session={session} onLeave={leaveRoom} />
   ) : (
     <Home onEnterRoom={enterRoom} />
+  )
+}
+
+function AuthForm({ initialError, onAuthenticated, onPending }) {
+  const [mode, setMode] = useState('login')
+  const [email, setEmail] = useState('')
+  const [password, setPassword] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState('')
+
+  async function submit(event) {
+    event.preventDefault()
+    setBusy(true)
+    setError('')
+    try {
+      const result = mode === 'register'
+        ? await supabase.auth.signUp({ email, password })
+        : await supabase.auth.signInWithPassword({ email, password })
+      if (result.error) throw result.error
+      if (mode === 'register' && result.data.user && !result.data.session) {
+        onPending(email)
+      } else if (result.data.session) {
+        onAuthenticated(result.data.session)
+      }
+    } catch (authError) {
+      setError(displayError(authError))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <main className="page recovery-page">
+      <section className="entry-card auth-card" aria-labelledby="auth-title">
+        <p className="eyebrow">Account required</p>
+        <h1 id="auth-title">{mode === 'login' ? 'Sign in to play' : 'Create your account'}</h1>
+        <form className="auth-form" onSubmit={submit}>
+          <label htmlFor="auth-email">Email address</label>
+          <input id="auth-email" type="email" autoComplete="email" required value={email} onChange={(event) => setEmail(event.target.value)} />
+          <label htmlFor="auth-password">Password</label>
+          <input id="auth-password" type="password" autoComplete={mode === 'login' ? 'current-password' : 'new-password'} minLength="6" required value={password} onChange={(event) => setPassword(event.target.value)} />
+          <button className="button button-primary" disabled={busy}>
+            {busy ? 'Please wait…' : mode === 'login' ? 'Sign in' : 'Register'}
+          </button>
+        </form>
+        <button className="button button-quiet auth-switch" type="button" disabled={busy} onClick={() => {
+          setMode((current) => current === 'login' ? 'register' : 'login')
+          setError('')
+        }}>
+          {mode === 'login' ? 'Need an account? Register' : 'Already have an account? Sign in'}
+        </button>
+        {(error || initialError) && <div className="notice notice-error" role="alert">{error || initialError}</div>}
+      </section>
+    </main>
+  )
+}
+
+export default function App() {
+  const [authSession, setAuthSession] = useState(null)
+  const [loading, setLoading] = useState(Boolean(supabase))
+  const [pendingEmail, setPendingEmail] = useState('')
+  const [error, setError] = useState(supabase ? '' : 'Supabase authentication is not configured.')
+
+  useEffect(() => {
+    if (!supabase) {
+      return undefined
+    }
+    let active = true
+    let authStateObserved = false
+    supabase.auth.getSession().then(({ data, error: sessionError }) => {
+      if (!active || authStateObserved) return
+      if (sessionError) setError(displayError(sessionError))
+      setAuthSession(data.session ?? null)
+      if (!data.session) clearSession()
+      setLoading(false)
+    })
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, nextSession) => {
+      if (!active) return
+      authStateObserved = true
+      setAuthSession(nextSession)
+      setPendingEmail('')
+      setError('')
+      if (!nextSession) clearSession()
+      setLoading(false)
+    })
+    return () => {
+      active = false
+      subscription.unsubscribe()
+    }
+  }, [])
+
+  async function signOut() {
+    setError('')
+    try {
+      const { error: signOutError } = await supabase.auth.signOut()
+      if (signOutError) {
+        setError(displayError(signOutError))
+        return
+      }
+      clearSession()
+      setAuthSession(null)
+    } catch (signOutError) {
+      setError(displayError(signOutError))
+    }
+  }
+
+  if (loading) return <SessionRecovery error="" onRetry={() => {}} onForget={() => {}} />
+  if (error && !supabase) {
+    return <main className="page recovery-page"><div className="notice notice-error" role="alert">{error}</div></main>
+  }
+  if (pendingEmail) {
+    return (
+      <main className="page recovery-page">
+        <section className="entry-card centered" aria-live="polite">
+          <p className="eyebrow">Confirm your email</p>
+          <h1>Check your inbox</h1>
+          <p>We sent a confirmation link to {pendingEmail}. Confirm your email, then return here to sign in.</p>
+          <button className="button button-quiet" onClick={() => setPendingEmail('')}>Back to sign in</button>
+        </section>
+      </main>
+    )
+  }
+  if (!authSession) return <AuthForm initialError={error} onAuthenticated={setAuthSession} onPending={setPendingEmail} />
+
+  return (
+    <div className="authenticated-app">
+      <div className="account-bar">
+        <span>Signed in</span>
+        <button className="button button-quiet" onClick={signOut}>Sign out</button>
+      </div>
+      {error && <div className="page notice notice-error" role="alert">{error}</div>}
+      <GameApp />
+    </div>
   )
 }

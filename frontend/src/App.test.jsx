@@ -2,7 +2,7 @@ import { StrictMode } from 'react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
-import App from './App.jsx'
+import { GameApp as App } from './App.jsx'
 import * as api from './api.js'
 import { APP_VERSION, STORAGE_KEY } from './storage.js'
 
@@ -238,7 +238,7 @@ describe('core room flow', () => {
     await screen.findByRole('heading', { name: 'You won' })
     await userEvent.click(screen.getByRole('button', { name: 'Leave room' }))
     expect(api.leaveRoom).toHaveBeenCalledWith('ABC234', 'host-secret')
-		expect(screen.getByRole('button', { name: 'Create room' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Create room' })).toBeInTheDocument()
     expect(localStorage.getItem(STORAGE_KEY)).toBeNull()
     expect(closeStream).toHaveBeenCalledOnce()
   })

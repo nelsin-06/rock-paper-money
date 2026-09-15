@@ -18,10 +18,10 @@ func TestRepositoryRollsBackFailedMutation(t *testing.T) {
 		t.Fatal(err)
 	}
 	digest := application.DigestToken("host-token")
-	if _, err = repository.Create(context.Background(), aggregate, digest); err != nil {
+	if _, err = repository.Create(context.Background(), aggregate, digest, "host-user"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err = repository.Mutate(context.Background(), "ABC234", digest, func(room *domain.Room, playerID string) error {
+	if _, err = repository.Mutate(context.Background(), "ABC234", digest, "host-user", func(room *domain.Room, playerID string) error {
 		if err := room.Join("guest-id"); err != nil {
 			return err
 		}
@@ -41,20 +41,20 @@ func TestRepositoryRollsBackFailedMutation(t *testing.T) {
 func TestSkewedLastHeartbeatsDoNotFabricateWinner(t *testing.T) {
 	repository, _ := memory.New()
 	aggregate, _ := domain.New("ABC234", "host-id")
-	if _, err := repository.Create(context.Background(), aggregate, application.DigestToken("host-token")); err != nil {
+	if _, err := repository.Create(context.Background(), aggregate, application.DigestToken("host-token"), "host-user"); err != nil {
 		t.Fatal(err)
 	}
 	observed := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
 	deadline := observed.Add(13 * time.Second)
 	window := application.PresenceWindow{ObservedAt: observed, ProofAfter: deadline, Deadline: deadline, EvaluateAt: deadline.Add(3 * time.Second)}
-	_, leases, err := repository.Join(context.Background(), "ABC234", "guest-id", application.DigestToken("guest-token"), window)
+	_, leases, err := repository.Join(context.Background(), "ABC234", "guest-id", application.DigestToken("guest-token"), "guest-user", window)
 	if err != nil {
 		t.Fatal(err)
 	}
 	hostObserved := observed.Add(4 * time.Second)
 	hostDeadline := hostObserved.Add(13 * time.Second)
 	hostWindow := application.PresenceWindow{ObservedAt: hostObserved, ProofAfter: hostDeadline, Deadline: hostDeadline, EvaluateAt: hostDeadline.Add(3 * time.Second)}
-	_, err = repository.RefreshPresence(context.Background(), "ABC234", application.DigestToken("host-token"), hostWindow)
+	_, err = repository.RefreshPresence(context.Background(), "ABC234", application.DigestToken("host-token"), "host-user", hostWindow)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -73,13 +73,13 @@ func TestRefreshReconstructsExpiredOpponentAndPreservesGenerationsAcrossRounds(t
 	aggregate, _ := domain.New("ABC234", "host-id")
 	hostDigest := application.DigestToken("host-token")
 	guestDigest := application.DigestToken("guest-token")
-	if _, err := repository.Create(context.Background(), aggregate, hostDigest); err != nil {
+	if _, err := repository.Create(context.Background(), aggregate, hostDigest, "host-user"); err != nil {
 		t.Fatal(err)
 	}
 	observed := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
 	deadline := observed.Add(13 * time.Second)
 	window := application.PresenceWindow{ObservedAt: observed, ProofAfter: deadline, Deadline: deadline, EvaluateAt: deadline.Add(3 * time.Second)}
-	_, initial, err := repository.Join(context.Background(), "ABC234", "guest-id", guestDigest, window)
+	_, initial, err := repository.Join(context.Background(), "ABC234", "guest-id", guestDigest, "guest-user", window)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -92,7 +92,7 @@ func TestRefreshReconstructsExpiredOpponentAndPreservesGenerationsAcrossRounds(t
 	hostObserved := window.EvaluateAt.Add(time.Second)
 	hostDeadline := hostObserved.Add(13 * time.Second)
 	hostWindow := application.PresenceWindow{ObservedAt: hostObserved, ProofAfter: hostDeadline, Deadline: hostDeadline, EvaluateAt: hostDeadline.Add(3 * time.Second)}
-	refreshed, err := repository.RefreshPresence(context.Background(), "ABC234", hostDigest, hostWindow)
+	refreshed, err := repository.RefreshPresence(context.Background(), "ABC234", hostDigest, "host-user", hostWindow)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -104,17 +104,17 @@ func TestRefreshReconstructsExpiredOpponentAndPreservesGenerationsAcrossRounds(t
 		t.Fatalf("reconnected-host forfeit changed=%v error=%v", changed, err)
 	}
 
-	if _, err = repository.Mutate(context.Background(), "ABC234", guestDigest, func(room *domain.Room, playerID string) error {
+	if _, err = repository.Mutate(context.Background(), "ABC234", guestDigest, "guest-user", func(room *domain.Room, playerID string) error {
 		return room.RequestNextRound(playerID, 1)
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err = repository.Mutate(context.Background(), "ABC234", hostDigest, func(room *domain.Room, playerID string) error {
+	if _, err = repository.Mutate(context.Background(), "ABC234", hostDigest, "host-user", func(room *domain.Room, playerID string) error {
 		return room.RequestNextRound(playerID, 1)
 	}); err != nil {
 		t.Fatal(err)
 	}
-	nextRound, err := repository.RefreshPresence(context.Background(), "ABC234", hostDigest, hostWindow)
+	nextRound, err := repository.RefreshPresence(context.Background(), "ABC234", hostDigest, "host-user", hostWindow)
 	if err != nil {
 		t.Fatal(err)
 	}

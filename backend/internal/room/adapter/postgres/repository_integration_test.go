@@ -22,11 +22,11 @@ func TestPostgresPersistsAndSerializesRooms(t *testing.T) {
 	ctx := context.Background()
 	repository := postgres.NewRepository(pool)
 	service := fixedService(repository, postgres.NewEvents(pool, slog.Default()))
-	host, err := service.Create(ctx)
+	host, err := service.Create(ctx, "00000000-0000-4000-8000-000000000001")
 	if err != nil {
 		t.Fatal(err)
 	}
-	guest, err := service.Join(ctx, host.RoomCode)
+	guest, err := service.Join(ctx, host.RoomCode, "00000000-0000-4000-8000-000000000002")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -37,12 +37,12 @@ func TestPostgresPersistsAndSerializesRooms(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		<-start
-		errs <- service.SubmitMove(ctx, host.RoomCode, host.PlayerToken, domain.Rock)
+		errs <- service.SubmitMove(ctx, host.RoomCode, host.PlayerToken, "00000000-0000-4000-8000-000000000001", domain.Rock)
 	}()
 	go func() {
 		defer wg.Done()
 		<-start
-		errs <- service.SubmitMove(ctx, host.RoomCode, guest.PlayerToken, domain.Scissors)
+		errs <- service.SubmitMove(ctx, host.RoomCode, guest.PlayerToken, "00000000-0000-4000-8000-000000000002", domain.Scissors)
 	}()
 	close(start)
 	wg.Wait()
@@ -60,7 +60,7 @@ func TestPostgresPersistsAndSerializesRooms(t *testing.T) {
 	if snapshot.Revision != 4 || !snapshot.State.Resolved || snapshot.State.Players[0].Wins != 1 {
 		t.Fatalf("reconstructed = %#v", snapshot)
 	}
-	if err = restarted.SubmitMove(ctx, host.RoomCode, host.PlayerToken, domain.Paper); !errors.Is(err, domain.ErrRoundResolved) {
+	if err = restarted.SubmitMove(ctx, host.RoomCode, host.PlayerToken, "00000000-0000-4000-8000-000000000001", domain.Paper); !errors.Is(err, domain.ErrRoundResolved) {
 		t.Fatalf("resolved round error = %v", err)
 	}
 	unchanged, err := restarted.Snapshot(ctx, host.RoomCode)
@@ -77,6 +77,16 @@ func TestPostgresPersistsAndSerializesRooms(t *testing.T) {
 	if strings.Contains(credentialText, host.PlayerToken) || credentialText == host.PlayerToken {
 		t.Fatal("raw token persisted")
 	}
+	var owner string
+	if err = pool.QueryRow(ctx, "SELECT auth_user_id::text FROM room_seats WHERE room_code=$1 AND role='host'", host.RoomCode).Scan(&owner); err != nil {
+		t.Fatal(err)
+	}
+	if owner != "00000000-0000-4000-8000-000000000001" {
+		t.Fatalf("seat owner = %q", owner)
+	}
+	if err = restarted.SubmitMove(ctx, host.RoomCode, host.PlayerToken, "00000000-0000-4000-8000-000000000099", domain.Paper); !errors.Is(err, application.ErrUnauthorized) {
+		t.Fatalf("cross-account mutation error = %v", err)
+	}
 	tx, err := pool.Begin(ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -89,11 +99,39 @@ func TestPostgresPersistsAndSerializesRooms(t *testing.T) {
 	}
 }
 
+func TestPostgresAllowsLegacyNullableSeatsButRejectsDuplicateAccountSeats(t *testing.T) {
+	pool := integrationPool(t)
+	ctx := context.Background()
+	if _, err := pool.Exec(ctx, "INSERT INTO room_rooms(code) VALUES('OLD234')"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, "INSERT INTO room_rounds(room_code,number) VALUES('OLD234',1)"); err != nil {
+		t.Fatal(err)
+	}
+	legacyDigest := application.DigestToken("legacy-token")
+	if _, err := pool.Exec(ctx, "INSERT INTO room_seats(room_code,role,player_id,credential_digest) VALUES('OLD234','host','legacy-player',$1)", legacyDigest[:]); err != nil {
+		t.Fatal(err)
+	}
+
+	repository := postgres.NewRepository(pool)
+	aggregate, _ := domain.New("OWN234", "host-id")
+	owner := "00000000-0000-4000-8000-000000000001"
+	if _, err := repository.Create(ctx, aggregate, application.DigestToken("host-token"), owner); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	deadline := now.Add(13 * time.Second)
+	_, _, err := repository.Join(ctx, "OWN234", "guest-id", application.DigestToken("guest-token"), owner, application.PresenceWindow{ObservedAt: now, ProofAfter: deadline, Deadline: deadline, EvaluateAt: deadline.Add(3 * time.Second)})
+	if !errors.Is(err, application.ErrAccountSeated) {
+		t.Fatalf("same-account join error = %v", err)
+	}
+}
+
 func TestPostgresConcurrentJoinAllowsOneGuest(t *testing.T) {
 	pool := integrationPool(t)
 	repository := postgres.NewRepository(pool)
 	aggregate, _ := domain.New("JOIN23", "host-id")
-	if _, err := repository.Create(context.Background(), aggregate, application.DigestToken("host-token")); err != nil {
+	if _, err := repository.Create(context.Background(), aggregate, application.DigestToken("host-token"), "00000000-0000-4000-8000-000000000001"); err != nil {
 		t.Fatal(err)
 	}
 	start := make(chan struct{})
@@ -103,7 +141,7 @@ func TestPostgresConcurrentJoinAllowsOneGuest(t *testing.T) {
 			<-start
 			now := time.Now()
 			deadline := now.Add(13 * time.Second)
-			_, _, err := repository.Join(context.Background(), "JOIN23", fmt.Sprintf("guest-%d", i), application.DigestToken(fmt.Sprintf("token-%d", i)), application.PresenceWindow{ObservedAt: now, ProofAfter: deadline, Deadline: deadline, EvaluateAt: deadline.Add(3 * time.Second)})
+			_, _, err := repository.Join(context.Background(), "JOIN23", fmt.Sprintf("guest-%d", i), application.DigestToken(fmt.Sprintf("token-%d", i)), fmt.Sprintf("00000000-0000-4000-8000-%012d", i+2), application.PresenceWindow{ObservedAt: now, ProofAfter: deadline, Deadline: deadline, EvaluateAt: deadline.Add(3 * time.Second)})
 			errs <- err
 		}()
 	}
@@ -129,11 +167,11 @@ func TestPostgresPersistsForfeitAndRejectsStaleLease(t *testing.T) {
 	ctx := context.Background()
 	repository := postgres.NewRepository(pool)
 	service := fixedService(repository, postgres.NewEvents(pool, slog.Default()))
-	host, err := service.Create(ctx)
+	host, err := service.Create(ctx, "00000000-0000-4000-8000-000000000001")
 	if err != nil {
 		t.Fatal(err)
 	}
-	guest, err := service.Join(ctx, host.RoomCode)
+	guest, err := service.Join(ctx, host.RoomCode, "00000000-0000-4000-8000-000000000002")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -143,15 +181,15 @@ func TestPostgresPersistsForfeitAndRejectsStaleLease(t *testing.T) {
 	skewedHostObserved := observed.Add(4 * time.Second)
 	skewedHostDeadline := skewedHostObserved.Add(13 * time.Second)
 	skewedHostWindow := application.PresenceWindow{ObservedAt: skewedHostObserved, ProofAfter: skewedHostDeadline, Deadline: skewedHostDeadline, EvaluateAt: skewedHostDeadline.Add(3 * time.Second)}
-	if _, err = repository.RefreshPresence(ctx, host.RoomCode, application.DigestToken(host.PlayerToken), skewedHostWindow); err != nil {
+	if _, err = repository.RefreshPresence(ctx, host.RoomCode, application.DigestToken(host.PlayerToken), "00000000-0000-4000-8000-000000000001", skewedHostWindow); err != nil {
 		t.Fatal(err)
 	}
-	staleLeases, err := repository.RefreshPresence(ctx, host.RoomCode, application.DigestToken(guest.PlayerToken), guestWindow)
+	staleLeases, err := repository.RefreshPresence(ctx, host.RoomCode, application.DigestToken(guest.PlayerToken), "00000000-0000-4000-8000-000000000002", guestWindow)
 	if err != nil {
 		t.Fatal(err)
 	}
 	stale := postgresLeaseForPlayer(t, staleLeases, "guest-id")
-	currentLeases, err := repository.RefreshPresence(ctx, host.RoomCode, application.DigestToken(guest.PlayerToken), guestWindow)
+	currentLeases, err := repository.RefreshPresence(ctx, host.RoomCode, application.DigestToken(guest.PlayerToken), "00000000-0000-4000-8000-000000000002", guestWindow)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -165,7 +203,7 @@ func TestPostgresPersistsForfeitAndRejectsStaleLease(t *testing.T) {
 	hostObserved := guestWindow.ProofAfter.Add(time.Second)
 	hostDeadline := hostObserved.Add(13 * time.Second)
 	hostWindow := application.PresenceWindow{ObservedAt: hostObserved, ProofAfter: hostDeadline, Deadline: hostDeadline, EvaluateAt: hostDeadline.Add(3 * time.Second)}
-	refreshedLeases, err := repository.RefreshPresence(ctx, host.RoomCode, application.DigestToken(host.PlayerToken), hostWindow)
+	refreshedLeases, err := repository.RefreshPresence(ctx, host.RoomCode, application.DigestToken(host.PlayerToken), "00000000-0000-4000-8000-000000000001", hostWindow)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -204,24 +242,24 @@ func TestPostgresPreservesRoundHistoryAndClosedRoomAcrossRestart(t *testing.T) {
 	pool := integrationPool(t)
 	ctx := context.Background()
 	service := fixedService(postgres.NewRepository(pool), postgres.NewEvents(pool, slog.Default()))
-	host, err := service.Create(ctx)
+	host, err := service.Create(ctx, "00000000-0000-4000-8000-000000000001")
 	if err != nil {
 		t.Fatal(err)
 	}
-	guest, err := service.Join(ctx, host.RoomCode)
+	guest, err := service.Join(ctx, host.RoomCode, "00000000-0000-4000-8000-000000000002")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err = service.SubmitMove(ctx, host.RoomCode, host.PlayerToken, domain.Paper); err != nil {
+	if err = service.SubmitMove(ctx, host.RoomCode, host.PlayerToken, "00000000-0000-4000-8000-000000000001", domain.Paper); err != nil {
 		t.Fatal(err)
 	}
-	if err = service.SubmitMove(ctx, host.RoomCode, guest.PlayerToken, domain.Rock); err != nil {
+	if err = service.SubmitMove(ctx, host.RoomCode, guest.PlayerToken, "00000000-0000-4000-8000-000000000002", domain.Rock); err != nil {
 		t.Fatal(err)
 	}
-	if err = service.RequestNextRound(ctx, host.RoomCode, guest.PlayerToken, 1); err != nil {
+	if err = service.RequestNextRound(ctx, host.RoomCode, guest.PlayerToken, "00000000-0000-4000-8000-000000000002", 1); err != nil {
 		t.Fatal(err)
 	}
-	if err = service.RequestNextRound(ctx, host.RoomCode, host.PlayerToken, 1); err != nil {
+	if err = service.RequestNextRound(ctx, host.RoomCode, host.PlayerToken, "00000000-0000-4000-8000-000000000001", 1); err != nil {
 		t.Fatal(err)
 	}
 
@@ -240,17 +278,17 @@ func TestPostgresPreservesRoundHistoryAndClosedRoomAcrossRestart(t *testing.T) {
 		t.Fatalf("round-one history = result %q, %d moves, %d requests", result, moveCount, requestCount)
 	}
 
-	if err = service.SubmitMove(ctx, host.RoomCode, host.PlayerToken, domain.Rock); err != nil {
+	if err = service.SubmitMove(ctx, host.RoomCode, host.PlayerToken, "00000000-0000-4000-8000-000000000001", domain.Rock); err != nil {
 		t.Fatal(err)
 	}
-	if err = service.SubmitMove(ctx, host.RoomCode, guest.PlayerToken, domain.Rock); err != nil {
+	if err = service.SubmitMove(ctx, host.RoomCode, guest.PlayerToken, "00000000-0000-4000-8000-000000000002", domain.Rock); err != nil {
 		t.Fatal(err)
 	}
-	if err = service.Leave(ctx, host.RoomCode, host.PlayerToken); err != nil {
+	if err = service.Leave(ctx, host.RoomCode, host.PlayerToken, "00000000-0000-4000-8000-000000000001"); err != nil {
 		t.Fatal(err)
 	}
 	restarted := application.NewService(postgres.NewRepository(pool), postgres.NewEvents(pool, slog.Default()))
-	snapshot, role, err := restarted.Authenticate(ctx, host.RoomCode, host.PlayerToken)
+	snapshot, role, err := restarted.Authenticate(ctx, host.RoomCode, host.PlayerToken, "00000000-0000-4000-8000-000000000001")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -269,7 +307,7 @@ func TestPostgresNotificationsCrossInstances(t *testing.T) {
 	go eventsTwo.Run(ctx)
 	repository := postgres.NewRepository(pool)
 	serviceOne := fixedService(repository, eventsOne)
-	host, err := serviceOne.Create(ctx)
+	host, err := serviceOne.Create(ctx, "00000000-0000-4000-8000-000000000001")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -280,7 +318,7 @@ func TestPostgresNotificationsCrossInstances(t *testing.T) {
 	}
 	defer unsubscribe()
 	time.Sleep(100 * time.Millisecond)
-	if _, err = serviceOne.Join(ctx, host.RoomCode); err != nil {
+	if _, err = serviceOne.Join(ctx, host.RoomCode, "00000000-0000-4000-8000-000000000002"); err != nil {
 		t.Fatal(err)
 	}
 	select {

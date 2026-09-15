@@ -12,6 +12,7 @@ import (
 	"syscall"
 	"time"
 
+	"example.com/rock-paper-money/internal/auth"
 	roomhttp "example.com/rock-paper-money/internal/room/adapter/http"
 	"example.com/rock-paper-money/internal/room/adapter/postgres"
 	"example.com/rock-paper-money/internal/room/application"
@@ -28,6 +29,15 @@ func run() error {
 	databaseURL := os.Getenv("DATABASE_URL")
 	if databaseURL == "" {
 		return errors.New("DATABASE_URL is required")
+	}
+	supabaseURL := os.Getenv("SUPABASE_URL")
+	if supabaseURL == "" {
+		return errors.New("SUPABASE_URL is required")
+	}
+	audience := os.Getenv("SUPABASE_JWT_AUDIENCE")
+	verifier, err := auth.NewSupabaseJWTVerifier(supabaseURL, audience, nil)
+	if err != nil {
+		return fmt.Errorf("configure Supabase authentication: %w", err)
 	}
 	port := os.Getenv("PORT")
 	if port == "" {
@@ -63,7 +73,7 @@ func run() error {
 	}
 	server := &http.Server{
 		Addr:              "0.0.0.0:" + port,
-		Handler:           roomhttp.NewRouter(rooms, ready),
+		Handler:           roomhttp.NewRouter(rooms, verifier, ready),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
 		WriteTimeout:      10 * time.Second,
