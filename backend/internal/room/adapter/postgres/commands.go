@@ -5,11 +5,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"time"
 
 	"example.com/rock-paper-money/internal/latency"
 	"example.com/rock-paper-money/internal/room/application"
 	"example.com/rock-paper-money/internal/room/domain"
+	"example.com/rock-paper-money/internal/worker"
 	"github.com/jackc/pgx/v5"
 )
 
@@ -125,47 +127,123 @@ func (r *Repository) JoinCommand(ctx context.Context, code, playerID, accountID 
 }
 
 func (r *Repository) SubmitMoveCommand(ctx context.Context, code, accountID string, move domain.Move, command application.Command) (application.CommandResult, error) {
-	return r.writeAccountCommand(ctx, code, accountID, command, true, func(tx pgx.Tx, aggregate *domain.Room, _ map[string]string, playerID string) ([]application.PresenceLease, error) {
-		wasResolved := aggregate.State().Resolved
-		finishPersistence := latency.StartPhase(ctx, latency.PhasePersistenceWalletSettlement)
-		if err := fundRound(ctx, tx, code, aggregate.State().Round, ""); err != nil {
-			finishPersistence()
-			return nil, err
+	if !domain.IsValidMove(move) {
+		return application.CommandResult{}, fmt.Errorf("%w: %q", domain.ErrInvalidMove, move)
+	}
+	return r.recordRoomAction(ctx, code, accountID, command, "active", 0, func(tx pgx.Tx, round uint64, role string) error {
+		result, err := tx.Exec(latency.WithQueryName(ctx, "room_action_insert"), `
+			INSERT INTO room_moves(room_code,round_number,role,move)
+			VALUES($1,$2,$3,$4) ON CONFLICT DO NOTHING`, code, round, role, move)
+		if err != nil {
+			return err
 		}
-		finishPersistence()
-		finishMutation := latency.StartPhase(ctx, latency.PhaseDomainMutation)
-		if err := aggregate.SubmitMove(playerID, move); err != nil {
-			finishMutation()
-			return nil, err
+		if result.RowsAffected() == 0 {
+			return domain.ErrDuplicateMove
 		}
-		finishMutation()
-		if !wasResolved && aggregate.State().Resolved {
-			finishPersistence = latency.StartPhase(ctx, latency.PhasePersistenceWalletSettlement)
-			err := settleRound(ctx, tx, code, aggregate.State())
-			finishPersistence()
-			return nil, err
-		}
-		return nil, nil
+		return nil
 	})
 }
 
 func (r *Repository) RequestNextRoundCommand(ctx context.Context, code, accountID string, round uint64, command application.Command) (application.CommandResult, error) {
-	return r.writeAccountCommand(ctx, code, accountID, command, true, func(tx pgx.Tx, aggregate *domain.Room, _ map[string]string, playerID string) ([]application.PresenceLease, error) {
-		previous := aggregate.State().Round
-		finishMutation := latency.StartPhase(ctx, latency.PhaseDomainMutation)
-		if err := aggregate.RequestNextRound(playerID, round); err != nil {
-			finishMutation()
-			return nil, err
+	return r.recordRoomAction(ctx, code, accountID, command, "resolved", round, func(tx pgx.Tx, currentRound uint64, role string) error {
+		result, err := tx.Exec(latency.WithQueryName(ctx, "room_action_insert"), `
+			INSERT INTO room_next_round_requests(room_code,round_number,role)
+			VALUES($1,$2,$3) ON CONFLICT DO NOTHING`, code, currentRound, role)
+		if err != nil {
+			return err
 		}
-		finishMutation()
-		if aggregate.State().Round > previous {
-			finishPersistence := latency.StartPhase(ctx, latency.PhasePersistenceWalletSettlement)
-			err := fundRound(ctx, tx, code, aggregate.State().Round, "")
-			finishPersistence()
-			return nil, err
+		if result.RowsAffected() == 0 {
+			return domain.ErrNextRoundRequested
 		}
-		return nil, nil
+		return nil
 	})
+}
+
+func (r *Repository) recordRoomAction(ctx context.Context, code, accountID string, command application.Command, requiredRoundStatus string, expectedRound uint64, insert func(pgx.Tx, uint64, string) error) (application.CommandResult, error) {
+	finishPhase := latency.StartPhase(ctx, latency.PhasePoolBeginTransaction)
+	tx, err := r.pool.Begin(ctx)
+	finishPhase()
+	if err != nil {
+		return application.CommandResult{}, err
+	}
+	defer tx.Rollback(ctx)
+	finishPhase = latency.StartPhase(ctx, latency.PhaseIdempotencyLockReceipt)
+	replay, found, receiptErr := commandReceipt(ctx, tx, accountID, command)
+	finishPhase()
+	if receiptErr != nil || found {
+		return replay, receiptErr
+	}
+	var currentRound uint64
+	var roomStatus, roundStatus string
+	var roundReady bool
+	finishPhase = latency.StartPhase(ctx, latency.PhaseRoomLock)
+	err = tx.QueryRow(latency.WithQueryName(ctx, "round_shared_lock"), `
+		SELECT r.current_round,r.status,rr.status,
+		       rr.funded AND (SELECT count(*) = 2 FROM room_seats s WHERE s.room_code=r.code)
+		FROM room_rooms r JOIN room_rounds rr
+		  ON rr.room_code=r.code AND rr.number=r.current_round
+		WHERE r.code=$1
+		FOR SHARE OF rr`, code).Scan(&currentRound, &roomStatus, &roundStatus, &roundReady)
+	finishPhase()
+	if errors.Is(err, pgx.ErrNoRows) {
+		return application.CommandResult{}, application.ErrRoomNotFound
+	}
+	if err != nil {
+		return application.CommandResult{}, err
+	}
+	if roomStatus == "closed" {
+		return application.CommandResult{}, domain.ErrRoomClosed
+	}
+	if expectedRound != 0 && expectedRound != currentRound {
+		return application.CommandResult{}, domain.ErrStaleRound
+	}
+	if roundStatus != requiredRoundStatus {
+		if requiredRoundStatus == "active" {
+			return application.CommandResult{}, domain.ErrRoundResolved
+		}
+		return application.CommandResult{}, domain.ErrRoundNotResolved
+	}
+	var role string
+	if err = tx.QueryRow(ctx, "SELECT role FROM room_seats WHERE room_code=$1 AND auth_user_id=$2", code, accountID).Scan(&role); errors.Is(err, pgx.ErrNoRows) {
+		return application.CommandResult{}, application.ErrUnauthorized
+	} else if err != nil {
+		return application.CommandResult{}, err
+	}
+	if !roundReady {
+		return application.CommandResult{}, domain.ErrRoomNotReady
+	}
+	finishPhase = latency.StartPhase(ctx, latency.PhasePersistenceWalletSettlement)
+	if err = insert(tx, currentRound, role); err != nil {
+		finishPhase()
+		return application.CommandResult{}, err
+	}
+	var revision uint64
+	err = tx.QueryRow(ctx, "UPDATE room_rooms SET revision=revision+1,updated_at=now() WHERE code=$1 RETURNING revision", code).Scan(&revision)
+	finishPhase()
+	if err != nil {
+		return application.CommandResult{}, err
+	}
+	result := application.CommandResult{Snapshot: application.Snapshot{State: domain.State{Code: code, Round: currentRound, Ready: true, Resolved: requiredRoundStatus == "resolved"}, Revision: revision}}
+	finishPhase = latency.StartPhase(ctx, latency.PhaseOutboxReceipt)
+	if err = persistCommandEffects(ctx, tx, code, revision, accountID, command, result); err == nil {
+		err = notifyRoomStateChanged(ctx, tx, code, currentRound)
+	}
+	finishPhase()
+	if err != nil {
+		return application.CommandResult{}, err
+	}
+	finishPhase = latency.StartPhase(ctx, latency.PhaseCommit)
+	err = tx.Commit(ctx)
+	finishPhase()
+	if err != nil {
+		return application.CommandResult{}, err
+	}
+	// The durable worker remains the progress guarantee. This best-effort pass
+	// only reduces normal response-to-update latency and runs after action commit.
+	reconcileContext, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
+	_, _ = r.ReconcileRoom(reconcileContext, worker.RoomHint{RoomCode: code, Round: currentRound})
+	cancel()
+	return result, nil
 }
 
 func (r *Repository) MutateCommand(ctx context.Context, code, accountID string, mutation application.Mutation, command application.Command) (application.CommandResult, error) {

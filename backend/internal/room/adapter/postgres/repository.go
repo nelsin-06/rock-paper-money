@@ -588,9 +588,11 @@ func save(ctx context.Context, tx pgx.Tx, aggregate *domain.Room, roles map[stri
 	var result any
 	var resolvedAt any
 	var forfeitedRole any
+	roundStatus := "active"
 	if state.Resolved {
 		result = string(state.Result)
 		resolvedAt = "now"
+		roundStatus = "resolved"
 		for role, id := range roles {
 			if id == state.ForfeitedPlayerID {
 				forfeitedRole = role
@@ -610,10 +612,10 @@ func save(ctx context.Context, tx pgx.Tx, aggregate *domain.Room, roles map[stri
 			UPDATE room_seats s SET wins=i.wins FROM input i
 			WHERE s.room_code=$1 AND s.role=i.role
 		), upserted_round AS (
-			INSERT INTO room_rounds(room_code,number,result,resolved_at,forfeited_role)
-			VALUES($1,$3,$5,CASE WHEN $6::text IS NULL THEN NULL ELSE now() END,$7)
+			INSERT INTO room_rounds(room_code,number,result,resolved_at,forfeited_role,status)
+			VALUES($1,$3,$5,CASE WHEN $6::text IS NULL THEN NULL ELSE now() END,$7,$15)
 			ON CONFLICT(room_code,number) DO UPDATE
-			SET result=EXCLUDED.result,resolved_at=EXCLUDED.resolved_at,forfeited_role=EXCLUDED.forfeited_role
+			SET result=EXCLUDED.result,resolved_at=EXCLUDED.resolved_at,forfeited_role=EXCLUDED.forfeited_role,status=EXCLUDED.status
 		), historical_requests AS (
 			INSERT INTO room_next_round_requests(room_code,round_number,role)
 			SELECT $1,$14,i.role FROM input i WHERE $3>$14
@@ -634,7 +636,7 @@ func save(ctx context.Context, tx pgx.Tx, aggregate *domain.Room, roles map[stri
 		INSERT INTO room_next_round_requests(room_code,round_number,role)
 		SELECT $1,$3,i.role FROM input i WHERE i.wants_next
 		ON CONFLICT DO NOTHING`, state.Code, status, state.Round, revision, result, resolvedAt, forfeitedRole,
-		roleValues, playerIDs, winsValues, moveValues, hasMoves, requestValues, previousRound)
+		roleValues, playerIDs, winsValues, moveValues, hasMoves, requestValues, previousRound, roundStatus)
 	return err
 }
 

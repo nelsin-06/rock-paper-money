@@ -25,10 +25,11 @@ func TestRuntimeRunsEveryWorkerAndStopsGracefully(t *testing.T) {
 		slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil)),
 		Intervals{Deadlines: time.Millisecond, Outbox: time.Millisecond, Cleanup: time.Millisecond},
 	)
+	runtime.SetReconciliation(worker.NewReconciliationWorker(store, nil, worker.ReconciliationConfig{PeriodicInterval: time.Millisecond, IdleInterval: time.Millisecond}))
 	ctx, cancel := context.WithCancel(context.Background())
 	runtime.Start(ctx)
 	deadline := time.Now().Add(time.Second)
-	for time.Now().Before(deadline) && !store.called("deadline", "outbox", "sessions", "receipts") {
+	for time.Now().Before(deadline) && !store.called("deadline", "outbox", "sessions", "receipts", "reconciliation") {
 		time.Sleep(time.Millisecond)
 	}
 	cancel()
@@ -39,7 +40,7 @@ func TestRuntimeRunsEveryWorkerAndStopsGracefully(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("runtime did not stop after cancellation")
 	}
-	if !store.called("deadline", "outbox", "sessions", "receipts") {
+	if !store.called("deadline", "outbox", "sessions", "receipts", "reconciliation") {
 		t.Fatalf("worker calls = %#v", store.snapshot())
 	}
 }
@@ -53,6 +54,7 @@ func TestMetricsExposeOnlyBoundedOperationalLabels(t *testing.T) {
 	metrics.Receipt("conflict")
 	metrics.Deadline(2, 1, 1, 1, 7*time.Second)
 	metrics.Outbox(worker.OutboxRunReport{Claimed: 3, Published: 2, Attempts: 3, Retries: 1, PublishFailures: 1, BacklogDepth: 5, OldestPendingAge: 11 * time.Second})
+	metrics.Reconciliation(worker.ReconciliationPeriodic, worker.ReconciliationReport{ClaimAttempts: 2, ClaimWins: 1, ClaimNoops: 1, SettledRounds: 1, EligibleBacklog: 3})
 	recorder := httptest.NewRecorder()
 	metrics.ServeHTTP(recorder, httptest.NewRequest("GET", "/metrics", nil))
 	body := recorder.Body.String()
@@ -70,6 +72,9 @@ func TestMetricsExposeOnlyBoundedOperationalLabels(t *testing.T) {
 		"rpm_outbox_attempt_total 3",
 		"rpm_outbox_retry_total 1",
 		"rpm_outbox_publish_failure_total 1",
+		"rpm_reconciliation_claim_attempt_total{source=\"periodic\"} 2",
+		"rpm_reconciliation_claim_win_total{source=\"periodic\"} 1",
+		"rpm_reconciliation_backlog 3",
 	} {
 		if !strings.Contains(body, metric) {
 			t.Fatalf("metrics missing %q: %s", metric, body)
@@ -130,6 +135,14 @@ func (s *runtimeStore) Cleanup(context.Context) (int64, error) { s.mark("session
 func (s *runtimeStore) CleanupCommandReceipts(context.Context, time.Time) (int64, error) {
 	s.mark("receipts")
 	return 1, nil
+}
+func (s *runtimeStore) ReconcileRoom(context.Context, worker.RoomHint) (worker.ReconciliationReport, error) {
+	s.mark("reconciliation")
+	return worker.ReconciliationReport{}, nil
+}
+func (s *runtimeStore) ReconcileBatch(context.Context, int) (worker.ReconciliationReport, error) {
+	s.mark("reconciliation")
+	return worker.ReconciliationReport{}, nil
 }
 
 type runtimePublisher struct{}

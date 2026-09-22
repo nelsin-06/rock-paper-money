@@ -59,6 +59,18 @@ func (m *Metrics) Outbox(report worker.OutboxRunReport) {
 	m.set("rpm_outbox_backlog_depth", float64(max(report.BacklogDepth, 0)))
 	m.set("rpm_outbox_oldest_pending_age_seconds", max(report.OldestPendingAge.Seconds(), 0))
 }
+func (m *Metrics) Reconciliation(source worker.ReconciliationSource, report worker.ReconciliationReport) {
+	label := safeLabel(string(source))
+	m.add("rpm_reconciliation_claim_attempt_total{source=\""+label+"\"}", uint64(max(report.ClaimAttempts, 0)))
+	m.add("rpm_reconciliation_claim_win_total{source=\""+label+"\"}", uint64(max(report.ClaimWins, 0)))
+	m.add("rpm_reconciliation_claim_noop_total{source=\""+label+"\"}", uint64(max(report.ClaimNoops, 0)))
+	m.add("rpm_reconciliation_settled_total{source=\""+label+"\"}", uint64(max(report.SettledRounds, 0)))
+	m.add("rpm_reconciliation_advanced_total{source=\""+label+"\"}", uint64(max(report.AdvancedRounds, 0)))
+	m.add("rpm_reconciliation_failure_total{source=\""+label+"\"}", uint64(max(report.Failures, 0)))
+	m.set("rpm_reconciliation_backlog", float64(max(report.EligibleBacklog, 0)))
+	m.set("rpm_reconciliation_oldest_eligible_age_seconds", max(report.OldestEligibleAge.Seconds(), 0))
+	m.set("rpm_reconciliation_duration_seconds{source=\""+label+"\"}", max(report.Duration.Seconds(), 0))
+}
 func (m *Metrics) Cleanup(kind string, removed int64) {
 	m.add("rpm_cleanup_removed_total{kind=\""+safeLabel(kind)+"\"}", uint64(max(removed, 0)))
 }
