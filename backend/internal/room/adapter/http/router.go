@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -12,38 +11,98 @@ import (
 	"time"
 
 	"example.com/rock-paper-money/internal/auth"
+	"example.com/rock-paper-money/internal/latency"
 	"example.com/rock-paper-money/internal/room/application"
 	"example.com/rock-paper-money/internal/room/domain"
 )
 
 const (
-	roomCodeLength    = 6
-	roomCodeAlphabet  = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
-	heartbeatInterval = 15 * time.Second
+	roomCodeLength   = 6
+	roomCodeAlphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 )
+
+type ReadinessStatus struct {
+	Status     string `json:"status"`
+	PostgreSQL string `json:"postgresql"`
+	Realtime   string `json:"realtime"`
+}
 
 type router struct {
 	service  *application.Service
 	verifier auth.Verifier
+	sessions *auth.SessionService
+	security *auth.RequestSecurity
 	ready    func(context.Context) error
+	status   func(context.Context) (ReadinessStatus, int)
+	metrics  http.Handler
+	logger   *slog.Logger
+	latency  *latency.Observer
 }
 
-func NewRouter(service *application.Service, verifier auth.Verifier, ready func(context.Context) error) http.Handler {
-	handler := &router{service: service, verifier: verifier, ready: ready}
+func NewRouter(service *application.Service, verifier auth.Verifier, ready func(context.Context) error, logger *slog.Logger) http.Handler {
+	return NewRouterWithWebSocket(service, verifier, ready, logger, nil)
+}
+
+func NewRouterWithWebSocket(service *application.Service, verifier auth.Verifier, ready func(context.Context) error, logger *slog.Logger, socket http.Handler) http.Handler {
+	return newRouter(service, verifier, nil, nil, ready, nil, logger, socket, nil)
+}
+
+func NewSessionRouter(service *application.Service, verifier auth.Verifier, sessions *auth.SessionService, security *auth.RequestSecurity, ready func(context.Context) error, logger *slog.Logger) http.Handler {
+	return NewSessionRouterWithWebSocket(service, verifier, sessions, security, ready, logger, nil)
+}
+
+func NewSessionRouterWithWebSocket(service *application.Service, verifier auth.Verifier, sessions *auth.SessionService, security *auth.RequestSecurity, ready func(context.Context) error, logger *slog.Logger, socket http.Handler) http.Handler {
+	return newRouter(service, verifier, sessions, security, ready, nil, logger, socket, nil)
+}
+
+func NewOperationalRouter(service *application.Service, verifier auth.Verifier, sessions *auth.SessionService, security *auth.RequestSecurity, status func(context.Context) (ReadinessStatus, int), logger *slog.Logger, socket, metrics http.Handler, observer ...*latency.Observer) http.Handler {
+	return newRouter(service, verifier, sessions, security, nil, status, logger, socket, metrics, observer...)
+}
+
+func newRouter(service *application.Service, verifier auth.Verifier, sessions *auth.SessionService, security *auth.RequestSecurity, ready func(context.Context) error, status func(context.Context) (ReadinessStatus, int), logger *slog.Logger, socket, metrics http.Handler, observer ...*latency.Observer) http.Handler {
+	if logger == nil {
+		logger = slog.Default()
+	}
+	handler := &router{service: service, verifier: verifier, sessions: sessions, security: security, ready: ready, status: status, logger: logger, metrics: metrics}
+	if len(observer) > 0 {
+		handler.latency = observer[0]
+	}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /api/health", health)
-	mux.HandleFunc("GET /api/ready", handler.readiness)
-	mux.HandleFunc("POST /api/rooms", handler.protected(handler.createRoom))
-	mux.HandleFunc("POST /api/rooms/{code}/join", handler.protected(handler.joinRoom))
-	mux.HandleFunc("POST /api/rooms/{code}/moves", handler.protected(handler.submitMove))
-	mux.HandleFunc("GET /api/rooms/{code}/state", handler.roomState)
-	mux.HandleFunc("GET /api/rooms/{code}/events", handler.roomEvents)
-	mux.HandleFunc("POST /api/rooms/{code}/validate-session", handler.protected(handler.validateSession))
-	mux.HandleFunc("POST /api/rooms/{code}/next-round", handler.protected(handler.startNextRound))
-	mux.HandleFunc("POST /api/rooms/{code}/leave", handler.protected(handler.leaveRoom))
-	mux.HandleFunc("POST /api/rooms/{code}/presence", handler.protected(handler.refreshPresence))
-	return logRequests(slog.Default(), mux)
+	registerRoute(mux, http.MethodGet, "/api/health", health)
+	registerRoute(mux, http.MethodGet, "/api/ready", handler.observed("readiness", handler.readiness))
+	if metrics != nil {
+		mux.Handle("GET /metrics", metrics)
+	}
+	if sessions != nil && security != nil {
+		mux.Handle("/api/session", auth.NewSessionHTTPHandler(verifier, sessions, security))
+	}
+	registerRoute(mux, http.MethodPost, "/api/rooms", handler.protected("create_room", handler.createRoom))
+	registerRoute(mux, http.MethodPost, "/api/rooms/{code}/join", handler.protected("join_room", handler.joinRoom))
+	registerRoute(mux, http.MethodPost, "/api/rooms/{code}/moves", handler.protected("submit_move", handler.submitMove))
+	registerRoute(mux, http.MethodGet, "/api/rooms/{code}/state", handler.protected("room_state", handler.roomState))
+	if socket != nil {
+		registerRoute(mux, http.MethodGet, "/api/rooms/{code}/socket", socket.ServeHTTP)
+	}
+	registerRoute(mux, http.MethodPost, "/api/rooms/{code}/next-round", handler.protected("next_round", handler.startNextRound))
+	registerRoute(mux, http.MethodPost, "/api/rooms/{code}/leave", handler.protected("leave_room", handler.leaveRoom))
+	registerRoute(mux, http.MethodGet, "/api/wallet", handler.protected("wallet_balance", handler.walletBalance))
+	registerRoute(mux, http.MethodPost, "/api/wallet/recharges", handler.protected("recharge_wallet", handler.rechargeWallet))
+	registerRoute(mux, http.MethodGet, "/api/analytics/rounds", handler.protected("list_round_analytics", handler.analytics))
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) { writeAPIError(w, r, errorEndpointNotFound) })
+	return observeRequests(logger, mux)
+}
+
+func registerRoute(mux *http.ServeMux, method, path string, handler http.HandlerFunc) {
+	mux.HandleFunc(method+" "+path, handler)
+	mux.HandleFunc(path, func(w http.ResponseWriter, r *http.Request) {
+		allowed := method
+		if method == http.MethodGet {
+			allowed += ", " + http.MethodHead
+		}
+		w.Header().Set("Allow", allowed)
+		writeAPIError(w, r, errorMethodNotAllowed)
+	})
 }
 
 func health(w http.ResponseWriter, _ *http.Request) {
@@ -54,8 +113,13 @@ func health(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (rt *router) readiness(w http.ResponseWriter, r *http.Request) {
+	if rt.status != nil {
+		status, code := rt.status(r.Context())
+		writeJSON(w, code, status)
+		return
+	}
 	if rt.ready != nil && rt.ready(r.Context()) != nil {
-		writeError(w, http.StatusServiceUnavailable, "not ready")
+		writeAPIError(w, r, errorNotReady)
 		return
 	}
 	writeJSON(w, http.StatusOK, struct {
@@ -63,216 +127,244 @@ func (rt *router) readiness(w http.ResponseWriter, r *http.Request) {
 	}{Status: "ok"})
 }
 
-func (rt *router) protected(next func(http.ResponseWriter, *http.Request, auth.Principal)) http.HandlerFunc {
+func (rt *router) protected(operationName string, next func(http.ResponseWriter, *http.Request, auth.Principal)) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		token, ok := bearerToken(r)
-		if !ok || rt.verifier == nil {
-			writeError(w, http.StatusUnauthorized, "unauthorized")
+		response := &statusWriter{ResponseWriter: w}
+		if rt.latency != nil {
+			ctx, finish := rt.latency.StartOperation(r.Context(), requestIDFromContext(r.Context()), operationName)
+			r = r.WithContext(ctx)
+			defer finishObservedOperation(response, finish)
+		}
+		defer func() {
+			if r.Method == http.MethodGet || r.Method == http.MethodHead {
+				return
+			}
+			observer, ok := rt.metrics.(interface{ Receipt(string) })
+			if !ok {
+				return
+			}
+			if response.status == http.StatusConflict {
+				observer.Receipt("conflict")
+			} else if response.status > 0 && response.status < http.StatusInternalServerError {
+				observer.Receipt("accepted")
+			}
+		}()
+		w = response
+		if rt.sessions != nil {
+			finishAuthentication := rt.startPhase(r.Context(), latency.PhaseAuthentication)
+			cookie, err := r.Cookie(auth.SessionCookieName)
+			if err != nil || cookie.Value == "" {
+				finishAuthentication()
+				writeAPIError(w, r, errorUnauthorized)
+				return
+			}
+			session, err := rt.sessions.Authenticate(r.Context(), cookie.Value)
+			if err != nil || session.AccountID == "" {
+				finishAuthentication()
+				writeAPIError(w, r, errorUnauthorized)
+				return
+			}
+			if r.Method != http.MethodGet && r.Method != http.MethodHead {
+				if rt.security == nil || rt.security.ValidateMutation(r, session) != nil {
+					finishAuthentication()
+					writeAPIError(w, r, errorForbidden)
+					return
+				}
+			}
+			finishAuthentication()
+			next(w, r, auth.Principal{Subject: session.AccountID})
 			return
 		}
+		token, ok := bearerToken(r)
+		if !ok || rt.verifier == nil {
+			writeAPIError(w, r, errorUnauthorized)
+			return
+		}
+		finishAuthentication := rt.startPhase(r.Context(), latency.PhaseAuthentication)
 		principal, err := rt.verifier.Verify(r.Context(), token)
+		finishAuthentication()
 		if err != nil || principal.Subject == "" {
-			writeError(w, http.StatusUnauthorized, "unauthorized")
+			writeAPIError(w, r, errorUnauthorized)
 			return
 		}
 		next(w, r, principal)
 	}
 }
 
+func (rt *router) observed(operationName string, next http.HandlerFunc) http.HandlerFunc {
+	if rt.latency == nil {
+		return next
+	}
+	return func(w http.ResponseWriter, r *http.Request) {
+		response := &statusWriter{ResponseWriter: w}
+		ctx, finish := rt.latency.StartOperation(r.Context(), requestIDFromContext(r.Context()), operationName)
+		defer finishObservedOperation(response, finish)
+		next(response, r.WithContext(ctx))
+	}
+}
+
+func finishObservedOperation(response *statusWriter, finish func(int)) {
+	if panicValue := recover(); panicValue != nil {
+		status := response.status
+		if status == 0 {
+			status = http.StatusInternalServerError
+		}
+		finish(status)
+		panic(panicValue)
+	}
+	status := response.status
+	if status == 0 {
+		status = http.StatusOK
+	}
+	finish(status)
+}
+
+func (rt *router) startPhase(ctx context.Context, name string) func() {
+	if rt.latency == nil {
+		return func() {}
+	}
+	return rt.latency.StartPhase(ctx, name)
+}
+
+type statusWriter struct {
+	http.ResponseWriter
+	status int
+}
+
+func (w *statusWriter) WriteHeader(status int) {
+	if w.status == 0 {
+		w.status = status
+	}
+	w.ResponseWriter.WriteHeader(status)
+}
+
+func (w *statusWriter) Write(body []byte) (int, error) {
+	if w.status == 0 {
+		w.status = http.StatusOK
+	}
+	return w.ResponseWriter.Write(body)
+}
+
+func (w *statusWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
+
+func (w *statusWriter) recordInternalFailure(failure internalFailure) {
+	if recorder, ok := w.ResponseWriter.(interface{ recordInternalFailure(internalFailure) }); ok {
+		recorder.recordInternalFailure(failure)
+	}
+}
+
 func (rt *router) createRoom(w http.ResponseWriter, r *http.Request, principal auth.Principal) {
-	credentials, err := rt.service.Create(r.Context(), principal.Subject)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "internal server error")
+	key, ok := idempotencyKey(r)
+	if !ok {
+		writeAPIError(w, r, errorIdempotencyRequired)
 		return
 	}
-	writeJSON(w, http.StatusCreated, roomCredentials{RoomCode: credentials.RoomCode, PlayerToken: credentials.PlayerToken})
+	credentials, err := rt.service.CreateCommand(r.Context(), principal.Subject, key)
+	switch {
+	case err == nil:
+		writeJSON(w, http.StatusCreated, roomCredentials{RoomCode: credentials.RoomCode, PlayerToken: credentials.PlayerToken})
+	case errors.Is(err, application.ErrInsufficientFunds):
+		writeAPIError(w, r, errorInsufficientFunds)
+	default:
+		writeInternalError(w, r, "create_room", err)
+	}
 }
 
 func (rt *router) joinRoom(w http.ResponseWriter, r *http.Request, principal auth.Principal) {
 	code := normalizeRoomCode(r.PathValue("code"))
 	if code == "" {
-		writeError(w, http.StatusBadRequest, "room code is required")
+		writeAPIError(w, r, errorRoomCodeRequired)
 		return
 	}
 
-	credentials, err := rt.service.Join(r.Context(), code, principal.Subject)
+	key, ok := idempotencyKey(r)
+	if !ok {
+		writeAPIError(w, r, errorIdempotencyRequired)
+		return
+	}
+	credentials, err := rt.service.JoinCommand(r.Context(), code, principal.Subject, key)
 	switch {
 	case err == nil:
 		writeJSON(w, http.StatusCreated, roomCredentials{RoomCode: code, PlayerToken: credentials.PlayerToken})
 		return
 	case errors.Is(err, domain.ErrRoomFull):
-		writeError(w, http.StatusConflict, "room is full")
+		writeAPIError(w, r, errorRoomFull)
 		return
 	case errors.Is(err, domain.ErrRoomClosed):
-		writeError(w, http.StatusConflict, "room is closed")
+		writeAPIError(w, r, errorRoomClosed)
 		return
 	case errors.Is(err, application.ErrRoomNotFound):
-		writeError(w, http.StatusNotFound, "room not found")
+		writeAPIError(w, r, errorRoomNotFound)
 		return
 	case errors.Is(err, application.ErrAccountSeated):
-		writeError(w, http.StatusConflict, "account already occupies a seat")
+		writeAPIError(w, r, errorAccountSeated)
+		return
+	case errors.Is(err, application.ErrInsufficientFunds):
+		writeAPIError(w, r, errorInsufficientFunds)
 		return
 	default:
-		writeError(w, http.StatusInternalServerError, "internal server error")
+		writeInternalError(w, r, "join_room", err)
 	}
 }
 
 func (rt *router) submitMove(w http.ResponseWriter, r *http.Request, principal auth.Principal) {
-	code, _, ok := rt.findRoom(r.Context(), w, r.PathValue("code"))
+	code := normalizeRoomCode(r.PathValue("code"))
+	if code == "" {
+		writeAPIError(w, r, errorRoomCodeRequired)
+		return
+	}
+	key, ok := idempotencyKey(r)
 	if !ok {
+		writeAPIError(w, r, errorIdempotencyRequired)
 		return
 	}
-	token, ok := roomToken(r)
-	if !ok {
-		writeError(w, http.StatusUnauthorized, "unauthorized")
-		return
-	}
-	if _, _, err := rt.service.Authenticate(r.Context(), code, token, principal.Subject); err != nil {
-		writeError(w, http.StatusUnauthorized, "unauthorized")
-		return
-	}
-
 	var request moveRequest
 	decoder := json.NewDecoder(r.Body)
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&request); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid request body")
+		writeAPIError(w, r, errorInvalidBody)
 		return
 	}
 	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
-		writeError(w, http.StatusBadRequest, "invalid request body")
+		writeAPIError(w, r, errorInvalidBody)
 		return
 	}
 	if !domain.IsValidMove(request.Move) {
-		writeError(w, http.StatusBadRequest, "invalid move")
+		writeAPIError(w, r, errorInvalidMove)
 		return
 	}
 
-	switch err := rt.service.SubmitMove(r.Context(), code, token, principal.Subject, request.Move); {
+	switch err := rt.service.SubmitMoveCommand(r.Context(), code, principal.Subject, request.Move, key); {
 	case err == nil:
 		w.WriteHeader(http.StatusNoContent)
 	case errors.Is(err, domain.ErrRoomNotReady):
-		writeError(w, http.StatusConflict, "room not ready")
+		writeAPIError(w, r, errorRoomNotReady)
 	case errors.Is(err, domain.ErrDuplicateMove):
-		writeError(w, http.StatusConflict, "move already submitted")
+		writeAPIError(w, r, errorDuplicateMove)
 	case errors.Is(err, domain.ErrRoundResolved):
-		writeError(w, http.StatusConflict, "round is already resolved")
+		writeAPIError(w, r, errorRoundResolved)
 	case errors.Is(err, domain.ErrRoomClosed):
-		writeError(w, http.StatusConflict, "room is closed")
+		writeAPIError(w, r, errorRoomClosed)
 	case errors.Is(err, application.ErrRoomNotFound):
-		writeError(w, http.StatusNotFound, "room not found")
+		writeAPIError(w, r, errorRoomNotFound)
 	case errors.Is(err, application.ErrUnauthorized):
-		writeError(w, http.StatusUnauthorized, "unauthorized")
+		writeAPIError(w, r, errorRoomNotFound)
+	case errors.Is(err, application.ErrIdempotencyConflict):
+		writeAPIError(w, r, errorIdempotencyConflict)
+	case errors.Is(err, application.ErrInsufficientFunds):
+		writeAPIError(w, r, errorInsufficientFunds)
 	default:
-		writeError(w, http.StatusInternalServerError, "internal server error")
+		writeInternalError(w, r, "submit_move", err)
 	}
 }
 
-func (rt *router) roomState(w http.ResponseWriter, r *http.Request) {
-	code, state, ok := rt.findRoom(r.Context(), w, r.PathValue("code"))
+func (rt *router) roomState(w http.ResponseWriter, r *http.Request, principal auth.Principal) {
+	code, state, ok := rt.findRoomForAccount(r, w, r.PathValue("code"), principal.Subject)
 	if !ok {
 		return
 	}
 
 	writeJSON(w, http.StatusOK, publicRoomState(code, state))
-}
-
-func (rt *router) validateSession(w http.ResponseWriter, r *http.Request, principal auth.Principal) {
-	code, state, found := rt.findRoom(r.Context(), w, r.PathValue("code"))
-	if !found {
-		return
-	}
-	if state.Closed {
-		writeError(w, http.StatusNotFound, "room not found")
-		return
-	}
-	token, valid := roomToken(r)
-	if !valid {
-		writeError(w, http.StatusUnauthorized, "unauthorized")
-		return
-	}
-	_, role, err := rt.service.Authenticate(r.Context(), code, token, principal.Subject)
-	if errors.Is(err, application.ErrRoomNotFound) {
-		writeError(w, http.StatusNotFound, "room not found")
-		return
-	}
-	if err != nil {
-		writeError(w, http.StatusUnauthorized, "unauthorized")
-		return
-	}
-	var request validateSessionRequest
-	if !decodeJSONBody(r, &request) || (request.Role != "host" && request.Role != "guest") {
-		writeError(w, http.StatusBadRequest, "invalid request body")
-		return
-	}
-	if request.Role != role {
-		writeError(w, http.StatusUnauthorized, "unauthorized")
-		return
-	}
-	w.WriteHeader(http.StatusNoContent)
-}
-
-func (rt *router) roomEvents(w http.ResponseWriter, r *http.Request) {
-	code := normalizeRoomCode(r.PathValue("code"))
-	if code == "" {
-		writeError(w, http.StatusBadRequest, "room code is required")
-		return
-	}
-	if !supportsStreaming(w) {
-		writeError(w, http.StatusInternalServerError, "streaming is not supported")
-		return
-	}
-
-	controller := http.NewResponseController(w)
-	if err := controller.SetWriteDeadline(time.Time{}); err != nil {
-		writeError(w, http.StatusInternalServerError, "streaming is not supported")
-		return
-	}
-
-	initial, changes, unsubscribe, err := rt.service.Subscribe(r.Context(), code)
-	if errors.Is(err, application.ErrRoomNotFound) {
-		writeError(w, http.StatusNotFound, "room not found")
-		return
-	}
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "internal server error")
-		return
-	}
-	defer unsubscribe()
-
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
-	if err := writeRoomEvent(w, controller, initial); err != nil {
-		return
-	}
-
-	lastRevision := initial.Revision
-	heartbeat := time.NewTicker(heartbeatInterval)
-	defer heartbeat.Stop()
-
-	for {
-		select {
-		case <-r.Context().Done():
-			return
-		case <-changes:
-			snapshot, err := rt.service.Snapshot(r.Context(), code)
-			if err != nil || snapshot.Revision <= lastRevision {
-				continue
-			}
-			if err := writeRoomEvent(w, controller, snapshot); err != nil {
-				return
-			}
-			lastRevision = snapshot.Revision
-		case <-heartbeat.C:
-			if _, err := io.WriteString(w, ": heartbeat\n\n"); err != nil {
-				return
-			}
-			if err := controller.Flush(); err != nil {
-				return
-			}
-		}
-	}
 }
 
 func publicRoomState(code string, state domain.State) stateResponse {
@@ -304,109 +396,156 @@ func publicRoomState(code string, state domain.State) stateResponse {
 }
 
 func (rt *router) startNextRound(w http.ResponseWriter, r *http.Request, principal auth.Principal) {
-	code, _, ok := rt.findRoom(r.Context(), w, r.PathValue("code"))
-	if !ok {
+	code := normalizeRoomCode(r.PathValue("code"))
+	if code == "" {
+		writeAPIError(w, r, errorRoomCodeRequired)
 		return
 	}
-	token, ok := roomToken(r)
+	key, ok := idempotencyKey(r)
 	if !ok {
-		writeError(w, http.StatusUnauthorized, "unauthorized")
-		return
-	}
-	if _, _, err := rt.service.Authenticate(r.Context(), code, token, principal.Subject); err != nil {
-		writeError(w, http.StatusUnauthorized, "unauthorized")
+		writeAPIError(w, r, errorIdempotencyRequired)
 		return
 	}
 	var request nextRoundRequest
 	if !decodeJSONBody(r, &request) || request.Round == 0 {
-		writeError(w, http.StatusBadRequest, "invalid request body")
+		writeAPIError(w, r, errorInvalidBody)
 		return
 	}
 
-	switch err := rt.service.RequestNextRound(r.Context(), code, token, principal.Subject, request.Round); {
+	switch err := rt.service.RequestNextRoundCommand(r.Context(), code, principal.Subject, request.Round, key); {
 	case err == nil:
 		w.WriteHeader(http.StatusNoContent)
 	case errors.Is(err, domain.ErrRoundNotResolved):
-		writeError(w, http.StatusConflict, "round is not resolved")
+		writeAPIError(w, r, errorRoundNotResolved)
 	case errors.Is(err, domain.ErrNextRoundRequested):
-		writeError(w, http.StatusConflict, "next round already requested")
+		writeAPIError(w, r, errorNextRoundRequested)
 	case errors.Is(err, domain.ErrStaleRound):
-		writeError(w, http.StatusConflict, "round request is stale")
+		writeAPIError(w, r, errorStaleRound)
 	case errors.Is(err, domain.ErrRoomClosed):
-		writeError(w, http.StatusConflict, "room is closed")
+		writeAPIError(w, r, errorRoomClosed)
 	case errors.Is(err, application.ErrRoomNotFound):
-		writeError(w, http.StatusNotFound, "room not found")
+		writeAPIError(w, r, errorRoomNotFound)
 	case errors.Is(err, application.ErrUnauthorized):
-		writeError(w, http.StatusUnauthorized, "unauthorized")
+		writeAPIError(w, r, errorRoomNotFound)
+	case errors.Is(err, application.ErrIdempotencyConflict):
+		writeAPIError(w, r, errorIdempotencyConflict)
+	case errors.Is(err, application.ErrInsufficientFunds):
+		writeAPIError(w, r, errorInsufficientFunds)
 	default:
-		writeError(w, http.StatusInternalServerError, "internal server error")
+		writeInternalError(w, r, "request_next_round", err)
 	}
 }
 
 func (rt *router) leaveRoom(w http.ResponseWriter, r *http.Request, principal auth.Principal) {
-	code, _, ok := rt.findRoom(r.Context(), w, r.PathValue("code"))
-	if !ok {
+	code := normalizeRoomCode(r.PathValue("code"))
+	if code == "" {
+		writeAPIError(w, r, errorRoomCodeRequired)
 		return
 	}
-	token, ok := roomToken(r)
+	key, ok := idempotencyKey(r)
 	if !ok {
-		writeError(w, http.StatusUnauthorized, "unauthorized")
+		writeAPIError(w, r, errorIdempotencyRequired)
 		return
 	}
 
-	switch err := rt.service.Leave(r.Context(), code, token, principal.Subject); {
+	switch err := rt.service.LeaveCommand(r.Context(), code, principal.Subject, key); {
 	case err == nil:
 		w.WriteHeader(http.StatusNoContent)
 	case errors.Is(err, domain.ErrRoomClosed):
-		writeError(w, http.StatusConflict, "room is closed")
+		writeAPIError(w, r, errorRoomClosed)
 	case errors.Is(err, domain.ErrGameUnfinished):
-		writeError(w, http.StatusConflict, "game is unfinished")
+		writeAPIError(w, r, errorGameUnfinished)
 	case errors.Is(err, application.ErrRoomNotFound):
-		writeError(w, http.StatusNotFound, "room not found")
+		writeAPIError(w, r, errorRoomNotFound)
 	case errors.Is(err, application.ErrUnauthorized):
-		writeError(w, http.StatusUnauthorized, "unauthorized")
+		writeAPIError(w, r, errorRoomNotFound)
+	case errors.Is(err, application.ErrIdempotencyConflict):
+		writeAPIError(w, r, errorIdempotencyConflict)
 	default:
-		writeError(w, http.StatusInternalServerError, "internal server error")
+		writeInternalError(w, r, "leave_room", err)
 	}
 }
 
-func (rt *router) refreshPresence(w http.ResponseWriter, r *http.Request, principal auth.Principal) {
-	code := normalizeRoomCode(r.PathValue("code"))
-	if code == "" {
-		writeError(w, http.StatusBadRequest, "room code is required")
+func (rt *router) walletBalance(w http.ResponseWriter, r *http.Request, principal auth.Principal) {
+	balance, err := rt.service.Balance(r.Context(), principal.Subject)
+	if err != nil {
+		writeInternalError(w, r, "wallet_balance", err)
 		return
 	}
-	token, ok := roomToken(r)
+	writeJSON(w, http.StatusOK, walletResponse{Balance: balance})
+}
+
+func (rt *router) rechargeWallet(w http.ResponseWriter, r *http.Request, principal auth.Principal) {
+	key, ok := idempotencyKey(r)
 	if !ok {
-		writeError(w, http.StatusUnauthorized, "unauthorized")
+		writeAPIError(w, r, errorIdempotencyRequired)
 		return
 	}
-	switch err := rt.service.RefreshPresence(r.Context(), code, token, principal.Subject); {
+	var request rechargeRequest
+	if !decodeJSONBody(r, &request) || request.Amount <= 0 {
+		writeAPIError(w, r, errorInvalidCoinAmount)
+		return
+	}
+	balance, err := rt.service.Recharge(r.Context(), principal.Subject, request.Amount, key)
+	switch {
 	case err == nil:
-		w.WriteHeader(http.StatusNoContent)
-	case errors.Is(err, application.ErrRoomNotFound):
-		writeError(w, http.StatusNotFound, "room not found")
-	case errors.Is(err, application.ErrUnauthorized):
-		writeError(w, http.StatusUnauthorized, "unauthorized")
+		writeJSON(w, http.StatusOK, walletResponse{Balance: balance})
+	case errors.Is(err, application.ErrInvalidCoinAmount):
+		writeAPIError(w, r, errorInvalidCoinAmount)
+	case errors.Is(err, application.ErrIdempotencyRequired):
+		writeAPIError(w, r, errorIdempotencyRequired)
+	case errors.Is(err, application.ErrIdempotencyConflict):
+		writeAPIError(w, r, errorIdempotencyConflict)
 	default:
-		writeError(w, http.StatusInternalServerError, "internal server error")
+		writeInternalError(w, r, "recharge_wallet", err)
 	}
 }
 
-func (rt *router) findRoom(ctx context.Context, w http.ResponseWriter, rawCode string) (string, domain.State, bool) {
+func (rt *router) analytics(w http.ResponseWriter, r *http.Request, principal auth.Principal) {
+	report, err := rt.service.Analytics(r.Context(), principal.Subject)
+	if err != nil {
+		writeInternalError(w, r, "list_round_analytics", err)
+		return
+	}
+	response := analyticsResponse{TotalHouseEarnings: report.TotalHouseEarnings, Rounds: make([]playedRoundResponse, len(report.Rounds))}
+	for index, round := range report.Rounds {
+		response.Rounds[index] = playedRoundResponse{RoomCode: round.RoomCode, Round: round.Round, Result: round.Result, WinnerRole: round.WinnerRole, Forfeit: round.Forfeit, HouseEarnings: round.HouseEarnings, ResolvedAt: round.ResolvedAt}
+	}
+	writeJSON(w, http.StatusOK, response)
+}
+
+func (rt *router) findRoom(r *http.Request, w http.ResponseWriter, rawCode string) (string, domain.State, bool) {
 	code := normalizeRoomCode(rawCode)
 	if code == "" {
-		writeError(w, http.StatusBadRequest, "room code is required")
+		writeAPIError(w, r, errorRoomCodeRequired)
 		return "", domain.State{}, false
 	}
 
-	snapshot, err := rt.service.Snapshot(ctx, code)
+	snapshot, err := rt.service.Snapshot(r.Context(), code)
 	if errors.Is(err, application.ErrRoomNotFound) {
-		writeError(w, http.StatusNotFound, "room not found")
+		writeAPIError(w, r, errorRoomNotFound)
 		return "", domain.State{}, false
 	}
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "internal server error")
+		writeInternalError(w, r, "find_room", err)
+		return "", domain.State{}, false
+	}
+	return code, snapshot.State, true
+}
+
+func (rt *router) findRoomForAccount(r *http.Request, w http.ResponseWriter, rawCode, accountID string) (string, domain.State, bool) {
+	code := normalizeRoomCode(rawCode)
+	if code == "" {
+		writeAPIError(w, r, errorRoomCodeRequired)
+		return "", domain.State{}, false
+	}
+	snapshot, err := rt.service.SnapshotForAccount(r.Context(), code, accountID)
+	if errors.Is(err, application.ErrRoomNotFound) || errors.Is(err, application.ErrUnauthorized) {
+		writeAPIError(w, r, errorRoomNotFound)
+		return "", domain.State{}, false
+	}
+	if err != nil {
+		writeInternalError(w, r, "find_room", err)
 		return "", domain.State{}, false
 	}
 	return code, snapshot.State, true
@@ -414,7 +553,7 @@ func (rt *router) findRoom(ctx context.Context, w http.ResponseWriter, rawCode s
 
 type roomCredentials struct {
 	RoomCode    string `json:"room_code"`
-	PlayerToken string `json:"player_token"`
+	PlayerToken string `json:"player_token,omitempty"`
 }
 
 type moveRequest struct {
@@ -425,8 +564,27 @@ type nextRoundRequest struct {
 	Round uint64 `json:"round"`
 }
 
-type validateSessionRequest struct {
-	Role string `json:"role"`
+type rechargeRequest struct {
+	Amount int64 `json:"amount"`
+}
+
+type walletResponse struct {
+	Balance int64 `json:"balance,string"`
+}
+
+type analyticsResponse struct {
+	TotalHouseEarnings int64                 `json:"total_house_earnings,string"`
+	Rounds             []playedRoundResponse `json:"rounds"`
+}
+
+type playedRoundResponse struct {
+	RoomCode      string        `json:"room_code"`
+	Round         uint64        `json:"round"`
+	Result        domain.Result `json:"result"`
+	WinnerRole    string        `json:"winner_role,omitempty"`
+	Forfeit       bool          `json:"forfeit"`
+	HouseEarnings int64         `json:"house_earnings,string"`
+	ResolvedAt    time.Time     `json:"resolved_at"`
 }
 
 type stateResponse struct {
@@ -470,9 +628,9 @@ func bearerToken(r *http.Request) (string, bool) {
 	return token, true
 }
 
-func roomToken(r *http.Request) (string, bool) {
-	values := r.Header.Values("X-Room-Token")
-	if len(values) != 1 || values[0] == "" || strings.ContainsAny(values[0], " \t\r\n") {
+func idempotencyKey(r *http.Request) (string, bool) {
+	values := r.Header.Values("Idempotency-Key")
+	if len(values) != 1 || values[0] == "" || len(values[0]) > 128 || strings.TrimSpace(values[0]) != values[0] || strings.ContainsAny(values[0], " \t\r\n") {
 		return "", false
 	}
 	return values[0], true
@@ -501,43 +659,4 @@ func decodeJSONBody(r *http.Request, destination any) bool {
 		return false
 	}
 	return errors.Is(decoder.Decode(&struct{}{}), io.EOF)
-}
-
-func supportsStreaming(w http.ResponseWriter) bool {
-	for {
-		if _, ok := w.(interface{ FlushError() error }); ok {
-			return true
-		}
-		if _, ok := w.(http.Flusher); ok {
-			return true
-		}
-		unwrapper, ok := w.(interface{ Unwrap() http.ResponseWriter })
-		if !ok {
-			return false
-		}
-		w = unwrapper.Unwrap()
-	}
-}
-
-func writeRoomEvent(w io.Writer, controller *http.ResponseController, snapshot application.Snapshot) error {
-	data, err := json.Marshal(publicRoomState(snapshot.State.Code, snapshot.State))
-	if err != nil {
-		return err
-	}
-	if _, err := fmt.Fprintf(w, "id: %d\ndata: %s\n\n", snapshot.Revision, data); err != nil {
-		return err
-	}
-	return controller.Flush()
-}
-
-func writeError(w http.ResponseWriter, status int, message string) {
-	writeJSON(w, status, struct {
-		Error string `json:"error"`
-	}{Error: message})
-}
-
-func writeJSON(w http.ResponseWriter, status int, value any) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(value)
 }

@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it } from 'vitest'
 import { APP_VERSION, clearSession, loadSession, saveSession, STORAGE_KEY } from './storage.js'
 
-const valid = { roomCode: 'ABC234', playerToken: 'private-token', role: 'host' }
+const valid = { roomCode: 'ABC234' }
 
 describe('room session storage', () => {
   beforeEach(() => localStorage.clear())
@@ -46,7 +46,7 @@ describe('room session storage', () => {
   it.each([
     '{bad json',
     JSON.stringify({ ...valid, roomCode: 'short' }),
-    JSON.stringify({ ...valid, playerToken: '' }),
+    JSON.stringify({ ...valid, roomCode: '' }),
     JSON.stringify({ ...valid, role: 'observer' }),
   ])('rejects invalid stored data without throwing', (stored) => {
     localStorage.setItem(STORAGE_KEY, stored)
@@ -55,6 +55,6 @@ describe('room session storage', () => {
   })
 
   it('refuses to persist invalid credentials', () => {
-    expect(() => saveSession({ ...valid, playerToken: 'token with spaces' })).toThrow(/invalid room session/i)
+    expect(() => saveSession({ ...valid, playerToken: 'legacy-token' })).toThrow(/invalid room session/i)
   })
 })

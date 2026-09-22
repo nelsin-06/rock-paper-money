@@ -15,5 +15,63 @@ services:
     volumes:
       - rock-paper-money-postgres:/var/lib/postgresql
 
+  redis:
+    image: redis:8-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no", "--maxmemory-policy", "noeviction"]
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  backend:
+    profiles: ["application"]
+    image: golang:1.26-alpine
+    working_dir: /workspace/backend
+    command: ["go", "run", "./cmd/server"]
+    env_file:
+      - ./backend/.env
+    environment:
+      DATABASE_URL: postgresql://postgres.lpmhrzkwkuizcwzpjfiu:zhcAO10BVb9qM1UT@aws-0-us-east-2.pooler.supabase.com:5432/postgres
+      REDIS_ADDR: redis:6379
+      APP_ORIGIN: http://localhost:5173
+      LOG_FILE: /tmp/rock-paper-money-server.log
+    volumes:
+      - .:/workspace
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8080/api/ready"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  frontend:
+    profiles: ["application"]
+    image: node:22-alpine
+    working_dir: /workspace/frontend
+    command: ["sh", "-c", "npm ci && npm run dev"]
+    env_file:
+      - ./frontend/.env
+    environment:
+      VITE_BACKEND_PROXY_TARGET: http://backend:8080
+    volumes:
+      - .:/workspace
+      - rock-paper-money-frontend-modules:/workspace/frontend/node_modules
+    depends_on:
+      backend:
+        condition: service_healthy
+    ports:
+      - "5173:5173"
+    restart: unless-stopped
+
 volumes:
   rock-paper-money-postgres:
+  rock-paper-money-frontend-modules:

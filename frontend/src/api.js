@@ -1,36 +1,62 @@
-import { getAccessToken } from './supabase.js'
-
 export class ApiError extends Error {
-  constructor(message, status = 0) {
+  constructor(message, status = 0, { code = '', requestId = '', rawError } = {}) {
     super(message)
     this.name = 'ApiError'
     this.status = status
+    this.code = code
+    this.requestId = requestId
+    if (typeof rawError === 'string' && rawError) this.rawError = rawError
   }
 }
 
-export const PRESENCE_HEARTBEAT_MS = 3000
+function csrfToken() {
+  const prefix = 'rpm_csrf='
+  const cookie = document.cookie.split(';').map((value) => value.trim()).find((value) => value.startsWith(prefix))
+  return cookie ? decodeURIComponent(cookie.slice(prefix.length)) : ''
+}
 
 async function request(path, options = {}) {
+  const { retryNetwork = false, ...fetchOptions } = options
+  const requestOptions = { credentials: 'same-origin', ...fetchOptions }
   let response
-  try {
-    response = await fetch(path, options)
-  } catch {
-    throw new ApiError('Cannot reach the game server. Check your connection and try again.')
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      response = await fetch(path, requestOptions)
+      break
+    } catch (error) {
+      if (error?.name === 'AbortError') throw error
+      if (attempt === 1 || !retryNetwork) {
+        throw new ApiError('Cannot reach the game server. Check your connection and try again.')
+      }
+    }
   }
 
   if (!response.ok) {
-    let message = `Request failed (${response.status}).`
+    const fallback = new ApiError(`Request failed (${response.status}).`, response.status, {
+      requestId: response.headers.get('X-Request-ID') ?? '',
+    })
+    let body
     try {
-      const body = await response.json()
-      if (typeof body.error === 'string' && body.error) message = body.error
+      body = await response.json()
     } catch {
-      // Keep the status-based fallback when an upstream response is not JSON.
+      // Preserve the status-based fallback for non-JSON upstream failures.
     }
-    throw new ApiError(message, response.status)
+    if (
+      body?.status === response.status &&
+      typeof body.code === 'string' && body.code &&
+      typeof body.message === 'string' && body.message &&
+      typeof body.meta?.time === 'string' && body.meta.time &&
+      typeof body.meta?.requestId === 'string' && body.meta.requestId
+    ) {
+      throw new ApiError(body.message, response.status, {
+        code: body.code,
+        requestId: body.meta.requestId,
+        rawError: body.rawError,
+      })
+    }
+    throw fallback
   }
-
   if (response.status === 204) return null
-
   try {
     return await response.json()
   } catch {
@@ -38,16 +64,22 @@ async function request(path, options = {}) {
   }
 }
 
-function mapCredentials(dto, role) {
-  if (typeof dto?.room_code !== 'string' || typeof dto?.player_token !== 'string') {
-    throw new ApiError('The game server returned invalid room credentials.')
-  }
-  return { roomCode: dto.room_code, playerToken: dto.player_token, role }
+function mutationHeaders({ json = false, idempotent = true, idempotencyKey } = {}) {
+  const csrf = csrfToken()
+  if (!csrf) throw new ApiError('Your browser session is missing its security token. Sign in again.', 401)
+  const headers = { 'X-CSRF-Token': csrf }
+  if (json) headers['Content-Type'] = 'application/json'
+  if (idempotent) headers['Idempotency-Key'] = idempotencyKey || crypto.randomUUID()
+  return headers
 }
 
-function mapRoomState(dto) {
-  if (!Array.isArray(dto?.players)) throw new ApiError('The game server returned an invalid room state.')
+function mapRoomReference(dto) {
+  if (typeof dto?.room_code !== 'string') throw new ApiError('The game server returned an invalid room reference.')
+  return { roomCode: dto.room_code }
+}
 
+export function mapRoomState(dto) {
+  if (!Array.isArray(dto?.players)) throw new ApiError('The game server returned an invalid room state.')
   return {
     roomCode: dto.room_code,
     ready: dto.ready,
@@ -66,84 +98,95 @@ function mapRoomState(dto) {
   }
 }
 
-async function protectedHeaders(roomToken) {
-  const headers = { Authorization: `Bearer ${await getAccessToken()}` }
-  if (roomToken) headers['X-Room-Token'] = roomToken
-  return headers
+function coinValue(value, field) {
+  if (typeof value !== 'string' || !/^\d+$/.test(value)) throw new ApiError(`The game server returned an invalid ${field}.`)
+  return value
+}
+
+export async function bootstrapSession(accessToken, { signal } = {}) {
+  if (typeof accessToken !== 'string' || !accessToken) throw new ApiError('Your account session has expired. Sign in again.', 401)
+  await request('/api/session', {
+    method: 'POST',
+    credentials: 'same-origin',
+    headers: { Authorization: `Bearer ${accessToken}` },
+    signal,
+  })
+}
+
+export async function logoutSession({ signal } = {}) {
+  await request('/api/session', {
+    method: 'DELETE',
+    credentials: 'same-origin',
+    headers: mutationHeaders({ idempotent: false }),
+    signal,
+  })
 }
 
 export async function createRoom({ signal } = {}) {
-  return mapCredentials(await request('/api/rooms', { method: 'POST', headers: await protectedHeaders(), signal }), 'host')
+  return mapRoomReference(await request('/api/rooms', {
+    method: 'POST', headers: mutationHeaders(), retryNetwork: true, signal,
+  }))
 }
 
 export async function joinRoom(code, { signal } = {}) {
   const normalized = code.trim().toUpperCase()
-  return mapCredentials(
-    await request(`/api/rooms/${encodeURIComponent(normalized)}/join`, { method: 'POST', headers: await protectedHeaders(), signal }),
-    'guest',
-  )
+  return mapRoomReference(await request(`/api/rooms/${encodeURIComponent(normalized)}/join`, {
+    method: 'POST', headers: mutationHeaders(), retryNetwork: true, signal,
+  }))
 }
 
 export async function getRoomState(code, { signal } = {}) {
-  const dto = await request(`/api/rooms/${encodeURIComponent(code)}/state`, { signal })
-  return mapRoomState(dto)
+  return mapRoomState(await request(`/api/rooms/${encodeURIComponent(code)}/state`, { signal }))
 }
 
-export async function validateSession(code, token, role, { signal } = {}) {
-  await request(`/api/rooms/${encodeURIComponent(code)}/validate-session`, {
-    method: 'POST',
-    headers: { ...await protectedHeaders(token), 'Content-Type': 'application/json' },
-    body: JSON.stringify({ role }),
-    signal,
-  })
-}
-
-export function subscribeToRoom(code, { onState, onOpen, onError }) {
-  const source = new EventSource(`/api/rooms/${encodeURIComponent(code)}/events`)
-  source.onopen = () => onOpen?.()
-  source.onmessage = (event) => {
-    try {
-      onState(mapRoomState(JSON.parse(event.data)))
-    } catch {
-      onError?.(new ApiError('The game server returned an invalid room update.'))
-    }
-  }
-  source.onerror = () => {
-    onError?.(new ApiError('Live room updates disconnected. Reconnecting…'))
-  }
-  return () => source.close()
-}
-
-export async function submitMove(code, token, move, { signal } = {}) {
+export async function submitMove(code, move, { signal } = {}) {
   await request(`/api/rooms/${encodeURIComponent(code)}/moves`, {
-    method: 'POST',
-    headers: { ...await protectedHeaders(token), 'Content-Type': 'application/json' },
-    body: JSON.stringify({ move }),
-    signal,
+    method: 'POST', headers: mutationHeaders({ json: true }), body: JSON.stringify({ move }), retryNetwork: true, signal,
   })
 }
 
-export async function startNextRound(code, token, round, { signal } = {}) {
+export async function startNextRound(code, round, { signal } = {}) {
   await request(`/api/rooms/${encodeURIComponent(code)}/next-round`, {
-    method: 'POST',
-    headers: { ...await protectedHeaders(token), 'Content-Type': 'application/json' },
-    body: JSON.stringify({ round }),
-    signal,
+    method: 'POST', headers: mutationHeaders({ json: true }), body: JSON.stringify({ round }), retryNetwork: true, signal,
   })
 }
 
-export async function leaveRoom(code, token, { signal } = {}) {
+export async function leaveRoom(code, { signal } = {}) {
   await request(`/api/rooms/${encodeURIComponent(code)}/leave`, {
-    method: 'POST',
-    headers: await protectedHeaders(token),
-    signal,
+    method: 'POST', headers: mutationHeaders(), retryNetwork: true, signal,
   })
 }
 
-export async function refreshPresence(code, token, { signal } = {}) {
-  await request(`/api/rooms/${encodeURIComponent(code)}/presence`, {
+export async function getWallet({ signal } = {}) {
+  const dto = await request('/api/wallet', { signal })
+  return { balance: coinValue(dto?.balance, 'wallet balance') }
+}
+
+export async function rechargeWallet(amount, idempotencyKey, { signal } = {}) {
+  if (typeof amount !== 'string' || !/^[1-9]\d*$/.test(amount)) throw new ApiError('Enter a positive whole coin amount.')
+  const dto = await request('/api/wallet/recharges', {
     method: 'POST',
-    headers: await protectedHeaders(token),
+    headers: mutationHeaders({ json: true, idempotencyKey }),
+    body: `{"amount":${amount}}`,
+    retryNetwork: true,
     signal,
   })
+  return { balance: coinValue(dto?.balance, 'wallet balance') }
+}
+
+export async function getRoundAnalytics({ signal } = {}) {
+  const dto = await request('/api/analytics/rounds', { signal })
+  if (!Array.isArray(dto?.rounds)) throw new ApiError('The game server returned invalid round analytics.')
+  return {
+    totalHouseEarnings: coinValue(dto.total_house_earnings, 'house earnings'),
+    rounds: dto.rounds.map((round) => ({
+      roomCode: round.room_code,
+      round: round.round,
+      result: round.result,
+      winnerRole: round.winner_role || null,
+      forfeit: round.forfeit,
+      houseEarnings: coinValue(round.house_earnings, 'round house earnings'),
+      resolvedAt: round.resolved_at,
+    })),
+  }
 }

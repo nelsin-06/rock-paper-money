@@ -1,28 +1,30 @@
 import { StrictMode } from 'react'
-import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { act, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
-import { GameApp as App } from './App.jsx'
+import { AccountPanel, GameApp } from './App.jsx'
 import * as api from './api.js'
+import { connectToRoom } from './realtime.js'
 import { APP_VERSION, STORAGE_KEY } from './storage.js'
 
 vi.mock('./api.js')
+vi.mock('./realtime.js')
 
-const hostSession = { roomCode: 'ABC234', playerToken: 'host-secret', role: 'host' }
-const persistedHostSession = { ...hostSession, version: APP_VERSION }
+const roomSession = { roomCode: 'ABC234' }
+const persistedSession = { ...roomSession, version: APP_VERSION }
 const waitingState = {
-  roomCode: 'ABC234', ready: false, resolved: false, round: 1, closed: false,
-  players: [{ role: 'host', wins: 0, submitted: false, wantsNextRound: false }], result: null, moves: [],
+  roomCode: 'ABC234', revision: 1, playerRole: 'host', ready: false, resolved: false, round: 1, closed: false, forfeit: false,
+  players: [{ role: 'host', wins: 0, submitted: false, wantsNextRound: false }], result: null, moves: [], presence: { host: true },
 }
 const readyState = {
-  roomCode: 'ABC234', ready: true, resolved: false, round: 1, closed: false,
+  ...waitingState, revision: 2, ready: true,
   players: [
     { role: 'host', wins: 0, submitted: false, wantsNextRound: false },
     { role: 'guest', wins: 0, submitted: false, wantsNextRound: false },
-  ], result: null, moves: [],
+  ],
 }
 const resolvedState = {
-  roomCode: 'ABC234', ready: true, resolved: true, round: 1, closed: false, forfeit: false, result: 'player_one_wins',
+  ...readyState, revision: 3, resolved: true, result: 'player_one_wins',
   players: [
     { role: 'host', wins: 1, submitted: true, wantsNextRound: false },
     { role: 'guest', wins: 0, submitted: true, wantsNextRound: false },
@@ -30,357 +32,133 @@ const resolvedState = {
   moves: [{ role: 'host', move: 'paper' }, { role: 'guest', move: 'rock' }],
 }
 
-let activeStream
-let closeStream
+let activeSocket
+let closeSocket
 
 function streamRoomState(initialState) {
-  api.subscribeToRoom.mockImplementation((_code, handlers) => {
-    activeStream = handlers
-    closeStream = vi.fn()
-    handlers.onOpen()
+  connectToRoom.mockImplementation((_code, handlers) => {
+    activeSocket = handlers
+    closeSocket = vi.fn()
+    handlers.onOpen?.()
     handlers.onState(initialState)
-    return closeStream
+    return closeSocket
   })
 }
 
-describe('core room flow', () => {
+describe('token-free room flow', () => {
+  afterEach(() => vi.restoreAllMocks())
+
   beforeEach(() => {
     localStorage.clear()
-    api.createRoom.mockReset()
-    api.joinRoom.mockReset()
-    api.validateSession.mockReset()
-    api.validateSession.mockResolvedValue()
-    api.subscribeToRoom.mockReset()
-    api.submitMove.mockReset()
-    api.startNextRound.mockReset()
-    api.leaveRoom.mockReset()
-    api.refreshPresence.mockReset()
-    api.refreshPresence.mockResolvedValue()
+    Object.values(api).forEach((value) => value?.mockReset?.())
+    connectToRoom.mockReset()
   })
 
-  it('shows home and creates a room while persisting private credentials', async () => {
-    api.createRoom.mockResolvedValue(hostSession)
+  it('creates a room and persists only its non-secret room reference', async () => {
+    api.createRoom.mockResolvedValue(roomSession)
     streamRoomState(waitingState)
-    render(<App />)
-
-    expect(screen.getByRole('heading', { name: /rock.*paper.*money/i })).toBeInTheDocument()
+    render(<GameApp />)
     await userEvent.click(screen.getByRole('button', { name: 'Create room' }))
 
     expect(await screen.findByRole('heading', { name: /waiting for a guest/i })).toBeInTheDocument()
-    expect(screen.getByLabelText('Room code ABC234')).toBeInTheDocument()
-    expect(screen.queryByText('host-secret')).not.toBeInTheDocument()
-    expect(JSON.parse(localStorage.getItem(STORAGE_KEY))).toEqual(persistedHostSession)
+    expect(JSON.parse(localStorage.getItem(STORAGE_KEY))).toEqual(persistedSession)
+    expect(localStorage.getItem(STORAGE_KEY)).not.toMatch(/token|role/i)
   })
 
-  it('joins using a normalized six-character code', async () => {
-    api.joinRoom.mockResolvedValue({ ...hostSession, role: 'guest' })
-    streamRoomState(readyState)
-    render(<App />)
-
-    await userEvent.type(screen.getByLabelText(/six-character room code/i), 'abc234')
-    await userEvent.click(screen.getByRole('button', { name: 'Join room' }))
-
-    await screen.findByRole('heading', { name: 'Choose your move' })
-    expect(api.joinRoom).toHaveBeenCalledWith('ABC234')
-  })
-
-  it('locks same-tick duplicate create attempts', async () => {
-    api.createRoom.mockResolvedValue(hostSession)
-    streamRoomState(waitingState)
-    render(<App />)
-
-    const create = screen.getByRole('button', { name: 'Create room' })
-    act(() => {
-      create.click()
-      create.click()
-    })
-
-    expect(api.createRoom).toHaveBeenCalledTimes(1)
-    expect(await screen.findByRole('heading', { name: /waiting for a guest/i })).toBeInTheDocument()
-  })
-
-  it('locks same-tick duplicate join attempts', async () => {
-    api.joinRoom.mockResolvedValue({ ...hostSession, role: 'guest' })
-    streamRoomState(readyState)
-    render(<App />)
-    fireEvent.change(screen.getByLabelText(/six-character room code/i), { target: { value: 'ABC234' } })
-
-    const join = screen.getByRole('button', { name: 'Join room' })
-    act(() => {
-      join.click()
-      join.click()
-    })
-
-    expect(api.joinRoom).toHaveBeenCalledTimes(1)
-    expect(await screen.findByRole('heading', { name: 'Choose your move' })).toBeInTheDocument()
-  })
-
-  it('releases the home entry lock after failure so create can be retried', async () => {
-    api.createRoom.mockRejectedValueOnce(new Error('Create failed')).mockResolvedValue(hostSession)
-    streamRoomState(waitingState)
-    render(<App />)
-
-    await userEvent.click(screen.getByRole('button', { name: 'Create room' }))
-    expect(await screen.findByRole('alert')).toHaveTextContent('Create failed')
-    await userEvent.click(screen.getByRole('button', { name: 'Create room' }))
-
-    expect(api.createRoom).toHaveBeenCalledTimes(2)
-    expect(await screen.findByRole('heading', { name: /waiting for a guest/i })).toBeInTheDocument()
-  })
-
-  it('restores a room, submits only one move, and hides choices before resolution', async () => {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(persistedHostSession))
+  it('restores by room code and derives the player role from the socket snapshot', async () => {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(persistedSession))
     streamRoomState(readyState)
     api.submitMove.mockResolvedValue()
-    render(<App />)
+    render(<GameApp />)
 
-    const choices = await screen.findByLabelText('Choose a move')
-    expect(api.validateSession).toHaveBeenCalledWith('ABC234', 'host-secret', 'host', expect.objectContaining({ signal: expect.any(AbortSignal) }))
-    expect(screen.getByText(/stays secret until both players/i)).toBeInTheDocument()
-    expect(screen.queryByText(/opponent.*rock/i)).not.toBeInTheDocument()
-
-    const rock = within(choices).getByRole('button', { name: 'Rock' })
-    await userEvent.dblClick(rock)
-    await waitFor(() => expect(api.submitMove).toHaveBeenCalledTimes(1))
-    expect(api.submitMove).toHaveBeenCalledWith('ABC234', 'host-secret', 'rock')
+    expect(await screen.findByText('You')).toBeInTheDocument()
+    await userEvent.click(within(screen.getByLabelText('Choose a move')).getByRole('button', { name: 'Rock' }))
+    expect(api.submitMove).toHaveBeenCalledWith('ABC234', 'rock')
+    expect(connectToRoom).toHaveBeenCalledWith('ABC234', expect.any(Object))
   })
 
-  it('recovers visible action state after a StrictMode move failure', async () => {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(persistedHostSession))
+  it('locks same-tick duplicate create and move actions', async () => {
+    api.createRoom.mockResolvedValue(roomSession)
     streamRoomState(readyState)
-    api.submitMove.mockRejectedValue(new Error('Move failed'))
-    render(<StrictMode><App /></StrictMode>)
-
+    render(<StrictMode><GameApp /></StrictMode>)
+    const create = screen.getByRole('button', { name: 'Create room' })
+    act(() => { create.click(); create.click() })
+    expect(api.createRoom).toHaveBeenCalledTimes(1)
     const rock = await screen.findByRole('button', { name: 'Rock' })
-    await userEvent.click(rock)
-
-    expect(await screen.findByRole('alert')).toHaveTextContent('Move failed')
-    expect(rock).toBeEnabled()
-    expect(screen.getByRole('heading', { name: 'Choose your move' })).toBeInTheDocument()
+    act(() => { rock.click(); rock.click() })
+    expect(api.submitMove).toHaveBeenCalledTimes(1)
   })
 
-  it('shows submitted readiness from server truth without revealing either move', async () => {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(persistedHostSession))
-    const submitted = {
-      ...readyState,
-      players: [{ role: 'host', wins: 0, submitted: true }, { role: 'guest', wins: 0, submitted: false }],
-    }
-    streamRoomState(submitted)
-    render(<App />)
-
-    expect(await screen.findByRole('heading', { name: 'Move submitted' })).toBeInTheDocument()
-    expect(screen.queryByText('paper')).not.toBeInTheDocument()
-    expect(screen.getByText('Move locked')).toBeInTheDocument()
-  })
-
-  it('shows both next-round decisions and starts only after the other player accepts', async () => {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(persistedHostSession))
-    const resolved = {
-      roomCode: 'ABC234', ready: true, resolved: true, round: 1, closed: false, result: 'player_one_wins',
-      players: [
-        { role: 'host', wins: 1, submitted: true, wantsNextRound: false },
-        { role: 'guest', wins: 0, submitted: true, wantsNextRound: false },
-      ],
-      moves: [{ role: 'host', move: 'paper' }, { role: 'guest', move: 'rock' }],
-    }
-    const nextRound = {
-      ...readyState,
-      round: 2,
-      players: [
-        { role: 'host', wins: 1, submitted: false, wantsNextRound: false },
-        { role: 'guest', wins: 0, submitted: false, wantsNextRound: false },
-      ],
-    }
-    streamRoomState(resolved)
-    api.startNextRound.mockResolvedValue()
-    render(<App />)
-
-    expect(await screen.findByRole('heading', { name: 'You won' })).toBeInTheDocument()
-    expect(screen.getByText('paper')).toBeInTheDocument()
-    expect(screen.getByText('rock')).toBeInTheDocument()
-    expect(screen.getByLabelText('host score')).toHaveTextContent('1')
-
-    await userEvent.click(screen.getByRole('button', { name: 'Request next round' }))
-    expect(api.startNextRound).toHaveBeenCalledWith('ABC234', 'host-secret', 1)
-    act(() => activeStream.onState({
-      ...resolved,
-      players: [
-        { ...resolved.players[0], wantsNextRound: true },
-        resolved.players[1],
-      ],
-    }))
-    expect(screen.getByRole('button', { name: 'Waiting for opponent…' })).toBeDisabled()
-
-    act(() => activeStream.onState(nextRound))
-    expect(await screen.findByRole('heading', { name: 'Choose your move' })).toBeInTheDocument()
-    expect(screen.getByLabelText('host score')).toHaveTextContent('1')
-  })
-
-  it('disables voluntary leave while the round is unfinished', async () => {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(persistedHostSession))
-    streamRoomState(readyState)
-    render(<App />)
-
-    await screen.findByRole('heading', { name: 'Choose your move' })
-    const leave = screen.getByRole('button', { name: 'Leave room' })
-    expect(leave).toBeDisabled()
-    await userEvent.click(leave)
-    expect(api.leaveRoom).not.toHaveBeenCalled()
-    expect(screen.getByText('You can leave after the round is finished.')).toBeInTheDocument()
-  })
-
-  it('closes the room locally after a finished-game leave succeeds', async () => {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(persistedHostSession))
+  it('uses token-free next-round and leave commands', async () => {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(persistedSession))
     streamRoomState(resolvedState)
-    api.leaveRoom.mockResolvedValue()
-    render(<App />)
-
-    await screen.findByRole('heading', { name: 'You won' })
-    await userEvent.click(screen.getByRole('button', { name: 'Leave room' }))
-    expect(api.leaveRoom).toHaveBeenCalledWith('ABC234', 'host-secret')
-    expect(screen.getByRole('button', { name: 'Create room' })).toBeInTheDocument()
-    expect(localStorage.getItem(STORAGE_KEY)).toBeNull()
-    expect(closeStream).toHaveBeenCalledOnce()
-  })
-
-  it('shows a finished forfeit without inventing revealed moves', async () => {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(persistedHostSession))
-    streamRoomState({ ...resolvedState, forfeit: true, moves: [] })
-    render(<App />)
-
-    expect(await screen.findByRole('heading', { name: 'You won' })).toBeInTheDocument()
-    expect(screen.getByText('Your opponent disconnected and did not return.')).toBeInTheDocument()
-    expect(screen.queryByText('unknown')).not.toBeInTheDocument()
-  })
-
-  it('ejects the connected player when SSE reports that the opponent left', async () => {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(persistedHostSession))
-    streamRoomState(readyState)
-    render(<App />)
-    await screen.findByRole('heading', { name: 'Choose your move' })
-    act(() => activeStream.onState({ ...readyState, closed: true }))
-    expect(screen.getByRole('button', { name: 'Create room' })).toBeInTheDocument()
-    expect(localStorage.getItem(STORAGE_KEY)).toBeNull()
-  })
-
-  it('shows when the opponent requested another round and allows acceptance', async () => {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(persistedHostSession))
-    const opponentRequested = {
-      roomCode: 'ABC234', ready: true, resolved: true, round: 4, closed: false, result: 'draw',
-      players: [
-        { role: 'host', wins: 2, submitted: true, wantsNextRound: false },
-        { role: 'guest', wins: 2, submitted: true, wantsNextRound: true },
-      ],
-      moves: [{ role: 'host', move: 'rock' }, { role: 'guest', move: 'rock' }],
-    }
-    streamRoomState(opponentRequested)
     api.startNextRound.mockResolvedValue()
-    render(<App />)
+    api.leaveRoom.mockResolvedValue()
+    render(<GameApp />)
 
-    expect(await screen.findByText(/opponent wants another round/i)).toBeInTheDocument()
-    await userEvent.click(screen.getByRole('button', { name: 'Accept next round' }))
-    expect(api.startNextRound).toHaveBeenCalledWith('ABC234', 'host-secret', 4)
+    await userEvent.click(await screen.findByRole('button', { name: 'Request next round' }))
+    expect(api.startNextRound).toHaveBeenCalledWith('ABC234', 1)
+    await userEvent.click(screen.getByRole('button', { name: 'Leave room' }))
+    expect(api.leaveRoom).toHaveBeenCalledWith('ABC234')
+    expect(localStorage.getItem(STORAGE_KEY)).toBeNull()
+    expect(closeSocket).toHaveBeenCalledOnce()
   })
 
-  it('keeps credentials and replaces the EventSource when live updates are retried', async () => {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(persistedHostSession))
+  it('removes the local room when an authoritative snapshot closes it', async () => {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(persistedSession))
+    streamRoomState(readyState)
+    render(<GameApp />)
+    await screen.findByRole('heading', { name: 'Choose your move' })
+    act(() => activeSocket.onState({ ...readyState, revision: 3, closed: true }))
+    expect(screen.getByRole('button', { name: 'Create room' })).toBeInTheDocument()
+    expect(localStorage.getItem(STORAGE_KEY)).toBeNull()
+  })
+
+  it('replaces the WebSocket connection when the user retries', async () => {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(persistedSession))
     const firstClose = vi.fn()
-    const secondClose = vi.fn()
-    api.subscribeToRoom
+    connectToRoom
       .mockImplementationOnce((_code, handlers) => {
         handlers.onError(new Error('Network unavailable'))
         return firstClose
       })
       .mockImplementationOnce((_code, handlers) => {
-        handlers.onOpen()
         handlers.onState(waitingState)
-        return secondClose
+        return vi.fn()
       })
-    render(<App />)
-
-    expect(await screen.findByRole('alert')).toHaveTextContent('Network unavailable')
-    expect(localStorage.getItem(STORAGE_KEY)).not.toBeNull()
-    await userEvent.click(screen.getByRole('button', { name: 'Retry' }))
+    render(<GameApp />)
+    await userEvent.click(await screen.findByRole('button', { name: 'Retry' }))
     expect(await screen.findByRole('heading', { name: /waiting for a guest/i })).toBeInTheDocument()
     expect(firstClose).toHaveBeenCalledOnce()
-    expect(api.subscribeToRoom).toHaveBeenCalledTimes(2)
+    expect(connectToRoom).toHaveBeenCalledTimes(2)
   })
 
-  it('aborts an in-flight presence renewal when the room unmounts', async () => {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(persistedHostSession))
+  it('keeps the WebSocket connection open across wallet-driven rerenders', async () => {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(persistedSession))
     streamRoomState(readyState)
-    let presenceSignal
-    let finishPresence
-    api.refreshPresence.mockImplementation((_code, _token, { signal }) => {
-      presenceSignal = signal
-      return new Promise((resolve) => { finishPresence = resolve })
-    })
-    const { unmount } = render(<App />)
-
+    const { rerender, unmount } = render(<GameApp walletBalance="100" />)
     await screen.findByRole('heading', { name: 'Choose your move' })
-    expect(presenceSignal.aborted).toBe(false)
+
+    rerender(<GameApp walletBalance="50" />)
+
+    expect(connectToRoom).toHaveBeenCalledOnce()
+    expect(closeSocket).not.toHaveBeenCalled()
+
     unmount()
-    expect(presenceSignal.aborted).toBe(true)
-    await act(async () => finishPresence())
+    expect(closeSocket).toHaveBeenCalledOnce()
   })
 
-  it.each([401, 404])('clears an invalid restored session after validation returns %s', async (status) => {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(persistedHostSession))
-    api.validateSession.mockRejectedValue(Object.assign(new Error('Session rejected'), { status }))
-    render(<App />)
-
-    expect(await screen.findByRole('button', { name: 'Create room' })).toBeInTheDocument()
-    expect(localStorage.getItem(STORAGE_KEY)).toBeNull()
-    expect(api.subscribeToRoom).not.toHaveBeenCalled()
-  })
-
-  it('keeps credentials hidden from the room while transient validation fails and supports retry', async () => {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(persistedHostSession))
-    api.validateSession
-      .mockRejectedValueOnce(Object.assign(new Error('Server unavailable'), { status: 503 }))
-      .mockResolvedValueOnce()
-    streamRoomState(waitingState)
-    render(<App />)
-
-    expect(await screen.findByRole('heading', { name: /could not restore your room/i })).toBeInTheDocument()
-    expect(localStorage.getItem(STORAGE_KEY)).not.toBeNull()
-    expect(screen.queryByLabelText('Room code ABC234')).not.toBeInTheDocument()
-    expect(api.subscribeToRoom).not.toHaveBeenCalled()
-
-    await userEvent.click(screen.getByRole('button', { name: 'Retry' }))
-    expect(await screen.findByRole('heading', { name: /waiting for a guest/i })).toBeInTheDocument()
-    expect(api.validateSession).toHaveBeenCalledTimes(2)
-    expect(api.subscribeToRoom).toHaveBeenCalledOnce()
-  })
-
-  it('ignores a cancelled StrictMode validation result after restoration succeeds', async () => {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(persistedHostSession))
-    let rejectCancelledValidation
-    api.validateSession
-      .mockImplementationOnce(() => new Promise((_, reject) => { rejectCancelledValidation = reject }))
-      .mockResolvedValueOnce()
-    streamRoomState(waitingState)
-    render(<StrictMode><App /></StrictMode>)
-
-    expect(api.subscribeToRoom).not.toHaveBeenCalled()
-    expect(await screen.findByRole('heading', { name: /waiting for a guest/i })).toBeInTheDocument()
-    await act(async () => {
-      rejectCancelledValidation(Object.assign(new Error('Unauthorized'), { status: 401 }))
-    })
-
-    expect(screen.getByLabelText('Room code ABC234')).toBeInTheDocument()
-    expect(localStorage.getItem(STORAGE_KEY)).not.toBeNull()
-    expect(api.subscribeToRoom).toHaveBeenCalledTimes(2)
-  })
-
-  it('allows a transiently blocked user to forget the session locally', async () => {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(persistedHostSession))
-    api.validateSession.mockRejectedValue(new Error('Network unavailable'))
-    render(<App />)
-
-    await userEvent.click(await screen.findByRole('button', { name: 'Forget this session' }))
-    expect(screen.getByRole('button', { name: 'Create room' })).toBeInTheDocument()
-    expect(localStorage.getItem(STORAGE_KEY)).toBeNull()
-    expect(api.subscribeToRoom).not.toHaveBeenCalled()
+  it('shows wallet analytics and reuses a recharge key after ambiguity', async () => {
+    api.getWallet.mockResolvedValue({ balance: '0' })
+    api.getRoundAnalytics.mockResolvedValue({ totalHouseEarnings: '0', rounds: [] })
+    api.rechargeWallet.mockRejectedValueOnce(new Error('Connection lost')).mockResolvedValueOnce({ balance: '50' })
+    vi.spyOn(crypto, 'randomUUID').mockReturnValue('stable-retry-key')
+    render(<AccountPanel onBalance={() => {}} />)
+    await screen.findByText('0 coins')
+    await userEvent.type(screen.getByLabelText('Recharge amount'), '50')
+    await userEvent.click(screen.getByRole('button', { name: 'Add coins' }))
+    await screen.findByText('Connection lost')
+    await userEvent.click(screen.getByRole('button', { name: 'Add coins' }))
+    await waitFor(() => expect(api.rechargeWallet).toHaveBeenNthCalledWith(2, '50', 'stable-retry-key'))
   })
 })

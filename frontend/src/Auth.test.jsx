@@ -14,6 +14,7 @@ vi.mock('./supabase.js', () => ({ supabase: { auth } }))
 vi.mock('./api.js')
 
 import App from './App.jsx'
+import * as api from './api.js'
 
 describe('account authentication boundary', () => {
   let authStateChanged
@@ -26,6 +27,8 @@ describe('account authentication boundary', () => {
       authStateChanged = listener
       return { data: { subscription: { unsubscribe: vi.fn() } } }
     })
+    api.bootstrapSession.mockReset().mockResolvedValue()
+    api.logoutSession.mockReset().mockResolvedValue()
   })
 
   it('restores a Supabase session before enabling game actions', async () => {
@@ -38,6 +41,7 @@ describe('account authentication boundary', () => {
 
     expect(await screen.findByRole('button', { name: 'Create room' })).toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Sign out' })).toBeInTheDocument()
+    expect(api.bootstrapSession).toHaveBeenCalledWith('current')
   })
 
   it('signs in with email and password', async () => {
@@ -50,6 +54,7 @@ describe('account authentication boundary', () => {
     await userEvent.click(screen.getByRole('button', { name: 'Sign in' }))
 
     expect(auth.signInWithPassword).toHaveBeenCalledWith({ email: 'player@example.com', password: 'secret12' })
+    expect(api.bootstrapSession).toHaveBeenCalledWith('current')
     expect(await screen.findByRole('button', { name: 'Create room' })).toBeInTheDocument()
   })
 
@@ -75,6 +80,20 @@ describe('account authentication boundary', () => {
     expect(screen.getByRole('button', { name: 'Create room' })).toBeInTheDocument()
   })
 
+  it('serializes duplicate bootstrap signals for the same browser session', async () => {
+    let resolveBootstrap
+    api.bootstrapSession.mockReturnValue(new Promise((resolve) => { resolveBootstrap = resolve }))
+    auth.getSession.mockResolvedValue({ data: { session: { access_token: 'current' } }, error: null })
+    render(<App />)
+    await waitFor(() => expect(api.bootstrapSession).toHaveBeenCalledOnce())
+
+    act(() => authStateChanged('TOKEN_REFRESHED', { access_token: 'current' }))
+    await act(async () => resolveBootstrap())
+
+    expect(await screen.findByRole('button', { name: 'Create room' })).toBeInTheDocument()
+    expect(api.bootstrapSession).toHaveBeenCalledOnce()
+  })
+
   it('shows email confirmation pending when registration has no session', async () => {
     auth.signUp.mockResolvedValue({ data: { user: { id: 'user' }, session: null }, error: null })
     render(<App />)
@@ -95,6 +114,7 @@ describe('account authentication boundary', () => {
     await userEvent.click(await screen.findByRole('button', { name: 'Sign out' }))
 
     await waitFor(() => expect(auth.signOut).toHaveBeenCalledOnce())
+    expect(api.logoutSession).toHaveBeenCalledOnce()
     expect(await screen.findByRole('heading', { name: 'Sign in to play' })).toBeInTheDocument()
   })
 })

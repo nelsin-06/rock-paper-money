@@ -125,6 +125,19 @@ func TestLeaveClosesRoom(t *testing.T) {
 	}
 }
 
+func TestSoleWaitingPlayerMayLeave(t *testing.T) {
+	r, err := domain.New("ROOM", "host")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Leave("host"); err != nil {
+		t.Fatalf("waiting host leave error = %v", err)
+	}
+	if !r.State().Closed {
+		t.Fatal("waiting room not closed")
+	}
+}
+
 func TestForfeitAwardsOpponentExactlyOnce(t *testing.T) {
 	r := readyRoom(t)
 	if err := r.Forfeit("guest", 1); err != nil {
@@ -154,6 +167,70 @@ func TestForfeitAwardsOpponentExactlyOnce(t *testing.T) {
 	}
 	if !restored.State().Forfeit || restored.State().Players[0].Wins != 1 {
 		t.Fatalf("restored forfeit = %#v", restored.State())
+	}
+}
+
+func TestDeadlineResolutionUsesCommittedMovesAndIsImmutable(t *testing.T) {
+	tests := []struct {
+		name       string
+		moves      map[string]domain.Move
+		wantResult domain.Result
+		wantWins   [2]int
+	}{
+		{name: "zero moves draw", moves: map[string]domain.Move{}, wantResult: domain.Draw},
+		{name: "host move wins", moves: map[string]domain.Move{"host": domain.Rock}, wantResult: domain.PlayerOneWins, wantWins: [2]int{1, 0}},
+		{name: "guest move wins", moves: map[string]domain.Move{"guest": domain.Paper}, wantResult: domain.PlayerTwoWins, wantWins: [2]int{0, 1}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := readyRoom(t)
+			for playerID, move := range tt.moves {
+				if err := r.SubmitMove(playerID, move); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := r.ResolveInactivity(1); err != nil {
+				t.Fatal(err)
+			}
+			state := r.State()
+			if !state.Resolved || state.Result != tt.wantResult || state.Players[0].Wins != tt.wantWins[0] || state.Players[1].Wins != tt.wantWins[1] {
+				t.Fatalf("deadline state = %#v", state)
+			}
+			if err := r.ResolveInactivity(1); !errors.Is(err, domain.ErrRoundResolved) {
+				t.Fatalf("duplicate deadline error = %v", err)
+			}
+			restored, err := domain.Restore(r.PersistenceState())
+			if err != nil || restored.State().Result != tt.wantResult {
+				t.Fatalf("restore deadline result = %#v, error = %v", restored, err)
+			}
+		})
+	}
+
+	completed := readyRoom(t)
+	if err := completed.SubmitMove("host", domain.Rock); err != nil {
+		t.Fatal(err)
+	}
+	if err := completed.SubmitMove("guest", domain.Scissors); err != nil {
+		t.Fatal(err)
+	}
+	if err := completed.ResolveInactivity(1); !errors.Is(err, domain.ErrRoundResolved) {
+		t.Fatalf("completed round deadline error = %v", err)
+	}
+	if got := completed.State(); got.Result != domain.PlayerOneWins || got.Players[0].Wins != 1 {
+		t.Fatalf("completed round changed = %#v", got)
+	}
+}
+
+func TestDeadlineDrawOverridesPartialMoveForBothAbsent(t *testing.T) {
+	r := readyRoom(t)
+	if err := r.SubmitMove("host", domain.Rock); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.ResolveDeadlineDraw(1); err != nil {
+		t.Fatal(err)
+	}
+	if got := r.State(); !got.Resolved || got.Result != domain.Draw || got.Players[0].Wins != 0 || got.Players[1].Wins != 0 {
+		t.Fatalf("disconnect draw = %#v", got)
 	}
 }
 func readyRoom(t *testing.T) *domain.Room {

@@ -1,5 +1,8 @@
-import { useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import * as api from './api.js'
+import { connectToRoom } from './realtime.js'
+import firstMove from './assets/first-move.png'
+import secondMove from './assets/second-move.png'
 import { clearSession, loadSession, saveSession } from './storage.js'
 import { supabase } from './supabase.js'
 
@@ -13,7 +16,125 @@ function displayError(error) {
   return error instanceof Error ? error.message : 'Something went wrong. Please try again.'
 }
 
-function Home({ onEnterRoom }) {
+const ECONOMY_CHANGED_EVENT = 'rock-paper-money:economy-changed'
+export const ERROR_NOTICE_DURATION_MS = 5000
+
+function signalEconomyChanged() {
+  window.dispatchEvent(new Event(ECONOMY_CHANGED_EVENT))
+}
+
+export function ErrorNotice({ message, onDismiss, children }) {
+  const dismissRef = useRef(onDismiss)
+
+  useEffect(() => {
+    dismissRef.current = onDismiss
+  }, [onDismiss])
+
+  useEffect(() => {
+    if (!message) return undefined
+    const timeout = window.setTimeout(() => dismissRef.current(), ERROR_NOTICE_DURATION_MS)
+    return () => window.clearTimeout(timeout)
+  }, [message])
+
+  if (!message) return null
+  return (
+    <div className="notice notice-error" role="alert">
+      <span>{message}</span>
+      <div className="notice-actions">
+        {children}
+        <button className="notice-dismiss" type="button" aria-label="Dismiss error" onClick={onDismiss}>×</button>
+      </div>
+    </div>
+  )
+}
+
+export function AccountPanel({ onBalance }) {
+  const [balance, setBalance] = useState(null)
+  const [amount, setAmount] = useState('')
+  const [analytics, setAnalytics] = useState({ totalHouseEarnings: '0', rounds: [] })
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState('')
+  const pendingRechargeRef = useRef(null)
+
+  const refresh = useCallback(async () => {
+    try {
+      const [wallet, report] = await Promise.all([api.getWallet(), api.getRoundAnalytics()])
+      setBalance(wallet.balance)
+      onBalance(wallet.balance)
+      setAnalytics(report)
+      setError('')
+    } catch (requestError) {
+      setError(displayError(requestError))
+    }
+  }, [onBalance])
+
+  useEffect(() => {
+    const initialRefresh = window.setTimeout(refresh, 0)
+    window.addEventListener(ECONOMY_CHANGED_EVENT, refresh)
+    return () => {
+      window.clearTimeout(initialRefresh)
+      window.removeEventListener(ECONOMY_CHANGED_EVENT, refresh)
+    }
+  }, [refresh])
+
+  async function recharge(event) {
+    event.preventDefault()
+    if (!/^[1-9]\d*$/.test(amount)) {
+      setError('Enter a positive whole coin amount.')
+      return
+    }
+    setBusy(true)
+    setError('')
+    if (pendingRechargeRef.current?.amount !== amount) {
+      pendingRechargeRef.current = { amount, key: crypto.randomUUID() }
+    }
+    try {
+      const wallet = await api.rechargeWallet(amount, pendingRechargeRef.current.key)
+      setBalance(wallet.balance)
+      onBalance(wallet.balance)
+      setAmount('')
+      pendingRechargeRef.current = null
+    } catch (requestError) {
+      setError(displayError(requestError))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <aside className="economy-panel" aria-label="Coin wallet and round analytics">
+      <section className="wallet-card">
+        <div><p className="eyebrow">Coin wallet</p><strong>{balance ?? '…'} coins</strong></div>
+        <form className="recharge-form" onSubmit={recharge}>
+          <label htmlFor="recharge-amount">Recharge amount</label>
+          <input id="recharge-amount" inputMode="numeric" pattern="[1-9][0-9]*" value={amount} onChange={(event) => {
+            setAmount(event.target.value.replace(/\D/g, ''))
+            pendingRechargeRef.current = null
+          }} placeholder="100" />
+          <button className="button button-secondary" disabled={busy || !amount}>{busy ? 'Recharging…' : 'Add coins'}</button>
+        </form>
+        <ErrorNotice message={error} onDismiss={() => setError('')} />
+      </section>
+      <section className="analytics-card" aria-labelledby="analytics-title">
+        <div className="house-banner"><span>Total house earnings</span><strong>{analytics.totalHouseEarnings} coins</strong></div>
+        <h2 id="analytics-title">Played rounds</h2>
+        {analytics.rounds.length === 0 ? <p>No paid rounds have been played yet.</p> : (
+          <div className="analytics-list">
+            {analytics.rounds.map((round) => (
+              <article key={`${round.roomCode}:${round.round}`}>
+                <strong>{round.roomCode} · Round {round.round}</strong>
+                <span>{round.result === 'draw' ? 'Draw' : `${round.winnerRole === 'host' ? 'Host' : 'Guest'} won${round.forfeit ? ' by forfeit' : ''}`}</span>
+                <span>House: {round.houseEarnings} coins</span>
+              </article>
+            ))}
+          </div>
+        )}
+      </section>
+    </aside>
+  )
+}
+
+function Home({ onEnterRoom, walletBalance }) {
   const [code, setCode] = useState('')
   const [busy, setBusy] = useState(null)
   const [error, setError] = useState('')
@@ -26,6 +147,7 @@ function Home({ onEnterRoom }) {
     setError('')
     try {
       const session = await action()
+      signalEconomyChanged()
       saveSession(session)
       onEnterRoom(session)
     } catch (requestError) {
@@ -44,6 +166,8 @@ function Home({ onEnterRoom }) {
     enter(() => api.joinRoom(code), 'guest')
   }
 
+  const insufficientForRound = walletBalance !== null && BigInt(walletBalance) < 50n
+
   return (
     <main className="page home-page">
       <section className="hero" aria-labelledby="home-title">
@@ -53,7 +177,7 @@ function Home({ onEnterRoom }) {
       </section>
 
       <section className="entry-card" aria-label="Enter a game">
-        <button className="button button-primary" disabled={busy !== null} onClick={() => enter(api.createRoom, 'host')}>
+        <button className="button button-primary" disabled={busy !== null || insufficientForRound} onClick={() => enter(api.createRoom, 'host')}>
           {busy === 'host' ? 'Creating room…' : 'Create room'}
         </button>
         <div className="divider"><span>or join</span></div>
@@ -69,11 +193,12 @@ function Home({ onEnterRoom }) {
             spellCheck="false"
             inputMode="text"
           />
-          <button className="button button-secondary" disabled={busy !== null || code.length !== 6}>
+          <button className="button button-secondary" disabled={busy !== null || code.length !== 6 || insufficientForRound}>
             {busy === 'guest' ? 'Joining room…' : 'Join room'}
           </button>
         </form>
-        {error && <div className="notice notice-error" role="alert">{error}</div>}
+        {insufficientForRound && <div className="notice notice-error">You need at least 50 coins to create or join a room. Creating a room does not charge coins.</div>}
+        <ErrorNotice message={error} onDismiss={() => setError('')} />
       </section>
     </main>
   )
@@ -150,7 +275,16 @@ function RoundResult({ state, role }) {
   )
 }
 
-function Room({ session, onLeave }) {
+function ChoosingAnimation() {
+  return (
+    <div className="choosing-animation" role="img" aria-label="Players choosing their moves">
+      <img className="choosing-frame choosing-frame-first" src={firstMove} alt="" />
+      <img className="choosing-frame choosing-frame-second" src={secondMove} alt="" />
+    </div>
+  )
+}
+
+function Room({ session, onLeave, walletBalance }) {
   const [state, setState] = useState(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
@@ -160,6 +294,7 @@ function Room({ session, onLeave }) {
   const [connectionError, setConnectionError] = useState('')
   const actionLockRef = useRef(false)
   const mountedRef = useRef(true)
+  const previousEconomyStateRef = useRef(null)
 
   useEffect(() => {
     mountedRef.current = true
@@ -171,7 +306,7 @@ function Room({ session, onLeave }) {
   useEffect(() => {
     let active = true
 
-    const close = api.subscribeToRoom(session.roomCode, {
+    const close = connectToRoom(session.roomCode, {
       onOpen: () => {
         if (active) setConnectionError('')
       },
@@ -182,7 +317,12 @@ function Room({ session, onLeave }) {
           return
         }
         setState(nextState)
-        const serverPlayer = nextState.players.find((player) => player.role === session.role)
+        const previous = previousEconomyStateRef.current
+        if (previous && ((!previous.ready && nextState.ready) || (!previous.resolved && nextState.resolved) || previous.round !== nextState.round)) {
+          signalEconomyChanged()
+        }
+        previousEconomyStateRef.current = nextState
+        const serverPlayer = nextState.players.find((player) => player.role === nextState.playerRole)
         if (serverPlayer?.submitted) setMovePending(false)
         setConnectionError('')
         setLoading(false)
@@ -198,31 +338,7 @@ function Room({ session, onLeave }) {
       active = false
       close()
     }
-  }, [session.roomCode, session.role, connectionAttempt, onLeave])
-
-  useEffect(() => {
-    let active = true
-    let presenceController = null
-    const refresh = async () => {
-      if (presenceController) return
-      const requestController = new AbortController()
-      presenceController = requestController
-      try {
-        await api.refreshPresence(session.roomCode, session.playerToken, { signal: requestController.signal })
-      } catch (presenceError) {
-        if (active && !requestController.signal.aborted) setConnectionError(displayError(presenceError))
-      } finally {
-        if (presenceController === requestController) presenceController = null
-      }
-    }
-    refresh()
-    const heartbeat = window.setInterval(refresh, api.PRESENCE_HEARTBEAT_MS)
-    return () => {
-      active = false
-      window.clearInterval(heartbeat)
-      presenceController?.abort()
-    }
-  }, [session.roomCode, session.playerToken])
+  }, [session.roomCode, connectionAttempt, onLeave])
 
   async function performAction(name, request) {
     if (actionLockRef.current) return
@@ -243,10 +359,13 @@ function Room({ session, onLeave }) {
     }
   }
 
-  const currentPlayer = state?.players.find((player) => player.role === session.role)
+  const role = state?.playerRole
+  const currentPlayer = state?.players.find((player) => player.role === role)
   const hasSubmitted = (currentPlayer?.submitted ?? false) || movePending
-  const opponent = state?.players.find((player) => player.role !== session.role)
+  const opponent = state?.players.find((player) => player.role !== role)
   const wantsNextRound = currentPlayer?.wantsNextRound ?? false
+  const canLeave = state?.resolved || (state?.ready === false && state.players.length === 1)
+  const insufficientForRound = walletBalance !== null && BigInt(walletBalance) < 50n
 
   function retryConnection() {
     setLoading(true)
@@ -264,9 +383,9 @@ function Room({ session, onLeave }) {
         </div>
         <button
           className="button button-quiet"
-          disabled={action !== null || !state?.resolved}
+          disabled={action !== null || !canLeave}
           onClick={() => performAction('leave', async () => {
-            await api.leaveRoom(session.roomCode, session.playerToken)
+            await api.leaveRoom(session.roomCode)
             if (mountedRef.current) onLeave()
           })}
         >
@@ -274,14 +393,14 @@ function Room({ session, onLeave }) {
         </button>
       </header>
 
-      <Scoreboard players={state?.players} role={session.role} resolved={state?.resolved} />
+      <Scoreboard players={state?.players} role={role} resolved={state?.resolved} />
 
-      {(error || connectionError) && (
-        <div className="notice notice-error" role="alert">
-          <span>{error || connectionError}</span>
-          {connectionError && <button onClick={retryConnection}>Retry</button>}
-        </div>
-      )}
+      <ErrorNotice
+        message={error || connectionError}
+        onDismiss={() => error ? setError('') : setConnectionError('')}
+      >
+        {connectionError && <button type="button" onClick={retryConnection}>Retry</button>}
+      </ErrorNotice>
 
       {loading && !state && <section className="game-panel centered" aria-live="polite"><div className="loader" /><h2>Loading room…</h2></section>}
 
@@ -291,6 +410,7 @@ function Room({ session, onLeave }) {
           <p className="eyebrow">Room is open</p>
           <h2>Waiting for a guest</h2>
           <p>Keep this page open while your opponent joins with the code above.</p>
+          {insufficientForRound && <div className="notice notice-error">Recharge to at least 50 coins before a guest can fund this round.</div>}
         </section>
       )}
 
@@ -299,13 +419,14 @@ function Room({ session, onLeave }) {
           <p className="eyebrow">Current round</p>
           <h2 id="round-title">{hasSubmitted ? 'Move submitted' : 'Choose your move'}</h2>
           <p>{hasSubmitted ? 'Your choice is hidden. Waiting for your opponent.' : 'Your move stays secret until both players submit.'}</p>
+          <ChoosingAnimation />
           <div className="move-grid" aria-label="Choose a move">
             {MOVES.map((move) => (
               <button
                 className="move-button"
                 key={move.value}
                 disabled={hasSubmitted || action !== null}
-                onClick={() => performAction('move', () => api.submitMove(session.roomCode, session.playerToken, move.value))}
+                onClick={() => performAction('move', () => api.submitMove(session.roomCode, move.value))}
               >
                 <span aria-hidden="true">{move.symbol}</span>
                 {move.label}
@@ -318,7 +439,7 @@ function Room({ session, onLeave }) {
 
       {state?.resolved && (
         <section className="game-panel">
-          <RoundResult state={state} role={session.role} />
+          <RoundResult state={state} role={role} />
           <p aria-live="polite">
             {wantsNextRound
               ? 'You want another round. Waiting for your opponent to decide.'
@@ -328,8 +449,8 @@ function Room({ session, onLeave }) {
           </p>
           <button
             className="button button-primary"
-            disabled={action !== null || wantsNextRound}
-            onClick={() => performAction('next', () => api.startNextRound(session.roomCode, session.playerToken, state.round))}
+            disabled={action !== null || wantsNextRound || insufficientForRound}
+            onClick={() => performAction('next', () => api.startNextRound(session.roomCode, state.round))}
           >
             {action === 'next'
               ? 'Sending request…'
@@ -337,78 +458,41 @@ function Room({ session, onLeave }) {
                 ? 'Waiting for opponent…'
                 : opponent?.wantsNextRound ? 'Accept next round' : 'Request next round'}
           </button>
+          {insufficientForRound && <div className="notice notice-error">Recharge to at least 50 coins before accepting another paid round.</div>}
         </section>
       )}
 
       <p className="leave-note">
-        {state?.resolved ? 'Leaving closes this room for both players.' : 'You can leave after the round is finished.'}
+        {state?.resolved
+          ? 'Leaving closes this room for both players.'
+          : state?.ready === false && state.players.length === 1
+            ? 'You can leave while waiting for an opponent.'
+            : 'You can leave after the round is finished.'}
       </p>
     </main>
   )
 }
 
-export function GameApp() {
+export function GameApp({ walletBalance = null }) {
   const [session, setSession] = useState(() => loadSession())
-  const [sessionReady, setSessionReady] = useState(() => !session)
-  const [validationError, setValidationError] = useState('')
-  const [validationAttempt, setValidationAttempt] = useState(0)
 
-  useEffect(() => {
-    if (!session || sessionReady) return undefined
-
-    const controller = new AbortController()
-    let active = true
-
-    api.validateSession(session.roomCode, session.playerToken, session.role, { signal: controller.signal })
-      .then(() => {
-        if (active) setSessionReady(true)
-      })
-      .catch((requestError) => {
-        if (!active || controller.signal.aborted) return
-        if (requestError?.status === 401 || requestError?.status === 404) {
-          clearSession()
-          setSession(null)
-          return
-        }
-        setValidationError(displayError(requestError))
-      })
-
-    return () => {
-      active = false
-      controller.abort()
-    }
-  }, [session, sessionReady, validationAttempt])
-
-  function leaveRoom() {
+  const leaveRoom = useCallback(() => {
     clearSession()
     setSession(null)
-    setSessionReady(false)
-    setValidationError('')
-  }
+  }, [])
 
   function enterRoom(nextSession) {
     setSession(nextSession)
-    setSessionReady(true)
-    setValidationError('')
-  }
-
-  function retryValidation() {
-    setValidationError('')
-    setValidationAttempt((attempt) => attempt + 1)
-  }
-
-  if (session && !sessionReady) {
-    return <SessionRecovery error={validationError} onRetry={retryValidation} onForget={leaveRoom} />
   }
 
   return session ? (
-    <Room key={`${session.roomCode}:${session.playerToken}`} session={session} onLeave={leaveRoom} />
+    <Room key={session.roomCode} session={session} onLeave={leaveRoom} walletBalance={walletBalance} />
   ) : (
-    <Home onEnterRoom={enterRoom} />
+    <Home onEnterRoom={enterRoom} walletBalance={walletBalance} />
   )
 }
 
-function AuthForm({ initialError, onAuthenticated, onPending }) {
+function AuthForm({ initialError, onAuthenticated, onPending, onDismissInitialError }) {
   const [mode, setMode] = useState('login')
   const [email, setEmail] = useState('')
   const [password, setPassword] = useState('')
@@ -456,7 +540,10 @@ function AuthForm({ initialError, onAuthenticated, onPending }) {
         }}>
           {mode === 'login' ? 'Need an account? Register' : 'Already have an account? Sign in'}
         </button>
-        {(error || initialError) && <div className="notice notice-error" role="alert">{error || initialError}</div>}
+        <ErrorNotice
+          message={error || initialError}
+          onDismiss={() => error ? setError('') : onDismissInitialError()}
+        />
       </section>
     </main>
   )
@@ -467,6 +554,31 @@ export default function App() {
   const [loading, setLoading] = useState(Boolean(supabase))
   const [pendingEmail, setPendingEmail] = useState('')
   const [error, setError] = useState(supabase ? '' : 'Supabase authentication is not configured.')
+  const [walletBalance, setWalletBalance] = useState(null)
+  const backendTokenRef = useRef('')
+  const backendSessionTaskRef = useRef(Promise.resolve())
+  const authSequenceRef = useRef(0)
+
+  const establishSession = useCallback((nextSession) => {
+    const sequence = ++authSequenceRef.current
+    const task = backendSessionTaskRef.current.then(async () => {
+      if (!nextSession) {
+        backendTokenRef.current = ''
+        if (sequence === authSequenceRef.current) {
+          clearSession()
+          setAuthSession(null)
+        }
+        return
+      }
+      if (backendTokenRef.current !== nextSession.access_token) {
+        await api.bootstrapSession(nextSession.access_token)
+        backendTokenRef.current = nextSession.access_token
+      }
+      if (sequence === authSequenceRef.current) setAuthSession(nextSession)
+    })
+    backendSessionTaskRef.current = task.catch(() => {})
+    return task
+  }, [])
 
   useEffect(() => {
     if (!supabase) {
@@ -474,37 +586,44 @@ export default function App() {
     }
     let active = true
     let authStateObserved = false
-    supabase.auth.getSession().then(({ data, error: sessionError }) => {
+    supabase.auth.getSession().then(async ({ data, error: sessionError }) => {
       if (!active || authStateObserved) return
-      if (sessionError) setError(displayError(sessionError))
-      setAuthSession(data.session ?? null)
-      if (!data.session) clearSession()
+      try {
+        if (sessionError) throw sessionError
+        await establishSession(data.session ?? null)
+      } catch (sessionFailure) {
+        if (active) setError(displayError(sessionFailure))
+      }
       setLoading(false)
     })
     const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, nextSession) => {
       if (!active) return
       authStateObserved = true
-      setAuthSession(nextSession)
       setPendingEmail('')
       setError('')
-      if (!nextSession) clearSession()
-      setLoading(false)
+      establishSession(nextSession).catch((sessionFailure) => {
+        if (active) setError(displayError(sessionFailure))
+      }).finally(() => {
+        if (active) setLoading(false)
+      })
     })
     return () => {
       active = false
       subscription.unsubscribe()
     }
-  }, [])
+  }, [establishSession])
 
   async function signOut() {
     setError('')
     try {
+      await api.logoutSession()
       const { error: signOutError } = await supabase.auth.signOut()
       if (signOutError) {
         setError(displayError(signOutError))
         return
       }
       clearSession()
+      backendTokenRef.current = ''
       setAuthSession(null)
     } catch (signOutError) {
       setError(displayError(signOutError))
@@ -527,7 +646,7 @@ export default function App() {
       </main>
     )
   }
-  if (!authSession) return <AuthForm initialError={error} onAuthenticated={setAuthSession} onPending={setPendingEmail} />
+  if (!authSession) return <AuthForm initialError={error} onAuthenticated={(session) => establishSession(session).catch((sessionFailure) => setError(displayError(sessionFailure)))} onPending={setPendingEmail} onDismissInitialError={() => setError('')} />
 
   return (
     <div className="authenticated-app">
@@ -535,8 +654,11 @@ export default function App() {
         <span>Signed in</span>
         <button className="button button-quiet" onClick={signOut}>Sign out</button>
       </div>
-      {error && <div className="page notice notice-error" role="alert">{error}</div>}
-      <GameApp />
+      <div className="page account-error">
+        <ErrorNotice message={error} onDismiss={() => setError('')} />
+      </div>
+      <AccountPanel onBalance={setWalletBalance} />
+      <GameApp walletBalance={walletBalance} />
     </div>
   )
 }
