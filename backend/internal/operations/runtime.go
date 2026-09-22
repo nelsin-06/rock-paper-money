@@ -2,6 +2,7 @@ package operations
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"sync"
 	"time"
@@ -10,13 +11,16 @@ import (
 )
 
 type Runtime struct {
-	deadlines *worker.DeadlineWorker
-	outbox    *worker.OutboxWorker
-	cleanup   *worker.CleanupWorker
-	metrics   *Metrics
-	logger    *slog.Logger
-	intervals Intervals
-	wait      sync.WaitGroup
+	deadlines               *worker.DeadlineWorker
+	outbox                  *worker.OutboxWorker
+	cleanup                 *worker.CleanupWorker
+	reconcile               *worker.ReconciliationWorker
+	metrics                 *Metrics
+	logger                  *slog.Logger
+	intervals               Intervals
+	wait                    sync.WaitGroup
+	errorMu                 sync.Mutex
+	lastReconciliationError time.Time
 }
 
 type Intervals struct {
@@ -48,7 +52,17 @@ func (r *Runtime) Start(ctx context.Context) {
 	r.startLoop(ctx, "deadlines", r.intervals.Deadlines, r.runDeadlines)
 	r.startLoop(ctx, "outbox", r.intervals.Outbox, r.runOutbox)
 	r.startLoop(ctx, "cleanup", r.intervals.Cleanup, r.runCleanup)
+	if r.reconcile != nil {
+		r.wait.Add(1)
+		go func() {
+			defer r.wait.Done()
+			r.reconcile.Run(ctx, r.observeReconciliation)
+			r.logger.Info("worker stopped", "worker", "reconciliation")
+		}()
+	}
 }
+
+func (r *Runtime) SetReconciliation(worker *worker.ReconciliationWorker) { r.reconcile = worker }
 
 func (r *Runtime) Wait() { r.wait.Wait() }
 
@@ -104,4 +118,23 @@ func (r *Runtime) runCleanup(ctx context.Context) {
 		return
 	}
 	r.logger.Info("cleanup worker completed", "sessions", report.Sessions, "receipts", report.Receipts)
+}
+
+func (r *Runtime) observeReconciliation(source worker.ReconciliationSource, report worker.ReconciliationReport, err error) {
+	r.metrics.Reconciliation(source, report)
+	if err != nil {
+		r.errorMu.Lock()
+		shouldLog := time.Since(r.lastReconciliationError) >= 30*time.Second
+		if shouldLog {
+			r.lastReconciliationError = time.Now()
+		}
+		r.errorMu.Unlock()
+		if shouldLog {
+			r.logger.Warn("reconciliation worker retrying", "source", source, "error_type", fmt.Sprintf("%T", err), "failures", report.Failures)
+		}
+		return
+	}
+	if report.ClaimWins > 0 || report.ClaimNoops > 0 {
+		r.logger.Info("reconciliation worker completed", "source", source, "claim_attempts", report.ClaimAttempts, "claim_wins", report.ClaimWins, "claim_noops", report.ClaimNoops, "settled", report.SettledRounds, "advanced", report.AdvancedRounds, "backlog", report.EligibleBacklog, "oldest_eligible_age_seconds", report.OldestEligibleAge.Seconds())
+	}
 }

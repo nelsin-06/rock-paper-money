@@ -233,6 +233,51 @@ func TestDeadlineDrawOverridesPartialMoveForBothAbsent(t *testing.T) {
 		t.Fatalf("disconnect draw = %#v", got)
 	}
 }
+
+func TestExplicitTransitionsApplyRestoredIndependentActions(t *testing.T) {
+	moves := domain.PersistenceState{
+		Code: "ROOM", Round: 1,
+		Players:           []domain.PersistedPlayer{{ID: "host"}, {ID: "guest"}},
+		Moves:             map[string]domain.Move{"host": domain.Rock, "guest": domain.Scissors},
+		NextRoundRequests: map[string]bool{},
+	}
+	room, err := domain.Restore(moves)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = room.ResolveCommittedMoves(1); err != nil {
+		t.Fatal(err)
+	}
+	if state := room.State(); !state.Resolved || state.Result != domain.PlayerOneWins || state.Players[0].Wins != 1 {
+		t.Fatalf("resolved restored moves = %#v", state)
+	}
+
+	requests := room.PersistenceState()
+	requests.NextRoundRequests = map[string]bool{"host": true, "guest": true}
+	room, err = domain.Restore(requests)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = room.AdvanceCommittedNextRound(1); err != nil {
+		t.Fatal(err)
+	}
+	if state := room.State(); state.Round != 2 || state.Resolved || state.Players[0].Wins != 1 {
+		t.Fatalf("advanced restored requests = %#v", state)
+	}
+}
+
+func TestExplicitTransitionsRejectIncompleteOrStaleActions(t *testing.T) {
+	room := readyRoom(t)
+	if err := room.ResolveCommittedMoves(2); !errors.Is(err, domain.ErrStaleRound) {
+		t.Fatalf("stale move resolution error = %v", err)
+	}
+	if err := room.ResolveCommittedMoves(1); !errors.Is(err, domain.ErrRoundNotResolved) {
+		t.Fatalf("incomplete move resolution error = %v", err)
+	}
+	if err := room.AdvanceCommittedNextRound(1); !errors.Is(err, domain.ErrRoundNotResolved) {
+		t.Fatalf("unresolved advance error = %v", err)
+	}
+}
 func readyRoom(t *testing.T) *domain.Room {
 	t.Helper()
 	r, err := domain.New("ROOM", "host")

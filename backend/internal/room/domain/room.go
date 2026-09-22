@@ -233,6 +233,53 @@ func (r *Room) RequestNextRound(playerID string, round uint64) error {
 	return nil
 }
 
+// ResolveCommittedMoves applies the game rules to two moves restored from
+// authoritative storage. Action persistence remains independent from this
+// transition so a reconciler can claim and resolve the round exactly once.
+func (r *Room) ResolveCommittedMoves(expectedRound uint64) error {
+	if r.closed {
+		return ErrRoomClosed
+	}
+	if expectedRound != r.round {
+		return ErrStaleRound
+	}
+	if r.resolved {
+		return ErrRoundResolved
+	}
+	if len(r.players) != 2 {
+		return ErrRoomNotReady
+	}
+	if len(r.moves) != 2 {
+		return ErrRoundNotResolved
+	}
+	r.resolve()
+	return nil
+}
+
+// AdvanceCommittedNextRound applies two restored next-round requests without
+// re-submitting either player's decision through the aggregate.
+func (r *Room) AdvanceCommittedNextRound(expectedRound uint64) error {
+	if r.closed {
+		return ErrRoomClosed
+	}
+	if expectedRound != r.round {
+		return ErrStaleRound
+	}
+	if !r.resolved {
+		return ErrRoundNotResolved
+	}
+	if len(r.players) != 2 || len(r.nextRoundRequests) != len(r.players) {
+		return ErrRoomNotReady
+	}
+	r.moves = map[string]Move{}
+	r.resolved = false
+	r.result = ""
+	r.forfeitedPlayerID = ""
+	r.round++
+	r.nextRoundRequests = map[string]bool{}
+	return nil
+}
+
 func (r *Room) Leave(playerID string) error {
 	if r.closed {
 		return ErrRoomClosed

@@ -19,6 +19,7 @@ import (
 	"example.com/rock-paper-money/internal/room/adapter/postgres"
 	"example.com/rock-paper-money/internal/room/application"
 	"example.com/rock-paper-money/internal/room/domain"
+	"example.com/rock-paper-money/internal/worker"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -247,6 +248,317 @@ func TestPostgresCommandReceiptReplaysAcrossLossRestartAndConcurrency(t *testing
 	}
 	if settlements != 1 {
 		t.Fatalf("settlements after receipt cleanup = %d", settlements)
+	}
+}
+
+func TestPostgresMoveRequiresBothSeatsAndFundedRound(t *testing.T) {
+	pool := integrationPool(t)
+	ctx := context.Background()
+	repository := postgres.NewRepository(pool)
+	hostAccount := "00000000-0000-4000-8000-000000000001"
+	guestAccount := "00000000-0000-4000-8000-000000000002"
+	if _, err := repository.Recharge(ctx, hostAccount, 1_000, "not-ready-host-funding"); err != nil {
+		t.Fatal(err)
+	}
+	aggregate, err := domain.New("RDY234", "not-ready-host")
+	if err != nil {
+		t.Fatal(err)
+	}
+	createCommand, _ := application.NewCommand("not-ready-create", "room.create", struct{}{})
+	if _, err = repository.CreateCommand(ctx, aggregate, hostAccount, createCommand); err != nil {
+		t.Fatal(err)
+	}
+
+	assertRejected := func(key string) {
+		t.Helper()
+		moveCommand, commandErr := application.NewCommand(key, "room.move", struct {
+			RoomCode string      `json:"room_code"`
+			Move     domain.Move `json:"move"`
+		}{"RDY234", domain.Rock})
+		if commandErr != nil {
+			t.Fatal(commandErr)
+		}
+		if _, commandErr = repository.SubmitMoveCommand(ctx, "RDY234", hostAccount, domain.Rock, moveCommand); !errors.Is(commandErr, domain.ErrRoomNotReady) {
+			t.Fatalf("move error = %v, want %v", commandErr, domain.ErrRoomNotReady)
+		}
+		var moves, receipts int
+		if commandErr = pool.QueryRow(ctx, "SELECT count(*) FROM room_moves WHERE room_code='RDY234'").Scan(&moves); commandErr != nil {
+			t.Fatal(commandErr)
+		}
+		if commandErr = pool.QueryRow(ctx, "SELECT count(*) FROM command_receipts WHERE idempotency_key=$1", key).Scan(&receipts); commandErr != nil {
+			t.Fatal(commandErr)
+		}
+		if moves != 0 || receipts != 0 {
+			t.Fatalf("rejected move persisted moves=%d receipts=%d", moves, receipts)
+		}
+	}
+
+	assertRejected("not-ready-missing-guest")
+	if _, err = pool.Exec(ctx, "INSERT INTO room_seats(room_code,role,player_id,auth_user_id) VALUES('RDY234','guest','not-ready-guest',$1)", guestAccount); err != nil {
+		t.Fatal(err)
+	}
+	assertRejected("not-ready-unfunded-round")
+}
+
+func TestPostgresConcurrentActionsAndDuplicateClaimsSettleExactlyOnce(t *testing.T) {
+	pool := integrationPool(t)
+	ctx := context.Background()
+	repository := postgres.NewRepository(pool)
+	roomCode, hostAccount, guestAccount := createFundedDeadlineRoom(t, repository, "concurrent-actions")
+	start := make(chan struct{})
+	errs := make(chan error, 2)
+	commands := []struct {
+		account string
+		move    domain.Move
+		key     string
+	}{{hostAccount, domain.Rock, "concurrent-host-move"}, {guestAccount, domain.Scissors, "concurrent-guest-move"}}
+	for _, item := range commands {
+		item := item
+		go func() {
+			<-start
+			command, _ := application.NewCommand(item.key, "room.move", struct {
+				RoomCode string      `json:"room_code"`
+				Move     domain.Move `json:"move"`
+			}{roomCode, item.move})
+			_, commandErr := repository.SubmitMoveCommand(ctx, roomCode, item.account, item.move, command)
+			errs <- commandErr
+		}()
+	}
+	close(start)
+	for range commands {
+		if err := <-errs; err != nil {
+			t.Fatal(err)
+		}
+	}
+	assertSingleSettlement(t, pool, roomCode)
+	var moves, receipts int
+	if err := pool.QueryRow(ctx, "SELECT count(*) FROM room_moves WHERE room_code=$1 AND round_number=1", roomCode).Scan(&moves); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, "SELECT count(*) FROM command_receipts WHERE idempotency_key IN ('concurrent-host-move','concurrent-guest-move')").Scan(&receipts); err != nil {
+		t.Fatal(err)
+	}
+	if moves != 2 || receipts != 2 {
+		t.Fatalf("moves=%d receipts=%d", moves, receipts)
+	}
+
+	claimRoom, _, _ := createFundedDeadlineRoom(t, repository, "duplicate-claims")
+	if _, err := pool.Exec(ctx, "INSERT INTO room_moves(room_code,round_number,role,move) VALUES($1,1,'host','paper'),($1,1,'guest','rock')", claimRoom); err != nil {
+		t.Fatal(err)
+	}
+	start = make(chan struct{})
+	reports := make(chan worker.ReconciliationReport, 8)
+	errs = make(chan error, 8)
+	for range 8 {
+		go func() {
+			<-start
+			report, reconcileErr := postgres.NewRepository(pool).ReconcileRoom(ctx, worker.RoomHint{RoomCode: claimRoom, Round: 1})
+			reports <- report
+			errs <- reconcileErr
+		}()
+	}
+	close(start)
+	wins := int64(0)
+	for range 8 {
+		if err := <-errs; err != nil {
+			t.Fatal(err)
+		}
+		wins += (<-reports).ClaimWins
+	}
+	if wins != 1 {
+		t.Fatalf("claim wins = %d, want 1", wins)
+	}
+	assertSingleSettlement(t, pool, claimRoom)
+}
+
+func TestPostgresReconciliationRollsBackAndRetriesDurableRequests(t *testing.T) {
+	pool := integrationPool(t)
+	ctx := context.Background()
+	repository := postgres.NewRepository(pool)
+	roomCode, hostAccount, guestAccount := createFundedDeadlineRoom(t, repository, "rollback-retry")
+	if _, err := pool.Exec(ctx, "INSERT INTO room_moves(room_code,round_number,role,move) VALUES($1,1,'host','rock'),($1,1,'guest','paper')", roomCode); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, "UPDATE wallet_accounts SET balance=99 WHERE account_id=$1", "escrow:"+roomCode+":1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repository.ReconcileRoom(ctx, worker.RoomHint{RoomCode: roomCode, Round: 1}); err == nil {
+		t.Fatal("settlement with invalid escrow succeeded")
+	}
+	var status string
+	var history int
+	if err := pool.QueryRow(ctx, "SELECT status FROM room_rounds WHERE room_code=$1 AND number=1", roomCode).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, "SELECT count(*) FROM game_round_history WHERE room_code=$1", roomCode).Scan(&history); err != nil {
+		t.Fatal(err)
+	}
+	if status != "active" || history != 0 {
+		t.Fatalf("rolled back status=%q history=%d", status, history)
+	}
+	if _, err := pool.Exec(ctx, "UPDATE wallet_accounts SET balance=100 WHERE account_id=$1", "escrow:"+roomCode+":1"); err != nil {
+		t.Fatal(err)
+	}
+	if report, err := repository.ReconcileBatch(ctx, 8); err != nil || report.SettledRounds != 1 {
+		t.Fatalf("periodic recovery report=%#v error=%v", report, err)
+	}
+
+	if _, err := pool.Exec(ctx, "UPDATE wallet_accounts SET balance=0 WHERE account_id=$1", "user:"+guestAccount); err != nil {
+		t.Fatal(err)
+	}
+	start := make(chan struct{})
+	errs := make(chan error, 2)
+	for index, account := range []string{hostAccount, guestAccount} {
+		index, account := index, account
+		go func() {
+			<-start
+			command, _ := application.NewCommand(fmt.Sprintf("retry-next-%d", index), "room.next-round", struct {
+				RoomCode string `json:"room_code"`
+				Round    uint64 `json:"round"`
+			}{roomCode, 1})
+			_, requestErr := repository.RequestNextRoundCommand(ctx, roomCode, account, 1, command)
+			errs <- requestErr
+		}()
+	}
+	close(start)
+	for range 2 {
+		if err := <-errs; err != nil {
+			t.Fatal(err)
+		}
+	}
+	var currentRound uint64
+	var requests int
+	if err := pool.QueryRow(ctx, "SELECT current_round FROM room_rooms WHERE code=$1", roomCode).Scan(&currentRound); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, "SELECT count(*) FROM room_next_round_requests WHERE room_code=$1 AND round_number=1", roomCode).Scan(&requests); err != nil {
+		t.Fatal(err)
+	}
+	if currentRound != 1 || requests != 2 {
+		t.Fatalf("failed funding round=%d requests=%d", currentRound, requests)
+	}
+	if _, err := repository.Recharge(ctx, guestAccount, application.RoundStake, "retry-next-funding"); err != nil {
+		t.Fatal(err)
+	}
+	if report, err := repository.ReconcileBatch(ctx, 8); err != nil || report.AdvancedRounds != 1 {
+		t.Fatalf("request recovery report=%#v error=%v", report, err)
+	}
+	if err := pool.QueryRow(ctx, "SELECT current_round FROM room_rooms WHERE code=$1", roomCode).Scan(&currentRound); err != nil || currentRound != 2 {
+		t.Fatalf("advanced round=%d error=%v", currentRound, err)
+	}
+}
+
+func TestPostgresUnresolvedMovePrivacyConflictsAndStaleRequests(t *testing.T) {
+	pool := integrationPool(t)
+	ctx := context.Background()
+	repository := postgres.NewRepository(pool)
+	roomCode, hostAccount, guestAccount := createFundedDeadlineRoom(t, repository, "hidden-move")
+	moveCommand, _ := application.NewCommand("hidden-host-move", "room.move", struct {
+		RoomCode string      `json:"room_code"`
+		Move     domain.Move `json:"move"`
+	}{roomCode, domain.Rock})
+	if _, err := repository.SubmitMoveCommand(ctx, roomCode, hostAccount, domain.Rock, moveCommand); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := repository.SnapshotForAccount(ctx, roomCode, guestAccount)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snapshot.State.Moves) != 0 || !snapshot.State.Players[0].Submitted {
+		t.Fatalf("unresolved snapshot exposed move = %#v", snapshot.State)
+	}
+	conflict, _ := application.NewCommand("conflicting-host-move", "room.move", struct {
+		RoomCode string      `json:"room_code"`
+		Move     domain.Move `json:"move"`
+	}{roomCode, domain.Paper})
+	if _, err = repository.SubmitMoveCommand(ctx, roomCode, hostAccount, domain.Paper, conflict); !errors.Is(err, domain.ErrDuplicateMove) {
+		t.Fatalf("conflicting move error = %v", err)
+	}
+	stale, _ := application.NewCommand("stale-next-request", "room.next-round", struct {
+		RoomCode string `json:"room_code"`
+		Round    uint64 `json:"round"`
+	}{roomCode, 2})
+	if _, err = repository.RequestNextRoundCommand(ctx, roomCode, guestAccount, 2, stale); !errors.Is(err, domain.ErrStaleRound) {
+		t.Fatalf("stale request error = %v", err)
+	}
+}
+
+func TestPostgresStartupListenerAndDroppedNotificationPeriodicRecovery(t *testing.T) {
+	pool := integrationPool(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	repository := postgres.NewRepository(pool)
+	startupRoom, _, _ := createFundedDeadlineRoom(t, repository, "startup-recovery")
+	if _, err := pool.Exec(ctx, "INSERT INTO room_moves(room_code,round_number,role,move) VALUES($1,1,'host','rock'),($1,1,'guest','scissors')", startupRoom); err != nil {
+		t.Fatal(err)
+	}
+	reports := make(chan struct {
+		source worker.ReconciliationSource
+		report worker.ReconciliationReport
+		err    error
+	}, 16)
+	reconciler := worker.NewReconciliationWorker(repository, postgres.NewRoomStateListener(pool), worker.ReconciliationConfig{PeriodicInterval: time.Hour, IdleInterval: time.Hour})
+	done := make(chan struct{})
+	go func() {
+		reconciler.Run(ctx, func(source worker.ReconciliationSource, report worker.ReconciliationReport, err error) {
+			reports <- struct {
+				source worker.ReconciliationSource
+				report worker.ReconciliationReport
+				err    error
+			}{source, report, err}
+		})
+		close(done)
+	}()
+	var startup struct {
+		source worker.ReconciliationSource
+		report worker.ReconciliationReport
+		err    error
+	}
+	select {
+	case startup = <-reports:
+	case <-time.After(3 * time.Second):
+		t.Fatal("listener did not establish and run startup reconciliation")
+	}
+	if startup.err != nil || startup.source != worker.ReconciliationStartup || startup.report.SettledRounds != 1 {
+		t.Fatalf("startup recovery source=%q report=%#v error=%v", startup.source, startup.report, startup.err)
+	}
+	assertSingleSettlement(t, pool, startupRoom)
+	cancel()
+	<-done
+
+	periodicRoom, _, _ := createFundedDeadlineRoom(t, repository, "periodic-recovery")
+	periodicContext, stopPeriodic := context.WithCancel(context.Background())
+	defer stopPeriodic()
+	periodicReports := make(chan worker.ReconciliationReport, 16)
+	periodicReady := make(chan struct{}, 1)
+	periodic := worker.NewReconciliationWorker(repository, nil, worker.ReconciliationConfig{PeriodicInterval: 10 * time.Millisecond, IdleInterval: 10 * time.Millisecond})
+	go periodic.Run(periodicContext, func(source worker.ReconciliationSource, report worker.ReconciliationReport, err error) {
+		if err == nil && source == worker.ReconciliationStartup {
+			periodicReady <- struct{}{}
+		}
+		if err == nil && source == worker.ReconciliationPeriodic {
+			periodicReports <- report
+		}
+	})
+	select {
+	case <-periodicReady:
+	case <-time.After(time.Second):
+		t.Fatal("periodic worker did not finish startup drain")
+	}
+	if _, err := pool.Exec(context.Background(), "INSERT INTO room_moves(room_code,round_number,role,move) VALUES($1,1,'host','paper'),($1,1,'guest','rock')", periodicRoom); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.After(time.Second)
+	for {
+		select {
+		case report := <-periodicReports:
+			if report.SettledRounds == 1 {
+				assertSingleSettlement(t, pool, periodicRoom)
+				return
+			}
+		case <-deadline:
+			t.Fatal("periodic reconciliation did not recover dropped notification")
+		}
 	}
 }
 
@@ -1041,7 +1353,7 @@ func insertDeadlineSession(t *testing.T, pool *pgxpool.Pool, accountID string, m
 
 func createFundedDeadlineRoom(t *testing.T, repository *postgres.Repository, name string) (string, string, string) {
 	t.Helper()
-	codes := map[string]string{"deadline": "DUE234", "zero": "ZER234", "one": "ONE234", "race": "RCE234", "receipt-cleanup": "RCP234"}
+	codes := map[string]string{"deadline": "DUE234", "zero": "ZER234", "one": "ONE234", "race": "RCE234", "receipt-cleanup": "RCP234", "concurrent-actions": "CON234", "duplicate-claims": "CLM234", "rollback-retry": "RBK234", "hidden-move": "HID234", "startup-recovery": "SUP234", "periodic-recovery": "PER234"}
 	code := codes[name]
 	hostAccount := "00000000-0000-4000-8000-000000000001"
 	guestAccount := "00000000-0000-4000-8000-000000000002"

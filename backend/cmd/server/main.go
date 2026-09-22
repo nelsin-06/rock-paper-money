@@ -133,6 +133,7 @@ func run() error {
 		logger,
 		operations.Intervals{},
 	)
+	runtime.SetReconciliation(worker.NewReconciliationWorker(repository, postgres.NewRoomStateListener(pool), worker.ReconciliationConfig{}))
 	runtime.Start(runtimeContext)
 	defer func() {
 		stopRuntime()

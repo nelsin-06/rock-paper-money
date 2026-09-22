@@ -217,15 +217,37 @@ func (r *Repository) ProcessNextDeadline(ctx context.Context, now time.Time) (ap
 	defer tx.Rollback(ctx)
 	var candidateID int64
 	var roomCode string
+	var candidateRound uint64
 	var candidateDueAt time.Time
 	if err = tx.QueryRow(ctx, `
-		SELECT deadline_id,room_code,due_at FROM room_deadlines
+		SELECT deadline_id,room_code,round_number,due_at FROM room_deadlines
 		WHERE status='pending' AND due_at<=$1
 		ORDER BY due_at,CASE kind WHEN 'disconnect' THEN 0 ELSE 1 END,deadline_id
-		LIMIT 1`, now).Scan(&candidateID, &roomCode, &candidateDueAt); errors.Is(err, pgx.ErrNoRows) {
+		LIMIT 1`, now).Scan(&candidateID, &roomCode, &candidateRound, &candidateDueAt); errors.Is(err, pgx.ErrNoRows) {
 		return application.DeadlineResult{}, nil
 	} else if err != nil {
 		return application.DeadlineResult{}, err
+	}
+	claim, err := tx.Exec(ctx, `
+		UPDATE room_rounds rr SET status='settling'
+		WHERE rr.room_code=$1 AND rr.number=$2 AND rr.status='active' AND rr.funded
+		  AND EXISTS (SELECT 1 FROM room_rooms r WHERE r.code=rr.room_code AND r.current_round=rr.number AND r.status='active')`, roomCode, candidateRound)
+	if err != nil {
+		return application.DeadlineResult{}, err
+	}
+	if claim.RowsAffected() == 0 {
+		if _, err = tx.Exec(ctx, `
+			UPDATE room_deadlines d SET status='cancelled',completed_at=$2
+			WHERE d.deadline_id=$1 AND NOT EXISTS (
+				SELECT 1 FROM room_rounds rr JOIN room_rooms r ON r.code=rr.room_code
+				WHERE rr.room_code=d.room_code AND rr.number=d.round_number
+				  AND r.current_round=rr.number AND r.status='active' AND rr.status='active')`, candidateID, now); err != nil {
+			return application.DeadlineResult{}, err
+		}
+		if err = tx.Commit(ctx); err != nil {
+			return application.DeadlineResult{}, err
+		}
+		return application.DeadlineResult{Processed: true, Stale: true, RoomCode: roomCode, Round: candidateRound, DueAt: candidateDueAt}, nil
 	}
 	var round uint64
 	if err = tx.QueryRow(ctx, "SELECT current_round FROM room_rooms WHERE code=$1 FOR UPDATE", roomCode).Scan(&round); errors.Is(err, pgx.ErrNoRows) {
@@ -248,6 +270,9 @@ func (r *Repository) ProcessNextDeadline(ctx context.Context, now time.Time) (ap
 		return application.DeadlineResult{}, err
 	}
 	if !found {
+		if _, err = tx.Exec(ctx, "UPDATE room_rounds SET status='active' WHERE room_code=$1 AND number=$2 AND status='settling'", roomCode, round); err != nil {
+			return application.DeadlineResult{}, err
+		}
 		if err = tx.Commit(ctx); err != nil {
 			return application.DeadlineResult{}, err
 		}
@@ -266,6 +291,9 @@ func (r *Repository) ProcessNextDeadline(ctx context.Context, now time.Time) (ap
 			if _, err = tx.Exec(ctx, "UPDATE room_deadlines SET status='cancelled',completed_at=$2 WHERE deadline_id=$1", deadline.id, now); err != nil {
 				return application.DeadlineResult{}, err
 			}
+			if _, err = tx.Exec(ctx, "UPDATE room_rounds SET status='active' WHERE room_code=$1 AND number=$2 AND status='settling'", roomCode, round); err != nil {
+				return application.DeadlineResult{}, err
+			}
 			if err = tx.Commit(ctx); err != nil {
 				return application.DeadlineResult{}, err
 			}
@@ -282,6 +310,9 @@ func (r *Repository) ProcessNextDeadline(ctx context.Context, now time.Time) (ap
 	if err != nil {
 		if errors.Is(err, domain.ErrRoundResolved) || errors.Is(err, domain.ErrStaleRound) || errors.Is(err, domain.ErrRoomClosed) {
 			if _, err = tx.Exec(ctx, "UPDATE room_deadlines SET status='cancelled',completed_at=$2 WHERE deadline_id=$1", deadline.id, now); err != nil {
+				return application.DeadlineResult{}, err
+			}
+			if _, err = tx.Exec(ctx, "UPDATE room_rounds SET status='active' WHERE room_code=$1 AND number=$2 AND status='settling'", roomCode, round); err != nil {
 				return application.DeadlineResult{}, err
 			}
 			if err = tx.Commit(ctx); err != nil {
