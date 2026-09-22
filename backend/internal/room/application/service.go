@@ -9,22 +9,21 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log/slog"
-	"sync"
 	"time"
 
 	"example.com/rock-paper-money/internal/room/domain"
 )
 
 var (
-	ErrDuplicateRoom       = errors.New("room code already exists")
-	ErrRoomNotFound        = errors.New("room code was not found")
-	ErrUnauthorized        = errors.New("invalid room credential")
-	ErrAccountSeated       = errors.New("account already occupies a seat")
-	ErrInsufficientFunds   = errors.New("insufficient coin balance")
-	ErrInvalidCoinAmount   = errors.New("coin amount must be a positive integer")
-	ErrIdempotencyRequired = errors.New("idempotency key is required")
-	ErrIdempotencyConflict = errors.New("idempotency key was already used with different data")
+	ErrDuplicateRoom                   = errors.New("room code already exists")
+	ErrRoomNotFound                    = errors.New("room code was not found")
+	ErrUnauthorized                    = errors.New("invalid room credential")
+	ErrAccountSeated                   = errors.New("account already occupies a seat")
+	ErrInsufficientFunds               = errors.New("insufficient coin balance")
+	ErrInvalidCoinAmount               = errors.New("coin amount must be a positive integer")
+	ErrIdempotencyRequired             = errors.New("idempotency key is required")
+	ErrIdempotencyConflict             = errors.New("idempotency key was already used with different data")
+	errorsUnsupportedCommandRepository = errors.New("repository does not support idempotent commands")
 )
 
 const (
@@ -36,6 +35,7 @@ const (
 type Snapshot struct {
 	State    domain.State
 	Revision uint64
+	Presence map[string]bool
 }
 type CredentialDigest [sha256.Size]byte
 type Mutation func(*domain.Room, string) error
@@ -103,30 +103,12 @@ type ScheduleFunc func(time.Duration, func()) Timer
 
 type Service struct {
 	repository        Repository
-	events            Events
 	generateCode      Generator
 	generateToken     Generator
 	generatePlayerID  Generator
 	now               func() time.Time
-	schedule          ScheduleFunc
 	gracePeriod       time.Duration
 	heartbeatInterval time.Duration
-	retryDelay        time.Duration
-	maxRetries        int
-	reportError       func(error)
-	presenceMu        sync.Mutex
-	presenceTimers    map[string]scheduledPresence
-	presenceVersions  map[string]presenceVersion
-}
-
-type scheduledPresence struct {
-	version presenceVersion
-	timer   Timer
-}
-
-type presenceVersion struct {
-	round      uint64
-	generation uint64
 }
 
 const (
@@ -163,25 +145,13 @@ func NewServiceWithPresenceConfig(repository Repository, events Events, code, to
 	if config.Now == nil {
 		config.Now = time.Now
 	}
-	if config.Schedule == nil {
-		config.Schedule = func(delay time.Duration, run func()) Timer { return time.AfterFunc(delay, run) }
-	}
 	if config.GracePeriod == 0 {
 		config.GracePeriod = DefaultPresenceGracePeriod
 	}
 	if config.HeartbeatInterval == 0 {
 		config.HeartbeatInterval = PresenceHeartbeatInterval
 	}
-	if config.RetryDelay == 0 {
-		config.RetryDelay = defaultPresenceRetryDelay
-	}
-	if config.MaxRetries == 0 {
-		config.MaxRetries = defaultPresenceMaxRetries
-	}
-	if config.ReportError == nil {
-		config.ReportError = func(err error) { slog.Error("room presence expiry failed", "error", err) }
-	}
-	return &Service{repository: repository, events: events, generateCode: code, generateToken: token, generatePlayerID: playerID, now: config.Now, schedule: config.Schedule, gracePeriod: config.GracePeriod, heartbeatInterval: config.HeartbeatInterval, retryDelay: config.RetryDelay, maxRetries: config.MaxRetries, reportError: config.ReportError, presenceTimers: map[string]scheduledPresence{}, presenceVersions: map[string]presenceVersion{}}
+	return &Service{repository: repository, generateCode: code, generateToken: token, generatePlayerID: playerID, now: config.Now, gracePeriod: config.GracePeriod, heartbeatInterval: config.HeartbeatInterval}
 }
 
 func (s *Service) Create(ctx context.Context, authUserID string) (Credentials, error) {
@@ -229,15 +199,12 @@ func (s *Service) Join(ctx context.Context, code, authUserID string) (Credential
 			return Credentials{}, err
 		}
 		now := s.now()
-		_, leases, err := s.repository.JoinFunded(ctx, code, id, DigestToken(token), authUserID, s.presenceWindow(now))
+		_, _, err = s.repository.JoinFunded(ctx, code, id, DigestToken(token), authUserID, s.presenceWindow(now))
 		if errors.Is(err, domain.ErrDuplicatePlayer) {
 			continue
 		}
 		if err != nil {
 			return Credentials{}, err
-		}
-		for _, lease := range leases {
-			s.installPresence(lease)
 		}
 		return Credentials{RoomCode: code, PlayerToken: token}, nil
 	}
@@ -280,6 +247,16 @@ func (s *Service) Recharge(ctx context.Context, authUserID string, amount int64,
 	if idempotencyKey == "" || len(idempotencyKey) > 128 {
 		return 0, ErrIdempotencyRequired
 	}
+	if repository, ok := s.repository.(CommandRepository); ok {
+		command, err := NewCommand(idempotencyKey, "wallet.recharge", struct {
+			Amount int64 `json:"amount"`
+		}{amount})
+		if err != nil {
+			return 0, err
+		}
+		result, err := repository.RechargeCommand(ctx, authUserID, amount, command)
+		return result.Balance, err
+	}
 	return s.repository.Recharge(ctx, authUserID, amount, idempotencyKey)
 }
 
@@ -294,12 +271,9 @@ func (s *Service) Analytics(ctx context.Context, authUserID string) (Analytics, 
 // authoritative leases for both seats so an expired opponent is reconsidered.
 func (s *Service) RefreshPresence(ctx context.Context, code, token, authUserID string) error {
 	now := s.now()
-	leases, err := s.repository.RefreshPresence(ctx, code, DigestToken(token), authUserID, s.presenceWindow(now))
+	_, err := s.repository.RefreshPresence(ctx, code, DigestToken(token), authUserID, s.presenceWindow(now))
 	if err != nil {
 		return err
-	}
-	for _, lease := range leases {
-		s.installPresence(lease)
 	}
 	return nil
 }
@@ -311,73 +285,6 @@ func (s *Service) presenceDeadline(now time.Time) time.Time {
 func (s *Service) presenceWindow(now time.Time) PresenceWindow {
 	deadline := s.presenceDeadline(now)
 	return PresenceWindow{ObservedAt: now, ProofAfter: deadline, Deadline: deadline, EvaluateAt: deadline.Add(s.heartbeatInterval)}
-}
-
-func (s *Service) installPresence(lease PresenceLease) {
-	key := lease.RoomCode + ":" + lease.PlayerID
-	s.presenceMu.Lock()
-	version := presenceVersion{round: lease.Round, generation: lease.Generation}
-	if current, exists := s.presenceVersions[key]; exists && !version.after(current) {
-		s.presenceMu.Unlock()
-		return
-	}
-	s.presenceVersions[key] = version
-	previous, exists := s.presenceTimers[key]
-	if exists {
-		previous.timer.Stop()
-		delete(s.presenceTimers, key)
-	}
-	if lease.Active {
-		s.schedulePresenceLocked(key, lease, 0, maxDuration(lease.EvaluateAt.Sub(s.now())))
-	}
-	s.presenceMu.Unlock()
-}
-
-func (s *Service) schedulePresenceLocked(key string, lease PresenceLease, attempt int, delay time.Duration) {
-	timer := s.schedule(delay, func() { s.expirePresence(key, lease, attempt) })
-	s.presenceTimers[key] = scheduledPresence{version: presenceVersion{round: lease.Round, generation: lease.Generation}, timer: timer}
-}
-
-func (s *Service) expirePresence(key string, lease PresenceLease, attempt int) {
-	ctx, cancel := context.WithTimeout(context.Background(), presenceAttemptTimeout)
-	_, _, err := s.repository.ForfeitExpired(ctx, lease, s.now())
-	cancel()
-	if err != nil {
-		s.reportError(fmt.Errorf("resolve presence expiry for room %s: %w", lease.RoomCode, err))
-	}
-	s.presenceMu.Lock()
-	defer s.presenceMu.Unlock()
-	current, exists := s.presenceTimers[key]
-	if !exists || current.version != (presenceVersion{round: lease.Round, generation: lease.Generation}) {
-		return
-	}
-	if err != nil && attempt < s.maxRetries {
-		s.schedulePresenceLocked(key, lease, attempt+1, s.retryDelay)
-		return
-	}
-	delete(s.presenceTimers, key)
-}
-
-func (v presenceVersion) after(other presenceVersion) bool {
-	return v.round > other.round || (v.round == other.round && v.generation > other.generation)
-}
-
-func maxDuration(value time.Duration) time.Duration {
-	if value < 0 {
-		return 0
-	}
-	return value
-}
-
-// Subscribe registers before loading state, so a concurrent change is never missed.
-func (s *Service) Subscribe(ctx context.Context, code string) (Snapshot, <-chan struct{}, func(), error) {
-	changes, unsubscribe := s.events.Subscribe(code)
-	snapshot, err := s.repository.Snapshot(ctx, code)
-	if err != nil {
-		unsubscribe()
-		return Snapshot{}, nil, nil, err
-	}
-	return snapshot, changes, unsubscribe, nil
 }
 
 func DigestToken(token string) CredentialDigest { return sha256.Sum256([]byte(token)) }

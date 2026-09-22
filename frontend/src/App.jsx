@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import * as api from './api.js'
+import { connectToRoom } from './realtime.js'
 import firstMove from './assets/first-move.png'
 import secondMove from './assets/second-move.png'
 import { clearSession, loadSession, saveSession } from './storage.js'
@@ -305,7 +306,7 @@ function Room({ session, onLeave, walletBalance }) {
   useEffect(() => {
     let active = true
 
-    const close = api.subscribeToRoom(session.roomCode, {
+    const close = connectToRoom(session.roomCode, {
       onOpen: () => {
         if (active) setConnectionError('')
       },
@@ -321,7 +322,7 @@ function Room({ session, onLeave, walletBalance }) {
           signalEconomyChanged()
         }
         previousEconomyStateRef.current = nextState
-        const serverPlayer = nextState.players.find((player) => player.role === session.role)
+        const serverPlayer = nextState.players.find((player) => player.role === nextState.playerRole)
         if (serverPlayer?.submitted) setMovePending(false)
         setConnectionError('')
         setLoading(false)
@@ -337,31 +338,7 @@ function Room({ session, onLeave, walletBalance }) {
       active = false
       close()
     }
-  }, [session.roomCode, session.role, connectionAttempt, onLeave])
-
-  useEffect(() => {
-    let active = true
-    let presenceController = null
-    const refresh = async () => {
-      if (presenceController) return
-      const requestController = new AbortController()
-      presenceController = requestController
-      try {
-        await api.refreshPresence(session.roomCode, session.playerToken, { signal: requestController.signal })
-      } catch (presenceError) {
-        if (active && !requestController.signal.aborted) setConnectionError(displayError(presenceError))
-      } finally {
-        if (presenceController === requestController) presenceController = null
-      }
-    }
-    refresh()
-    const heartbeat = window.setInterval(refresh, api.PRESENCE_HEARTBEAT_MS)
-    return () => {
-      active = false
-      window.clearInterval(heartbeat)
-      presenceController?.abort()
-    }
-  }, [session.roomCode, session.playerToken])
+  }, [session.roomCode, connectionAttempt, onLeave])
 
   async function performAction(name, request) {
     if (actionLockRef.current) return
@@ -382,9 +359,10 @@ function Room({ session, onLeave, walletBalance }) {
     }
   }
 
-  const currentPlayer = state?.players.find((player) => player.role === session.role)
+  const role = state?.playerRole
+  const currentPlayer = state?.players.find((player) => player.role === role)
   const hasSubmitted = (currentPlayer?.submitted ?? false) || movePending
-  const opponent = state?.players.find((player) => player.role !== session.role)
+  const opponent = state?.players.find((player) => player.role !== role)
   const wantsNextRound = currentPlayer?.wantsNextRound ?? false
   const canLeave = state?.resolved || (state?.ready === false && state.players.length === 1)
   const insufficientForRound = walletBalance !== null && BigInt(walletBalance) < 50n
@@ -407,7 +385,7 @@ function Room({ session, onLeave, walletBalance }) {
           className="button button-quiet"
           disabled={action !== null || !canLeave}
           onClick={() => performAction('leave', async () => {
-            await api.leaveRoom(session.roomCode, session.playerToken)
+            await api.leaveRoom(session.roomCode)
             if (mountedRef.current) onLeave()
           })}
         >
@@ -415,7 +393,7 @@ function Room({ session, onLeave, walletBalance }) {
         </button>
       </header>
 
-      <Scoreboard players={state?.players} role={session.role} resolved={state?.resolved} />
+      <Scoreboard players={state?.players} role={role} resolved={state?.resolved} />
 
       <ErrorNotice
         message={error || connectionError}
@@ -448,7 +426,7 @@ function Room({ session, onLeave, walletBalance }) {
                 className="move-button"
                 key={move.value}
                 disabled={hasSubmitted || action !== null}
-                onClick={() => performAction('move', () => api.submitMove(session.roomCode, session.playerToken, move.value))}
+                onClick={() => performAction('move', () => api.submitMove(session.roomCode, move.value))}
               >
                 <span aria-hidden="true">{move.symbol}</span>
                 {move.label}
@@ -461,7 +439,7 @@ function Room({ session, onLeave, walletBalance }) {
 
       {state?.resolved && (
         <section className="game-panel">
-          <RoundResult state={state} role={session.role} />
+          <RoundResult state={state} role={role} />
           <p aria-live="polite">
             {wantsNextRound
               ? 'You want another round. Waiting for your opponent to decide.'
@@ -472,7 +450,7 @@ function Room({ session, onLeave, walletBalance }) {
           <button
             className="button button-primary"
             disabled={action !== null || wantsNextRound || insufficientForRound}
-            onClick={() => performAction('next', () => api.startNextRound(session.roomCode, session.playerToken, state.round))}
+            onClick={() => performAction('next', () => api.startNextRound(session.roomCode, state.round))}
           >
             {action === 'next'
               ? 'Sending request…'
@@ -497,60 +475,18 @@ function Room({ session, onLeave, walletBalance }) {
 
 export function GameApp({ walletBalance = null }) {
   const [session, setSession] = useState(() => loadSession())
-  const [sessionReady, setSessionReady] = useState(() => !session)
-  const [validationError, setValidationError] = useState('')
-  const [validationAttempt, setValidationAttempt] = useState(0)
 
-  useEffect(() => {
-    if (!session || sessionReady) return undefined
-
-    const controller = new AbortController()
-    let active = true
-
-    api.validateSession(session.roomCode, session.playerToken, session.role, { signal: controller.signal })
-      .then(() => {
-        if (active) setSessionReady(true)
-      })
-      .catch((requestError) => {
-        if (!active || controller.signal.aborted) return
-        if (requestError?.status === 401 || requestError?.status === 404) {
-          clearSession()
-          setSession(null)
-          return
-        }
-        setValidationError(displayError(requestError))
-      })
-
-    return () => {
-      active = false
-      controller.abort()
-    }
-  }, [session, sessionReady, validationAttempt])
-
-  function leaveRoom() {
+  const leaveRoom = useCallback(() => {
     clearSession()
     setSession(null)
-    setSessionReady(false)
-    setValidationError('')
-  }
+  }, [])
 
   function enterRoom(nextSession) {
     setSession(nextSession)
-    setSessionReady(true)
-    setValidationError('')
-  }
-
-  function retryValidation() {
-    setValidationError('')
-    setValidationAttempt((attempt) => attempt + 1)
-  }
-
-  if (session && !sessionReady) {
-    return <SessionRecovery error={validationError} onRetry={retryValidation} onForget={leaveRoom} />
   }
 
   return session ? (
-    <Room key={`${session.roomCode}:${session.playerToken}`} session={session} onLeave={leaveRoom} walletBalance={walletBalance} />
+    <Room key={session.roomCode} session={session} onLeave={leaveRoom} walletBalance={walletBalance} />
   ) : (
     <Home onEnterRoom={enterRoom} walletBalance={walletBalance} />
   )
@@ -619,6 +555,30 @@ export default function App() {
   const [pendingEmail, setPendingEmail] = useState('')
   const [error, setError] = useState(supabase ? '' : 'Supabase authentication is not configured.')
   const [walletBalance, setWalletBalance] = useState(null)
+  const backendTokenRef = useRef('')
+  const backendSessionTaskRef = useRef(Promise.resolve())
+  const authSequenceRef = useRef(0)
+
+  const establishSession = useCallback((nextSession) => {
+    const sequence = ++authSequenceRef.current
+    const task = backendSessionTaskRef.current.then(async () => {
+      if (!nextSession) {
+        backendTokenRef.current = ''
+        if (sequence === authSequenceRef.current) {
+          clearSession()
+          setAuthSession(null)
+        }
+        return
+      }
+      if (backendTokenRef.current !== nextSession.access_token) {
+        await api.bootstrapSession(nextSession.access_token)
+        backendTokenRef.current = nextSession.access_token
+      }
+      if (sequence === authSequenceRef.current) setAuthSession(nextSession)
+    })
+    backendSessionTaskRef.current = task.catch(() => {})
+    return task
+  }, [])
 
   useEffect(() => {
     if (!supabase) {
@@ -626,37 +586,44 @@ export default function App() {
     }
     let active = true
     let authStateObserved = false
-    supabase.auth.getSession().then(({ data, error: sessionError }) => {
+    supabase.auth.getSession().then(async ({ data, error: sessionError }) => {
       if (!active || authStateObserved) return
-      if (sessionError) setError(displayError(sessionError))
-      setAuthSession(data.session ?? null)
-      if (!data.session) clearSession()
+      try {
+        if (sessionError) throw sessionError
+        await establishSession(data.session ?? null)
+      } catch (sessionFailure) {
+        if (active) setError(displayError(sessionFailure))
+      }
       setLoading(false)
     })
     const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, nextSession) => {
       if (!active) return
       authStateObserved = true
-      setAuthSession(nextSession)
       setPendingEmail('')
       setError('')
-      if (!nextSession) clearSession()
-      setLoading(false)
+      establishSession(nextSession).catch((sessionFailure) => {
+        if (active) setError(displayError(sessionFailure))
+      }).finally(() => {
+        if (active) setLoading(false)
+      })
     })
     return () => {
       active = false
       subscription.unsubscribe()
     }
-  }, [])
+  }, [establishSession])
 
   async function signOut() {
     setError('')
     try {
+      await api.logoutSession()
       const { error: signOutError } = await supabase.auth.signOut()
       if (signOutError) {
         setError(displayError(signOutError))
         return
       }
       clearSession()
+      backendTokenRef.current = ''
       setAuthSession(null)
     } catch (signOutError) {
       setError(displayError(signOutError))
@@ -679,7 +646,7 @@ export default function App() {
       </main>
     )
   }
-  if (!authSession) return <AuthForm initialError={error} onAuthenticated={setAuthSession} onPending={setPendingEmail} onDismissInitialError={() => setError('')} />
+  if (!authSession) return <AuthForm initialError={error} onAuthenticated={(session) => establishSession(session).catch((sessionFailure) => setError(displayError(sessionFailure)))} onPending={setPendingEmail} onDismissInitialError={() => setError('')} />
 
   return (
     <div className="authenticated-app">

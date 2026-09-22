@@ -2,7 +2,6 @@ package roomhttp
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
 	"errors"
 	"log/slog"
@@ -128,21 +127,6 @@ func TestPostCommitPanicLogsOnceAndRepanics(t *testing.T) {
 				t.Fatalf("post-commit panic log = %#v", entry)
 			}
 		})
-	}
-}
-
-func TestSSEFailureLogPreservesCauseAndCorrelation(t *testing.T) {
-	var logs bytes.Buffer
-	logger := slog.New(slog.NewJSONHandler(&logs, nil))
-	rt := &router{logger: logger}
-	request := httptest.NewRequest(http.MethodGet, "/api/rooms/ABC234/events", nil)
-	request = request.WithContext(context.WithValue(request.Context(), requestIDContextKey{}, "request-123"))
-
-	rt.logSSEFailure(request, "room_event", errors.New("connection reset by peer"))
-
-	entries := errorLogEntries(t, logs.String())
-	if len(entries) != 1 || entries[0]["request_id"] != "request-123" || entries[0]["error"] != "connection reset by peer" || entries[0]["kind"] != "sse_error" || entries[0]["phase"] != "room_event" {
-		t.Fatalf("SSE error logs = %#v", entries)
 	}
 }
 

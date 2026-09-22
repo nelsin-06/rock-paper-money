@@ -147,11 +147,7 @@ func Restore(state PersistenceState) (*Room, error) {
 			return nil, ErrInvalidState
 		}
 		if state.ForfeitedPlayerID == "" {
-			if len(state.Moves) != 2 {
-				return nil, ErrInvalidState
-			}
-			result, _ := DetermineResult(state.Moves[state.Players[0].ID], state.Moves[state.Players[1].ID])
-			if result != state.Result {
+			if !validResolvedMoves(state) {
 				return nil, ErrInvalidState
 			}
 		} else {
@@ -281,6 +277,58 @@ func (r *Room) Forfeit(playerID string, expectedRound uint64) error {
 	return nil
 }
 
+// ResolveInactivity deterministically resolves a funded round with zero or one move.
+func (r *Room) ResolveInactivity(expectedRound uint64) error {
+	if err := r.validateDeadlineResolution(expectedRound); err != nil {
+		return err
+	}
+	switch len(r.moves) {
+	case 0:
+		r.result = Draw
+	case 1:
+		for index, player := range r.players {
+			if _, submitted := r.moves[player.ID]; submitted {
+				if index == 0 {
+					r.result = PlayerOneWins
+				} else {
+					r.result = PlayerTwoWins
+				}
+				r.players[index].Wins++
+			}
+		}
+	default:
+		return ErrRoundResolved
+	}
+	r.resolved = true
+	return nil
+}
+
+// ResolveDeadlineDraw refunds both stakes when neither player remains present.
+func (r *Room) ResolveDeadlineDraw(expectedRound uint64) error {
+	if err := r.validateDeadlineResolution(expectedRound); err != nil {
+		return err
+	}
+	r.resolved = true
+	r.result = Draw
+	return nil
+}
+
+func (r *Room) validateDeadlineResolution(expectedRound uint64) error {
+	if r.closed {
+		return ErrRoomClosed
+	}
+	if expectedRound != r.round {
+		return ErrStaleRound
+	}
+	if r.resolved {
+		return ErrRoundResolved
+	}
+	if len(r.players) != 2 {
+		return ErrRoomNotReady
+	}
+	return nil
+}
+
 func (r *Room) State() State {
 	players := make([]Player, len(r.players))
 	for i, p := range r.players {
@@ -333,4 +381,23 @@ func cloneRequests(in map[string]bool) map[string]bool {
 		out[k] = v
 	}
 	return out
+}
+
+func validResolvedMoves(state PersistenceState) bool {
+	if len(state.Moves) == 2 {
+		result, _ := DetermineResult(state.Moves[state.Players[0].ID], state.Moves[state.Players[1].ID])
+		return result == state.Result
+	}
+	if len(state.Moves) == 0 {
+		return state.Result == Draw
+	}
+	if len(state.Moves) == 1 {
+		_, hostMoved := state.Moves[state.Players[0].ID]
+		if hostMoved {
+			return state.Result == PlayerOneWins
+		}
+		_, guestMoved := state.Moves[state.Players[1].ID]
+		return guestMoved && state.Result == PlayerTwoWins
+	}
+	return false
 }

@@ -2,7 +2,6 @@ package memory
 
 import (
 	"context"
-	"crypto/subtle"
 	"errors"
 	"fmt"
 	"math"
@@ -20,6 +19,8 @@ type Repository struct {
 	wallets   map[string]int64
 	recharges map[string]memoryRecharge
 	history   []application.PlayedRound
+	commandMu sync.Mutex
+	receipts  map[string]memoryReceipt
 }
 type storedRoom struct {
 	room        *domain.Room
@@ -35,6 +36,12 @@ type memoryRecharge struct {
 	amount int64
 }
 
+type memoryReceipt struct {
+	accountID string
+	command   application.Command
+	result    application.CommandResult
+}
+
 type memoryPresence struct {
 	generation  uint64
 	refreshedAt time.Time
@@ -43,7 +50,81 @@ type memoryPresence struct {
 
 func New() (*Repository, *Events) {
 	events := NewEvents()
-	return &Repository{rooms: map[string]*storedRoom{}, events: events, wallets: map[string]int64{"house": 0}, recharges: map[string]memoryRecharge{}}, events
+	return &Repository{rooms: map[string]*storedRoom{}, events: events, wallets: map[string]int64{"house": 0}, recharges: map[string]memoryRecharge{}, receipts: map[string]memoryReceipt{}}, events
+}
+
+func (r *Repository) CreateCommand(ctx context.Context, aggregate *domain.Room, accountID string, command application.Command) (application.CommandResult, error) {
+	return r.executeCommand(accountID, command, func() (application.CommandResult, error) {
+		snapshot, err := r.Create(ctx, aggregate, application.DigestToken(aggregate.State().Players[0].ID), accountID)
+		return application.CommandResult{Snapshot: snapshot}, err
+	})
+}
+
+func (r *Repository) JoinCommand(ctx context.Context, code, playerID, accountID string, window application.PresenceWindow, command application.Command) (application.CommandResult, error) {
+	return r.executeCommand(accountID, command, func() (application.CommandResult, error) {
+		snapshot, leases, err := r.JoinFunded(ctx, code, playerID, application.DigestToken(playerID), accountID, window)
+		return application.CommandResult{Snapshot: snapshot, Leases: leases}, err
+	})
+}
+
+func (r *Repository) SubmitMoveCommand(ctx context.Context, code, accountID string, move domain.Move, command application.Command) (application.CommandResult, error) {
+	return r.executeCommand(accountID, command, func() (application.CommandResult, error) {
+		snapshot, err := r.SubmitMoveAndSettle(ctx, code, application.CredentialDigest{}, accountID, move)
+		return application.CommandResult{Snapshot: snapshot}, err
+	})
+}
+
+func (r *Repository) RequestNextRoundCommand(ctx context.Context, code, accountID string, round uint64, command application.Command) (application.CommandResult, error) {
+	return r.executeCommand(accountID, command, func() (application.CommandResult, error) {
+		snapshot, err := r.RequestNextRoundAndFund(ctx, code, application.CredentialDigest{}, accountID, round)
+		return application.CommandResult{Snapshot: snapshot}, err
+	})
+}
+
+func (r *Repository) MutateCommand(ctx context.Context, code, accountID string, mutation application.Mutation, command application.Command) (application.CommandResult, error) {
+	return r.executeCommand(accountID, command, func() (application.CommandResult, error) {
+		snapshot, err := r.Mutate(ctx, code, application.CredentialDigest{}, accountID, mutation)
+		return application.CommandResult{Snapshot: snapshot}, err
+	})
+}
+
+func (r *Repository) RechargeCommand(ctx context.Context, accountID string, amount int64, command application.Command) (application.CommandResult, error) {
+	return r.executeCommand(accountID, command, func() (application.CommandResult, error) {
+		balance, err := r.Recharge(ctx, accountID, amount, command.Key)
+		return application.CommandResult{Balance: balance}, err
+	})
+}
+
+func (r *Repository) SnapshotForAccount(ctx context.Context, code, accountID string) (application.Snapshot, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	stored, err := r.room(code)
+	if err != nil {
+		return application.Snapshot{}, err
+	}
+	if playerForAccount(stored.owners, accountID) == "" {
+		return application.Snapshot{}, application.ErrUnauthorized
+	}
+	return application.Snapshot{State: stored.room.State(), Revision: stored.revision}, nil
+}
+
+func (r *Repository) executeCommand(accountID string, command application.Command, execute func() (application.CommandResult, error)) (application.CommandResult, error) {
+	r.commandMu.Lock()
+	defer r.commandMu.Unlock()
+	if receipt, ok := r.receipts[command.Key]; ok {
+		if receipt.accountID != accountID || receipt.command.Operation != command.Operation || receipt.command.RequestHash != command.RequestHash {
+			return application.CommandResult{}, application.ErrIdempotencyConflict
+		}
+		result := receipt.result
+		result.Replayed = true
+		return result, nil
+	}
+	result, err := execute()
+	if err != nil {
+		return application.CommandResult{}, err
+	}
+	r.receipts[command.Key] = memoryReceipt{accountID: accountID, command: command, result: result}
+	return result, nil
 }
 
 func (r *Repository) Create(_ context.Context, aggregate *domain.Room, digest application.CredentialDigest, authUserID string) (application.Snapshot, error) {
@@ -398,16 +479,25 @@ func (r *Repository) changed(code string, stored *storedRoom) application.Snapsh
 	return application.Snapshot{State: stored.room.State(), Revision: stored.revision}
 }
 func authenticate(credentials map[string]application.CredentialDigest, owners map[string]string, digest application.CredentialDigest, authUserID string) (string, bool) {
-	for id, stored := range credentials {
-		if equalDigest(stored, digest) && owners[id] == authUserID && authUserID != "" {
-			return id, true
+	_ = credentials
+	_ = digest
+	id := playerForAccount(owners, authUserID)
+	return id, id != ""
+}
+
+func playerForAccount(owners map[string]string, accountID string) string {
+	if accountID == "" {
+		return ""
+	}
+	for id, owner := range owners {
+		if owner == accountID {
+			return id
 		}
 	}
-	return "", false
+	return ""
 }
-func equalDigest(a, b application.CredentialDigest) bool {
-	return subtle.ConstantTimeCompare(a[:], b[:]) == 1
-}
+
+func equalDigest(a, b application.CredentialDigest) bool { return a == b }
 
 type Events struct {
 	mu    sync.Mutex

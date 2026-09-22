@@ -1,7 +1,6 @@
 import { APP_VERSION } from './version.js'
 
 const STORAGE_KEY = 'rock-paper-money.session'
-const ROLES = new Set(['host', 'guest'])
 const SEMANTIC_VERSION = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/
 
 function parseVersion(version) {
@@ -27,10 +26,8 @@ export function isValidSession(value) {
     value &&
       typeof value.roomCode === 'string' &&
       /^[A-Z0-9]{6}$/.test(value.roomCode) &&
-      typeof value.playerToken === 'string' &&
-      value.playerToken.length > 0 &&
-      !/\s/.test(value.playerToken) &&
-      ROLES.has(value.role),
+      !Object.hasOwn(value, 'playerToken') &&
+      !Object.hasOwn(value, 'role'),
   )
 }
 
@@ -42,7 +39,7 @@ export function loadSession(storage = localStorage, currentVersion = APP_VERSION
       return null
     }
 
-    const session = { roomCode: value.roomCode, playerToken: value.playerToken, role: value.role }
+    const session = { roomCode: value.roomCode }
     if (value.version !== currentVersion) {
       storage.setItem(STORAGE_KEY, JSON.stringify({ ...session, version: currentVersion }))
     }

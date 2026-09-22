@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"time"
 
+	"example.com/rock-paper-money/internal/latency"
 	"example.com/rock-paper-money/internal/room/application"
 	"example.com/rock-paper-money/internal/room/domain"
 	"github.com/jackc/pgx/v5"
@@ -15,12 +16,57 @@ import (
 
 type Repository struct{ pool *pgxpool.Pool }
 
-var errPresenceLeaseCurrent = errors.New("presence lease is still current")
+var (
+	errPresenceLeaseCurrent  = errors.New("presence lease is still current")
+	ErrFundedEscrowRemaining = errors.New("funded escrow remains")
+)
 
 func NewRepository(pool *pgxpool.Pool) *Repository   { return &Repository{pool: pool} }
 func (r *Repository) Ping(ctx context.Context) error { return r.pool.Ping(ctx) }
 
-func (r *Repository) Create(ctx context.Context, aggregate *domain.Room, digest application.CredentialDigest, authUserID string) (application.Snapshot, error) {
+func (r *Repository) ResetDisposableRooms(ctx context.Context) error {
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	if _, err = tx.Exec(ctx, "SELECT pg_advisory_xact_lock($1)", int64(0x52504d52)); err != nil {
+		return err
+	}
+	if _, err = tx.Exec(ctx, "LOCK TABLE room_rooms IN ACCESS EXCLUSIVE MODE"); err != nil {
+		return err
+	}
+	rows, err := tx.Query(ctx, "SELECT account_id,balance FROM wallet_accounts WHERE account_type='escrow' ORDER BY account_id FOR UPDATE")
+	if err != nil {
+		return err
+	}
+	funded := false
+	for rows.Next() {
+		var accountID string
+		var balance int64
+		if err = rows.Scan(&accountID, &balance); err != nil {
+			rows.Close()
+			return err
+		}
+		if balance != 0 {
+			funded = true
+		}
+	}
+	if err = rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	rows.Close()
+	if funded {
+		return ErrFundedEscrowRemaining
+	}
+	if _, err = tx.Exec(ctx, "DELETE FROM room_rooms"); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+func (r *Repository) Create(ctx context.Context, aggregate *domain.Room, _ application.CredentialDigest, authUserID string) (application.Snapshot, error) {
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
 		return application.Snapshot{}, err
@@ -49,7 +95,7 @@ func (r *Repository) Create(ctx context.Context, aggregate *domain.Room, digest 
 	if _, err = tx.Exec(ctx, "INSERT INTO room_rounds(room_code,number) VALUES($1,1)", state.Code); err != nil {
 		return application.Snapshot{}, err
 	}
-	if _, err = tx.Exec(ctx, "INSERT INTO room_seats(room_code,role,player_id,credential_digest,auth_user_id) VALUES($1,'host',$2,$3,$4)", state.Code, state.Players[0].ID, digest[:], authUserID); err != nil {
+	if _, err = tx.Exec(ctx, "INSERT INTO room_seats(room_code,role,player_id,auth_user_id) VALUES($1,'host',$2,$3)", state.Code, state.Players[0].ID, authUserID); err != nil {
 		return application.Snapshot{}, err
 	}
 	if err = tx.Commit(ctx); err != nil {
@@ -58,7 +104,7 @@ func (r *Repository) Create(ctx context.Context, aggregate *domain.Room, digest 
 	return application.Snapshot{State: aggregate.State(), Revision: 1}, nil
 }
 
-func (r *Repository) JoinFunded(ctx context.Context, code, playerID string, digest application.CredentialDigest, authUserID string, window application.PresenceWindow) (application.Snapshot, []application.PresenceLease, error) {
+func (r *Repository) JoinFunded(ctx context.Context, code, playerID string, _ application.CredentialDigest, authUserID string, window application.PresenceWindow) (application.Snapshot, []application.PresenceLease, error) {
 	var leases []application.PresenceLease
 	snapshot, err := r.write(ctx, code, nil, "", func(tx pgx.Tx, aggregate *domain.Room, _ string) error {
 		if err := aggregate.Join(playerID); err != nil {
@@ -74,7 +120,7 @@ func (r *Repository) JoinFunded(ctx context.Context, code, playerID string, dige
 		if err := fundRound(ctx, tx, code, aggregate.State().Round, authUserID); err != nil {
 			return err
 		}
-		_, err := tx.Exec(ctx, "INSERT INTO room_seats(room_code,role,player_id,credential_digest,auth_user_id) VALUES($1,'guest',$2,$3,$4)", code, playerID, digest[:], authUserID)
+		_, err := tx.Exec(ctx, "INSERT INTO room_seats(room_code,role,player_id,auth_user_id) VALUES($1,'guest',$2,$3)", code, playerID, authUserID)
 		if isUnique(err) {
 			return application.ErrAccountSeated
 		}
@@ -157,7 +203,7 @@ func (r *Repository) write(ctx context.Context, code string, digest *application
 	playerID := ""
 	if digest != nil {
 		var role string
-		err = tx.QueryRow(ctx, "SELECT player_id,role FROM room_seats WHERE room_code=$1 AND credential_digest=$2 AND auth_user_id=$3", code, digest[:], authUserID).Scan(&playerID, &role)
+		err = tx.QueryRow(ctx, "SELECT player_id,role FROM room_seats WHERE room_code=$1 AND auth_user_id=$2", code, authUserID).Scan(&playerID, &role)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return application.Snapshot{}, application.ErrUnauthorized
 		} else if err != nil {
@@ -170,9 +216,6 @@ func (r *Repository) write(ctx context.Context, code string, digest *application
 	}
 	revision++
 	if err = save(ctx, tx, aggregate, roles, previousRound, revision); err != nil {
-		return application.Snapshot{}, err
-	}
-	if _, err = tx.Exec(ctx, "SELECT pg_notify('room_changes',$1)", fmt.Sprintf("%s:%d", code, revision)); err != nil {
 		return application.Snapshot{}, err
 	}
 	if err = tx.Commit(ctx); err != nil {
@@ -203,7 +246,7 @@ func (r *Repository) Snapshot(ctx context.Context, code string) (application.Sna
 	return application.Snapshot{State: aggregate.State(), Revision: revision}, nil
 }
 
-func (r *Repository) Authenticate(ctx context.Context, code string, digest application.CredentialDigest, authUserID string) (application.Snapshot, string, error) {
+func (r *Repository) Authenticate(ctx context.Context, code string, _ application.CredentialDigest, authUserID string) (application.Snapshot, string, error) {
 	tx, err := r.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
 	if err != nil {
 		return application.Snapshot{}, "", err
@@ -216,7 +259,7 @@ func (r *Repository) Authenticate(ctx context.Context, code string, digest appli
 		return application.Snapshot{}, "", err
 	}
 	var role string
-	if err = tx.QueryRow(ctx, "SELECT role FROM room_seats WHERE room_code=$1 AND credential_digest=$2 AND auth_user_id=$3", code, digest[:], authUserID).Scan(&role); errors.Is(err, pgx.ErrNoRows) {
+	if err = tx.QueryRow(ctx, "SELECT role FROM room_seats WHERE room_code=$1 AND auth_user_id=$2", code, authUserID).Scan(&role); errors.Is(err, pgx.ErrNoRows) {
 		return application.Snapshot{}, "", application.ErrUnauthorized
 	} else if err != nil {
 		return application.Snapshot{}, "", err
@@ -231,7 +274,7 @@ func (r *Repository) Authenticate(ctx context.Context, code string, digest appli
 	return application.Snapshot{State: aggregate.State(), Revision: revision}, role, nil
 }
 
-func (r *Repository) RefreshPresence(ctx context.Context, code string, digest application.CredentialDigest, authUserID string, window application.PresenceWindow) ([]application.PresenceLease, error) {
+func (r *Repository) RefreshPresence(ctx context.Context, code string, _ application.CredentialDigest, authUserID string, window application.PresenceWindow) ([]application.PresenceLease, error) {
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
 		return nil, err
@@ -245,7 +288,7 @@ func (r *Repository) RefreshPresence(ctx context.Context, code string, digest ap
 		return nil, err
 	}
 	var playerID string
-	if err = tx.QueryRow(ctx, "SELECT player_id FROM room_seats WHERE room_code=$1 AND credential_digest=$2 AND auth_user_id=$3", code, digest[:], authUserID).Scan(&playerID); errors.Is(err, pgx.ErrNoRows) {
+	if err = tx.QueryRow(ctx, "SELECT player_id FROM room_seats WHERE room_code=$1 AND auth_user_id=$2", code, authUserID).Scan(&playerID); errors.Is(err, pgx.ErrNoRows) {
 		return nil, application.ErrUnauthorized
 	} else if err != nil {
 		return nil, err
@@ -582,7 +625,7 @@ func escrowAccountID(code string, round uint64) string {
 }
 
 func lockWallets(ctx context.Context, tx pgx.Tx, accountIDs []string) error {
-	rows, err := tx.Query(ctx, "SELECT account_id FROM wallet_accounts WHERE account_id=ANY($1) ORDER BY account_id FOR UPDATE", accountIDs)
+	rows, err := tx.Query(latency.WithQueryName(ctx, "wallet_lock_wait"), "SELECT account_id FROM wallet_accounts WHERE account_id=ANY($1) ORDER BY account_id FOR UPDATE", accountIDs)
 	if err != nil {
 		return err
 	}
@@ -609,7 +652,7 @@ func fundRound(ctx context.Context, tx pgx.Tx, code string, round uint64, joinin
 		return err
 	}
 	if funded {
-		return nil
+		return scheduleInactivityDeadline(ctx, tx, code, round)
 	}
 	rows, err := tx.Query(ctx, "SELECT auth_user_id::text FROM room_seats WHERE room_code=$1 ORDER BY role", code)
 	if err != nil {
@@ -666,8 +709,10 @@ func fundRound(ctx context.Context, tx pgx.Tx, code string, round uint64, joinin
 	var transactionID int64
 	err = tx.QueryRow(ctx, "INSERT INTO wallet_transactions(business_key,transaction_type) VALUES($1,'stake') ON CONFLICT (business_key) DO NOTHING RETURNING transaction_id", businessKey).Scan(&transactionID)
 	if errors.Is(err, pgx.ErrNoRows) {
-		_, err = tx.Exec(ctx, "UPDATE room_rounds SET funded=true WHERE room_code=$1 AND number=$2", code, round)
-		return err
+		if _, err = tx.Exec(ctx, "UPDATE room_rounds SET funded=true WHERE room_code=$1 AND number=$2", code, round); err != nil {
+			return err
+		}
+		return scheduleInactivityDeadline(ctx, tx, code, round)
 	}
 	if err != nil {
 		return err
@@ -681,8 +726,10 @@ func fundRound(ctx context.Context, tx pgx.Tx, code string, round uint64, joinin
 	if _, err = tx.Exec(ctx, "UPDATE wallet_accounts SET balance=balance+$2 WHERE account_id=$1", escrow, application.RoundStake*2); err != nil {
 		return err
 	}
-	_, err = tx.Exec(ctx, "UPDATE room_rounds SET funded=true WHERE room_code=$1 AND number=$2", code, round)
-	return err
+	if _, err = tx.Exec(ctx, "UPDATE room_rounds SET funded=true WHERE room_code=$1 AND number=$2", code, round); err != nil {
+		return err
+	}
+	return scheduleInactivityDeadline(ctx, tx, code, round)
 }
 
 func settleRound(ctx context.Context, tx pgx.Tx, code string, state domain.State) error {

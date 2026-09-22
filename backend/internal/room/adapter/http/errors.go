@@ -29,6 +29,7 @@ type apiErrorMeta struct {
 var (
 	errorNotReady            = publicError(http.StatusServiceUnavailable, "service_unavailable", "Service is unavailable.")
 	errorUnauthorized        = publicError(http.StatusUnauthorized, "unauthorized", "Unauthorized.")
+	errorForbidden           = publicError(http.StatusForbidden, "forbidden", "Forbidden.")
 	errorRoomCodeRequired    = publicError(http.StatusBadRequest, "room_code_required", "Room code is required.")
 	errorInvalidBody         = publicError(http.StatusBadRequest, "invalid_request_body", "Invalid request body.")
 	errorInvalidMove         = publicError(http.StatusBadRequest, "invalid_move", "Invalid move.")

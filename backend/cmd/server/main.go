@@ -14,10 +14,15 @@ import (
 	"time"
 
 	"example.com/rock-paper-money/internal/auth"
+	"example.com/rock-paper-money/internal/latency"
+	"example.com/rock-paper-money/internal/operations"
+	"example.com/rock-paper-money/internal/realtime"
 	roomhttp "example.com/rock-paper-money/internal/room/adapter/http"
 	"example.com/rock-paper-money/internal/room/adapter/postgres"
 	"example.com/rock-paper-money/internal/room/application"
+	"example.com/rock-paper-money/internal/worker"
 	"github.com/jackc/pgx/v5/pgxpool"
+	redis "github.com/redis/go-redis/v9"
 )
 
 const (
@@ -42,6 +47,11 @@ func run() error {
 	}
 	defer logFile.Close()
 	slog.SetDefault(logger)
+	latencyConfig, err := latency.ConfigFromEnv(os.Getenv)
+	if err != nil {
+		return fmt.Errorf("configure latency observability: %w", err)
+	}
+	latencyObserver := latency.NewObserver(logger, latencyConfig)
 
 	databaseURL := os.Getenv("DATABASE_URL")
 	if databaseURL == "" {
@@ -56,16 +66,30 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("configure Supabase authentication: %w", err)
 	}
+	allowedOrigin := os.Getenv("APP_ORIGIN")
+	if allowedOrigin == "" {
+		return errors.New("APP_ORIGIN is required")
+	}
+	redisAddress := os.Getenv("REDIS_ADDR")
+	if redisAddress == "" {
+		return errors.New("REDIS_ADDR is required")
+	}
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8080"
 	}
 	root, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-	pool, err := pgxpool.New(root, databaseURL)
+	poolConfig, err := pgxpool.ParseConfig(databaseURL)
 	if err != nil {
 		return fmt.Errorf("configure database: %w", err)
 	}
+	poolConfig.ConnConfig.Tracer = latencyObserver
+	pool, err := pgxpool.NewWithConfig(root, poolConfig)
+	if err != nil {
+		return fmt.Errorf("configure database: %w", err)
+	}
+	latencyObserver.BindPool(pool)
 	defer pool.Close()
 	startup, cancelStartup := context.WithTimeout(root, 15*time.Second)
 	defer cancelStartup()
@@ -77,21 +101,53 @@ func run() error {
 	}
 	cancelStartup()
 	repository := postgres.NewRepository(pool)
-	events := postgres.NewEvents(pool, logger)
-	if err := events.Start(root); err != nil {
-		return fmt.Errorf("start database notification listener: %w", err)
+	sessions := auth.NewSessionService(auth.NewPostgresSessionStore(pool), nil, nil)
+	security, err := auth.NewRequestSecurity(allowedOrigin, sessions)
+	if err != nil {
+		return fmt.Errorf("configure request security: %w", err)
 	}
-	rooms := application.NewService(repository, events)
-	ready := func(ctx context.Context) error {
+	redisClient := redis.NewClient(&redis.Options{Addr: redisAddress})
+	defer redisClient.Close()
+	transport := realtime.NewRedisTransport(redisClient, time.Second)
+	metrics := operations.NewMetrics()
+	transport.SetObserver(metrics)
+	hub := realtime.NewHub(transport, repository)
+	hub.SetObserver(metrics)
+	sockets := realtime.NewWebSocketHandler(security, sessions, repository, hub, realtime.WebSocketConfig{Observer: metrics, LifecycleContext: root})
+	rooms := application.NewService(repository, nil)
+	ready := func(ctx context.Context) (roomhttp.ReadinessStatus, int) {
 		if err := repository.Ping(ctx); err != nil {
-			return err
+			return roomhttp.ReadinessStatus{Status: "unavailable", PostgreSQL: "unavailable", Realtime: "unknown"}, http.StatusServiceUnavailable
 		}
-		return events.Ready()
+		if err := transport.CheckReady(ctx); err != nil {
+			return roomhttp.ReadinessStatus{Status: "degraded", PostgreSQL: "authoritative", Realtime: "redis_unavailable"}, http.StatusServiceUnavailable
+		}
+		return roomhttp.ReadinessStatus{Status: "ok", PostgreSQL: "authoritative", Realtime: "ready"}, http.StatusOK
 	}
-	server := newHTTPServer(port, roomhttp.NewRouter(rooms, verifier, ready, logger))
+	runtimeContext, stopRuntime := context.WithCancel(context.Background())
+	runtime := operations.NewRuntime(
+		worker.NewDeadlineWorker(repository, time.Now),
+		worker.NewOutboxWorker(repository, transport, worker.OutboxConfig{}),
+		worker.NewCleanupWorker(sessions, repository, time.Now),
+		metrics,
+		logger,
+		operations.Intervals{},
+	)
+	runtime.Start(runtimeContext)
+	defer func() {
+		stopRuntime()
+		runtime.Wait()
+	}()
+	server := newHTTPServer(port, roomhttp.NewOperationalRouter(rooms, verifier, sessions, security, ready, logger, sockets, metrics, latencyObserver))
 
 	logger.Info("server listening", "address", server.Addr)
-	return serveHTTP(root, server, server.ListenAndServe)
+	serveErr := serveHTTP(root, server, server.ListenAndServe)
+	socketShutdownContext, cancelSocketShutdown := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancelSocketShutdown()
+	if err := sockets.Shutdown(socketShutdownContext); err != nil {
+		return errors.Join(serveErr, fmt.Errorf("shut down WebSockets: %w", err))
+	}
+	return serveErr
 }
 
 func newHTTPServer(port string, handler http.Handler) *http.Server {

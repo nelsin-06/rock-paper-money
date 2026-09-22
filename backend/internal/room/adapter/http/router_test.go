@@ -1,7 +1,6 @@
 package roomhttp
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -39,7 +38,7 @@ func TestHTTPContractAndPrivacy(t *testing.T) {
 	if strings.Contains(waiting.Body.String(), "rock") || strings.Contains(waiting.Body.String(), `"moves"`) {
 		t.Fatalf("unresolved move leaked: %s", waiting.Body.String())
 	}
-	assertStatus(t, request(t, handler, http.MethodPost, "/api/rooms/ABC234/moves", guest.PlayerToken, `{"move":"scissors"}`), http.StatusNoContent)
+	assertStatus(t, requestAs(t, handler, http.MethodPost, "/api/rooms/ABC234/moves", "guest-user", guest.PlayerToken, `{"move":"scissors"}`), http.StatusNoContent)
 	resolved := request(t, handler, http.MethodGet, "/api/rooms/ABC234/state", "", "")
 	if !strings.Contains(resolved.Body.String(), "player_one_wins") || !strings.Contains(resolved.Body.String(), "scissors") {
 		t.Fatalf("resolved state = %s", resolved.Body.String())
@@ -51,12 +50,11 @@ func TestHTTPContractAndPrivacy(t *testing.T) {
 		t.Fatalf("analytics response = %s", analytics.Body.String())
 	}
 	assertStatus(t, request(t, handler, http.MethodPost, "/api/rooms/ABC234/moves", host.PlayerToken, `{"move":"paper"}`), http.StatusConflict)
-	assertStatus(t, request(t, handler, http.MethodPost, "/api/rooms/ABC234/validate-session", host.PlayerToken, `{"role":"host"}`), http.StatusNoContent)
-	assertStatus(t, request(t, handler, http.MethodPost, "/api/rooms/ABC234/next-round", guest.PlayerToken, `{"round":1}`), http.StatusNoContent)
+	assertStatus(t, requestAs(t, handler, http.MethodPost, "/api/rooms/ABC234/next-round", "guest-user", guest.PlayerToken, `{"round":1}`), http.StatusNoContent)
 	assertStatus(t, request(t, handler, http.MethodPost, "/api/rooms/ABC234/next-round", host.PlayerToken, `{"round":1}`), http.StatusNoContent)
 	assertStatus(t, request(t, handler, http.MethodPost, "/api/rooms/ABC234/moves", host.PlayerToken, `{"move":"paper"}`), http.StatusNoContent)
-	assertStatus(t, request(t, handler, http.MethodPost, "/api/rooms/ABC234/moves", guest.PlayerToken, `{"move":"rock"}`), http.StatusNoContent)
-	assertStatus(t, request(t, handler, http.MethodPost, "/api/rooms/ABC234/leave", guest.PlayerToken, ""), http.StatusNoContent)
+	assertStatus(t, requestAs(t, handler, http.MethodPost, "/api/rooms/ABC234/moves", "guest-user", guest.PlayerToken, `{"move":"rock"}`), http.StatusNoContent)
+	assertStatus(t, requestAs(t, handler, http.MethodPost, "/api/rooms/ABC234/leave", "guest-user", guest.PlayerToken, ""), http.StatusNoContent)
 }
 
 func TestAuthenticationAndStableErrors(t *testing.T) {
@@ -72,8 +70,6 @@ func TestAuthenticationAndStableErrors(t *testing.T) {
 		hasRaw                  bool
 	}{
 		{"unknown room", "/api/rooms/NONE23/moves", "bad", `{"move":"rock"}`, 404, "room_not_found", "Room not found.", true},
-		{"missing token", "/api/rooms/ABC234/moves", "", `{"move":"rock"}`, 401, "unauthorized", "Unauthorized.", false},
-		{"bad token", "/api/rooms/ABC234/moves", "bad", `{"move":"rock"}`, 401, "unauthorized", "Unauthorized.", false},
 		{"invalid move", "/api/rooms/ABC234/moves", host.PlayerToken, `{"move":"lizard"}`, 400, "invalid_move", "Invalid move.", false},
 	}
 	for _, tt := range tests {
@@ -82,6 +78,70 @@ func TestAuthenticationAndStableErrors(t *testing.T) {
 			assertStatus(t, response, tt.status)
 			assertAPIError(t, response, tt.code, tt.message, tt.hasRaw)
 		})
+	}
+}
+
+func TestRoomMutationsRequireIdempotencyAndAccountSeatAuthority(t *testing.T) {
+	handler := NewRouter(fixedService(), testVerifier{}, nil, nil)
+
+	for _, test := range []struct {
+		name string
+		path string
+		body string
+	}{
+		{"create", "/api/rooms", ""},
+		{"join", "/api/rooms/ABC234/join", ""},
+		{"move", "/api/rooms/ABC234/moves", `{"move":"rock"}`},
+		{"next round", "/api/rooms/ABC234/next-round", `{"round":1}`},
+		{"leave", "/api/rooms/ABC234/leave", ""},
+		{"recharge", "/api/wallet/recharges", `{"amount":1}`},
+	} {
+		t.Run("missing key for "+test.name, func(t *testing.T) {
+			request := httptest.NewRequest(http.MethodPost, test.path, strings.NewReader(test.body))
+			request.Header.Set("Authorization", "Bearer host-user")
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, request)
+			assertStatus(t, response, http.StatusBadRequest)
+			assertAPIError(t, response, "idempotency_key_required", "A valid Idempotency-Key header is required.", false)
+		})
+	}
+
+	created := requestAs(t, handler, http.MethodPost, "/api/rooms", "host-user", "", "")
+	assertStatus(t, created, http.StatusCreated)
+	legacyClaim := requestAs(t, handler, http.MethodGet, "/api/rooms/ABC234/state", "other-user", "host-secret-token", "")
+	assertStatus(t, legacyClaim, http.StatusNotFound)
+	if strings.Contains(legacyClaim.Body.String(), "ABC234") || strings.Contains(legacyClaim.Body.String(), "host") {
+		t.Fatalf("non-player response disclosed room authority: %s", legacyClaim.Body.String())
+	}
+
+	ownerState := requestAs(t, handler, http.MethodGet, "/api/rooms/ABC234/state", "host-user", "fabricated-token", "")
+	assertStatus(t, ownerState, http.StatusOK)
+}
+
+func TestCanonicalMutationReplayAndConflict(t *testing.T) {
+	handler := NewRouter(fixedService(), testVerifier{}, nil, nil)
+	created := commandRequest(t, handler, http.MethodPost, "/api/rooms", "host-user", "canonical-create", "")
+	assertStatus(t, created, http.StatusCreated)
+	joined := commandRequest(t, handler, http.MethodPost, "/api/rooms/ABC234/join", "guest-user", "canonical-join", "")
+	assertStatus(t, joined, http.StatusCreated)
+
+	first := commandRequest(t, handler, http.MethodPost, "/api/rooms/ABC234/moves", "host-user", "canonical-move", `{"move":"rock"}`)
+	assertStatus(t, first, http.StatusNoContent)
+	replay := commandRequest(t, handler, http.MethodPost, "/api/rooms/ABC234/moves", "host-user", "canonical-move", " { \"move\" : \"rock\" } ")
+	assertStatus(t, replay, http.StatusNoContent)
+	conflict := commandRequest(t, handler, http.MethodPost, "/api/rooms/ABC234/moves", "host-user", "canonical-move", `{"move":"paper"}`)
+	assertStatus(t, conflict, http.StatusConflict)
+	crossAccount := commandRequest(t, handler, http.MethodPost, "/api/rooms/ABC234/moves", "guest-user", "canonical-move", `{"move":"scissors"}`)
+	assertStatus(t, crossAccount, http.StatusConflict)
+	if crossAccount.Body.String() != conflict.Body.String() {
+		var conflictBody, crossAccountBody apiErrorResponse
+		_ = json.Unmarshal(conflict.Body.Bytes(), &conflictBody)
+		_ = json.Unmarshal(crossAccount.Body.Bytes(), &crossAccountBody)
+		conflictBody.Meta = apiErrorMeta{}
+		crossAccountBody.Meta = apiErrorMeta{}
+		if conflictBody != crossAccountBody {
+			t.Fatalf("cross-account conflict disclosed a distinct result: %s vs %s", crossAccount.Body.String(), conflict.Body.String())
+		}
 	}
 }
 
@@ -120,9 +180,9 @@ func TestWalletRechargeIsSelfScopedAndIdempotent(t *testing.T) {
 	assertStatus(t, conflict, http.StatusConflict)
 	assertAPIError(t, conflict, "idempotency_conflict", "Idempotency key was already used with different data.", true)
 	guestRecharge := walletRechargeRequest(t, handler, "guest-user", "recharge-1", `{"amount":5}`)
-	assertStatus(t, guestRecharge, http.StatusOK)
+	assertStatus(t, guestRecharge, http.StatusConflict)
 	guest := requestAs(t, handler, http.MethodGet, "/api/wallet", "guest-user", "", "")
-	if !strings.Contains(guest.Body.String(), `"balance":"1005"`) {
+	if !strings.Contains(guest.Body.String(), `"balance":"1000"`) {
 		t.Fatalf("guest wallet was changed=%s", guest.Body.String())
 	}
 }
@@ -211,36 +271,9 @@ func TestProtectedRoutesRequireAccountAndMatchingRoomOwner(t *testing.T) {
 	handler.ServeHTTP(response, withoutAccount)
 	assertStatus(t, response, http.StatusUnauthorized)
 
-	host := credentials(t, request(t, handler, http.MethodPost, "/api/rooms", "", ""))
-	wrongOwner := requestAs(t, handler, http.MethodPost, "/api/rooms/ABC234/validate-session", "guest-user", host.PlayerToken, `{"role":"host"}`)
-	assertStatus(t, wrongOwner, http.StatusUnauthorized)
 }
 
-func TestValidateSessionRequiresAccountBeforeCheckingRoom(t *testing.T) {
-	service := fixedService()
-	handler := NewRouter(service, testVerifier{}, nil, nil)
-	hostResponse := request(t, handler, http.MethodPost, "/api/rooms", "", "")
-	assertStatus(t, hostResponse, http.StatusCreated)
-	host := credentials(t, hostResponse)
-	guestResponse := request(t, handler, http.MethodPost, "/api/rooms/ABC234/join", "", "")
-	guest := credentials(t, guestResponse)
-
-	for _, authorization := range []string{"", "Basic invalid", "Bearer invalid"} {
-		response := validateSessionRequestWithAuthorization(t, handler, authorization)
-		assertStatus(t, response, http.StatusUnauthorized)
-	}
-
-	assertStatus(t, request(t, handler, http.MethodPost, "/api/rooms/ABC234/moves", host.PlayerToken, `{"move":"rock"}`), http.StatusNoContent)
-	assertStatus(t, request(t, handler, http.MethodPost, "/api/rooms/ABC234/moves", guest.PlayerToken, `{"move":"rock"}`), http.StatusNoContent)
-	assertStatus(t, request(t, handler, http.MethodPost, "/api/rooms/ABC234/leave", guest.PlayerToken, ""), http.StatusNoContent)
-	for _, authorization := range []string{"", "Basic invalid", "Bearer invalid"} {
-		response := validateSessionRequestWithAuthorization(t, handler, authorization)
-		assertStatus(t, response, http.StatusUnauthorized)
-		assertAPIError(t, response, "unauthorized", "Unauthorized.", false)
-	}
-}
-
-func TestLeaveRejectedDuringUnfinishedGameAndPresenceIsAuthenticated(t *testing.T) {
+func TestLeaveRejectedDuringUnfinishedGame(t *testing.T) {
 	service := fixedService()
 	handler := NewRouter(service, testVerifier{}, nil, nil)
 	host := credentials(t, request(t, handler, http.MethodPost, "/api/rooms", "", ""))
@@ -249,8 +282,7 @@ func TestLeaveRejectedDuringUnfinishedGameAndPresenceIsAuthenticated(t *testing.
 	response := request(t, handler, http.MethodPost, "/api/rooms/ABC234/leave", guest.PlayerToken, "")
 	assertStatus(t, response, http.StatusConflict)
 	assertAPIError(t, response, "game_unfinished", "Game is unfinished.", true)
-	assertStatus(t, request(t, handler, http.MethodPost, "/api/rooms/ABC234/presence", "bad", ""), http.StatusUnauthorized)
-	assertStatus(t, request(t, handler, http.MethodPost, "/api/rooms/ABC234/presence", host.PlayerToken, ""), http.StatusNoContent)
+	_ = host
 }
 
 func TestSoleWaitingPlayerMayLeaveRoom(t *testing.T) {
@@ -272,23 +304,102 @@ func TestHealthAndReadinessDiffer(t *testing.T) {
 	assertStatus(t, response, 503)
 }
 
-func TestSSEEmitsAuthoritativeRevisions(t *testing.T) {
-	service := fixedService()
-	host, _ := service.Create(context.Background(), "host-user")
-	server := httptest.NewServer(NewRouter(service, testVerifier{}, nil, nil))
-	defer server.Close()
-	response, err := server.Client().Get(server.URL + "/api/rooms/ABC234/events")
+func TestOperationalReadinessDistinguishesAuthorityFromRealtimeDegradation(t *testing.T) {
+	status := func(context.Context) (ReadinessStatus, int) {
+		return ReadinessStatus{Status: "degraded", PostgreSQL: "authoritative", Realtime: "redis_unavailable"}, http.StatusServiceUnavailable
+	}
+	metrics := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("rpm_active_sockets 0\n")) })
+	handler := NewOperationalRouter(fixedService(), testVerifier{}, nil, nil, status, nil, nil, metrics)
+	ready := request(t, handler, http.MethodGet, "/api/ready", "", "")
+	assertStatus(t, ready, http.StatusServiceUnavailable)
+	if body := ready.Body.String(); !strings.Contains(body, `"postgresql":"authoritative"`) || !strings.Contains(body, `"realtime":"redis_unavailable"`) {
+		t.Fatalf("readiness body = %s", body)
+	}
+	metricResponse := request(t, handler, http.MethodGet, "/metrics", "", "")
+	assertStatus(t, metricResponse, http.StatusOK)
+}
+
+func TestWebSocketRouteIsWiredWithoutBearerMiddleware(t *testing.T) {
+	called := false
+	socket := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+		if r.PathValue("code") != "ABC234" {
+			t.Fatalf("room code = %q", r.PathValue("code"))
+		}
+		w.WriteHeader(http.StatusSwitchingProtocols)
+	})
+	handler := NewRouterWithWebSocket(fixedService(), testVerifier{}, nil, nil, socket)
+	request := httptest.NewRequest(http.MethodGet, "/api/rooms/ABC234/socket", nil)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if !called || response.Code != http.StatusSwitchingProtocols {
+		t.Fatalf("socket called=%v status=%d", called, response.Code)
+	}
+}
+
+func TestCookieSessionRESTRejectsBearerAndChecksCSRFBeforeEffects(t *testing.T) {
+	sessionStore := newRouterSessionStore()
+	sessions := auth.NewSessionService(sessionStore, bytes.NewReader(append(bytes.Repeat([]byte{0x41}, 32), bytes.Repeat([]byte{0x42}, 32)...)), func() time.Time {
+		return time.Date(2026, 9, 16, 12, 0, 0, 0, time.UTC)
+	})
+	credentials, err := sessions.Create(context.Background(), "host-user")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer response.Body.Close()
-	reader := bufio.NewReader(response.Body)
-	if id := readEvent(t, reader); id != "1" {
-		t.Fatalf("initial id = %s", id)
+	security, err := auth.NewRequestSecurity("https://game.example", sessions)
+	if err != nil {
+		t.Fatal(err)
 	}
-	_, _ = service.Join(context.Background(), host.RoomCode, "guest-user")
-	if id := readEvent(t, reader); id != "2" {
-		t.Fatalf("changed id = %s", id)
+	handler := NewSessionRouter(fixedService(), testVerifier{}, sessions, security, nil, nil)
+
+	bearerOnly := httptest.NewRequest(http.MethodPost, "/api/rooms", nil)
+	bearerOnly.Header.Set("Authorization", "Bearer host-user")
+	bearerOnly.Header.Set("Origin", "https://game.example")
+	bearerOnly.Header.Set(auth.CSRFHeaderName, credentials.CSRFToken)
+	bearerOnly.Header.Set("Idempotency-Key", "bearer-must-not-authenticate")
+	bearerResponse := httptest.NewRecorder()
+	handler.ServeHTTP(bearerResponse, bearerOnly)
+	assertStatus(t, bearerResponse, http.StatusUnauthorized)
+
+	for _, test := range []struct {
+		name   string
+		origin string
+		csrf   string
+	}{
+		{name: "missing origin", csrf: credentials.CSRFToken},
+		{name: "foreign origin", origin: "https://attacker.example", csrf: credentials.CSRFToken},
+		{name: "missing csrf", origin: "https://game.example"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			request := httptest.NewRequest(http.MethodPost, "/api/rooms", nil)
+			request.AddCookie(&http.Cookie{Name: auth.SessionCookieName, Value: credentials.Token})
+			request.Header.Set("Origin", test.origin)
+			request.Header.Set(auth.CSRFHeaderName, test.csrf)
+			request.Header.Set("Idempotency-Key", "csrf-"+strings.ReplaceAll(test.name, " ", "-"))
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, request)
+			assertStatus(t, response, http.StatusForbidden)
+		})
+	}
+
+	valid := httptest.NewRequest(http.MethodPost, "/api/rooms", nil)
+	valid.AddCookie(&http.Cookie{Name: auth.SessionCookieName, Value: credentials.Token})
+	valid.Header.Set("Origin", "https://game.example")
+	valid.Header.Set(auth.CSRFHeaderName, credentials.CSRFToken)
+	valid.Header.Set("Idempotency-Key", "cookie-session-create")
+	validResponse := httptest.NewRecorder()
+	handler.ServeHTTP(validResponse, valid)
+	assertStatus(t, validResponse, http.StatusCreated)
+	if strings.Contains(validResponse.Body.String(), "player_token") {
+		t.Fatalf("cookie response exposed legacy room token: %s", validResponse.Body.String())
+	}
+}
+
+func TestLegacyRealtimeRoutesAreRemoved(t *testing.T) {
+	handler := NewRouter(fixedService(), testVerifier{}, nil, nil)
+	for _, path := range []string{"/api/rooms/ABC234/events", "/api/rooms/ABC234/presence", "/api/rooms/ABC234/validate-session"} {
+		response := request(t, handler, http.MethodGet, path, "", "")
+		assertStatus(t, response, http.StatusNotFound)
 	}
 }
 
@@ -344,6 +455,19 @@ func requestAs(t *testing.T, handler http.Handler, method, path, account, token,
 	if token != "" {
 		req.Header.Set("X-Room-Token", token)
 	}
+	if method == http.MethodPost {
+		req.Header.Set("Idempotency-Key", fmt.Sprintf("test-%d", time.Now().UnixNano()))
+	}
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, req)
+	return response
+}
+
+func commandRequest(t *testing.T, handler http.Handler, method, path, account, key, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(method, path, strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+account)
+	req.Header.Set("Idempotency-Key", key)
 	response := httptest.NewRecorder()
 	handler.ServeHTTP(response, req)
 	return response
@@ -359,23 +483,61 @@ func walletRechargeRequest(t *testing.T, handler http.Handler, account, key, bod
 	return response
 }
 
-func validateSessionRequestWithAuthorization(t *testing.T, handler http.Handler, authorization string) *httptest.ResponseRecorder {
-	t.Helper()
-	req := httptest.NewRequest(http.MethodPost, "/api/rooms/ABC234/validate-session", strings.NewReader(`{"role":"host"}`))
-	if authorization != "" {
-		req.Header.Set("Authorization", authorization)
-	}
-	req.Header.Set("X-Room-Token", "host-secret-token")
-	response := httptest.NewRecorder()
-	handler.ServeHTTP(response, req)
-	return response
+type testVerifier struct{}
+
+type routerSessionStore struct {
+	mu      sync.Mutex
+	records map[auth.Digest]auth.Session
 }
 
-type testVerifier struct{}
+func newRouterSessionStore() *routerSessionStore {
+	return &routerSessionStore{records: make(map[auth.Digest]auth.Session)}
+}
+
+func (s *routerSessionStore) CreateSession(_ context.Context, session auth.Session) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.records[session.Digest] = session
+	return nil
+}
+
+func (s *routerSessionStore) UseSession(_ context.Context, digest auth.Digest, now, idleExpiresAt time.Time) (auth.Session, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	session, ok := s.records[digest]
+	if !ok || session.RevokedAt != nil || !now.Before(session.IdleExpiresAt) || !now.Before(session.AbsoluteExpiresAt) {
+		return auth.Session{}, auth.ErrInvalidSession
+	}
+	session.IdleExpiresAt = idleExpiresAt
+	s.records[digest] = session
+	return session, nil
+}
+
+func (s *routerSessionStore) RevokeSession(_ context.Context, digest auth.Digest, at time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	session, ok := s.records[digest]
+	if !ok {
+		return auth.ErrInvalidSession
+	}
+	session.RevokedAt = &at
+	s.records[digest] = session
+	return nil
+}
+
+func (s *routerSessionStore) DeleteExpiredSessions(context.Context, time.Time) (int64, error) {
+	return 0, nil
+}
 
 type submitOnlyRepository struct {
 	application.Repository
+	application.CommandRepository
 	calls int
+}
+
+func (r *submitOnlyRepository) SubmitMoveCommand(context.Context, string, string, domain.Move, application.Command) (application.CommandResult, error) {
+	r.calls++
+	return application.CommandResult{}, nil
 }
 
 func (r *submitOnlyRepository) SubmitMoveAndSettle(context.Context, string, application.CredentialDigest, string, domain.Move) (application.Snapshot, error) {
@@ -384,7 +546,7 @@ func (r *submitOnlyRepository) SubmitMoveAndSettle(context.Context, string, appl
 }
 
 func (testVerifier) Verify(_ context.Context, token string) (auth.Principal, error) {
-	if token != "host-user" && token != "guest-user" {
+	if token != "host-user" && token != "guest-user" && token != "other-user" {
 		return auth.Principal{}, errors.New("invalid token")
 	}
 	return auth.Principal{Subject: token}, nil
@@ -406,7 +568,7 @@ func credentials(t *testing.T, response *httptest.ResponseRecorder) roomCredenti
 func assertPrivate(t *testing.T, body string, secrets ...string) {
 	t.Helper()
 	for _, secret := range secrets {
-		if strings.Contains(body, secret) {
+		if secret != "" && strings.Contains(body, secret) {
 			t.Fatalf("state leaked token: %s", body)
 		}
 	}
@@ -434,34 +596,5 @@ func assertAPIError(t *testing.T, response *httptest.ResponseRecorder, code, mes
 	}
 	if _, err := time.Parse(time.RFC3339Nano, meta["time"].(string)); err != nil {
 		t.Fatalf("error time = %#v: %v", meta["time"], err)
-	}
-}
-func readEvent(t *testing.T, reader *bufio.Reader) string {
-	t.Helper()
-	result := make(chan string, 1)
-	go func() {
-		id := ""
-		for {
-			line, err := reader.ReadString('\n')
-			if err != nil {
-				result <- ""
-				return
-			}
-			line = strings.TrimSpace(line)
-			if strings.HasPrefix(line, "id: ") {
-				id = strings.TrimPrefix(line, "id: ")
-			}
-			if line == "" {
-				result <- id
-				return
-			}
-		}
-	}()
-	select {
-	case id := <-result:
-		return id
-	case <-time.After(time.Second):
-		t.Fatal("SSE timeout")
-		return ""
 	}
 }
