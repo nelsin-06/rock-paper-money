@@ -2,6 +2,7 @@ package postgres
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -460,7 +461,6 @@ func (r *Repository) Analytics(ctx context.Context) (application.Analytics, erro
 }
 
 type queryer interface {
-	Query(context.Context, string, ...any) (pgx.Rows, error)
 	QueryRow(context.Context, string, ...any) pgx.Row
 }
 
@@ -468,40 +468,40 @@ func load(ctx context.Context, q queryer, code string) (*domain.Room, map[string
 	var round uint64
 	var status string
 	var result, forfeitedRole *string
-	if err := q.QueryRow(ctx, "SELECT r.current_round,r.status,rr.result,rr.forfeited_role FROM room_rooms r JOIN room_rounds rr ON rr.room_code=r.code AND rr.number=r.current_round WHERE r.code=$1", code).Scan(&round, &status, &result, &forfeitedRole); err != nil {
+	var seatsJSON, movesJSON, requestsJSON []byte
+	if err := q.QueryRow(latency.WithQueryName(ctx, "room_aggregate_load"), `
+		SELECT r.current_round,
+		       r.status,
+		       rr.result,
+		       rr.forfeited_role,
+		       COALESCE((
+		           SELECT jsonb_agg(jsonb_build_object('role',s.role,'player_id',s.player_id,'wins',s.wins)
+		                            ORDER BY CASE s.role WHEN 'host' THEN 0 ELSE 1 END)
+		           FROM room_seats s
+		           WHERE s.room_code=r.code
+		       ), '[]'::jsonb),
+		       COALESCE((
+		           SELECT jsonb_agg(jsonb_build_object('player_id',s.player_id,'move',m.move)
+		                            ORDER BY CASE s.role WHEN 'host' THEN 0 ELSE 1 END)
+		           FROM room_moves m
+		           JOIN room_seats s ON s.room_code=m.room_code AND s.role=m.role
+		           WHERE m.room_code=r.code AND m.round_number=r.current_round
+		       ), '[]'::jsonb),
+		       COALESCE((
+		           SELECT jsonb_agg(jsonb_build_object('player_id',s.player_id)
+		                            ORDER BY CASE s.role WHEN 'host' THEN 0 ELSE 1 END)
+		           FROM room_next_round_requests n
+		           JOIN room_seats s ON s.room_code=n.room_code AND s.role=n.role
+		           WHERE n.room_code=r.code AND n.round_number=r.current_round
+		       ), '[]'::jsonb)
+		FROM room_rooms r
+		JOIN room_rounds rr ON rr.room_code=r.code AND rr.number=r.current_round
+		WHERE r.code=$1`, code).Scan(&round, &status, &result, &forfeitedRole, &seatsJSON, &movesJSON, &requestsJSON); err != nil {
 		return nil, nil, err
 	}
-	rows, err := q.Query(ctx, "SELECT role,player_id,wins FROM room_seats WHERE room_code=$1 ORDER BY CASE role WHEN 'host' THEN 0 ELSE 1 END", code)
-	if err != nil {
-		return nil, nil, err
-	}
-	defer rows.Close()
 	state := domain.PersistenceState{Code: code, Round: round, Closed: status == "closed", Moves: map[string]domain.Move{}, NextRoundRequests: map[string]bool{}}
 	roles := map[string]string{}
-	for rows.Next() {
-		var role, id string
-		var wins int
-		if err = rows.Scan(&role, &id, &wins); err != nil {
-			return nil, nil, err
-		}
-		state.Players = append(state.Players, domain.PersistedPlayer{ID: id, Wins: wins})
-		roles[role] = id
-	}
-	if err = rows.Err(); err != nil {
-		return nil, nil, err
-	}
-	moveRows, err := q.Query(ctx, "SELECT s.player_id,m.move FROM room_moves m JOIN room_seats s ON s.room_code=m.room_code AND s.role=m.role WHERE m.room_code=$1 AND m.round_number=$2", code, round)
-	if err != nil {
-		return nil, nil, err
-	}
-	if err = collectMoves(moveRows, state.Moves); err != nil {
-		return nil, nil, err
-	}
-	requestRows, err := q.Query(ctx, "SELECT s.player_id FROM room_next_round_requests n JOIN room_seats s ON s.room_code=n.room_code AND s.role=n.role WHERE n.room_code=$1 AND n.round_number=$2", code, round)
-	if err != nil {
-		return nil, nil, err
-	}
-	if err = collectNextRoundRequests(requestRows, state.NextRoundRequests); err != nil {
+	if err := decodeAggregateRows(seatsJSON, movesJSON, requestsJSON, &state, roles); err != nil {
 		return nil, nil, err
 	}
 	if result != nil {
@@ -515,29 +515,39 @@ func load(ctx context.Context, q queryer, code string) (*domain.Room, map[string
 	return aggregate, roles, err
 }
 
-func collectMoves(rows pgx.Rows, moves map[string]domain.Move) error {
-	defer rows.Close()
-	for rows.Next() {
-		var id string
-		var move domain.Move
-		if err := rows.Scan(&id, &move); err != nil {
-			return err
-		}
-		moves[id] = move
+func decodeAggregateRows(seatsJSON, movesJSON, requestsJSON []byte, state *domain.PersistenceState, roles map[string]string) error {
+	var seats []struct {
+		Role     string `json:"role"`
+		PlayerID string `json:"player_id"`
+		Wins     int    `json:"wins"`
 	}
-	return rows.Err()
-}
-
-func collectNextRoundRequests(rows pgx.Rows, requests map[string]bool) error {
-	defer rows.Close()
-	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
-			return err
-		}
-		requests[id] = true
+	if err := json.Unmarshal(seatsJSON, &seats); err != nil {
+		return fmt.Errorf("decode room seats: %w", err)
 	}
-	return rows.Err()
+	for _, seat := range seats {
+		state.Players = append(state.Players, domain.PersistedPlayer{ID: seat.PlayerID, Wins: seat.Wins})
+		roles[seat.Role] = seat.PlayerID
+	}
+	var moves []struct {
+		PlayerID string      `json:"player_id"`
+		Move     domain.Move `json:"move"`
+	}
+	if err := json.Unmarshal(movesJSON, &moves); err != nil {
+		return fmt.Errorf("decode room moves: %w", err)
+	}
+	for _, move := range moves {
+		state.Moves[move.PlayerID] = move.Move
+	}
+	var requests []struct {
+		PlayerID string `json:"player_id"`
+	}
+	if err := json.Unmarshal(requestsJSON, &requests); err != nil {
+		return fmt.Errorf("decode next-round requests: %w", err)
+	}
+	for _, request := range requests {
+		state.NextRoundRequests[request.PlayerID] = true
+	}
+	return nil
 }
 
 func save(ctx context.Context, tx pgx.Tx, aggregate *domain.Room, roles map[string]string, previousRound, revision uint64) error {
@@ -546,9 +556,12 @@ func save(ctx context.Context, tx pgx.Tx, aggregate *domain.Room, roles map[stri
 	if state.Closed {
 		status = "closed"
 	}
-	if _, err := tx.Exec(ctx, "UPDATE room_rooms SET status=$2,current_round=$3,revision=$4,updated_at=now(),closed_at=CASE WHEN $2='closed' THEN COALESCE(closed_at,now()) ELSE NULL END WHERE code=$1", state.Code, status, state.Round, revision); err != nil {
-		return err
-	}
+	roleValues := make([]string, 0, 2)
+	playerIDs := make([]string, 0, 2)
+	winsValues := make([]int32, 0, 2)
+	moveValues := make([]string, 0, 2)
+	hasMoves := make([]bool, 0, 2)
+	requestValues := make([]bool, 0, 2)
 	for _, role := range []string{"host", "guest"} {
 		id, ok := roles[role]
 		if !ok && role == "guest" && len(state.Players) == 2 {
@@ -564,9 +577,13 @@ func save(ctx context.Context, tx pgx.Tx, aggregate *domain.Room, roles map[stri
 				wins = p.Wins
 			}
 		}
-		if _, err := tx.Exec(ctx, "UPDATE room_seats SET wins=$3 WHERE room_code=$1 AND role=$2", state.Code, role, wins); err != nil {
-			return err
-		}
+		move, hasMove := state.Moves[id]
+		roleValues = append(roleValues, role)
+		playerIDs = append(playerIDs, id)
+		winsValues = append(winsValues, int32(wins))
+		moveValues = append(moveValues, string(move))
+		hasMoves = append(hasMoves, hasMove)
+		requestValues = append(requestValues, state.NextRoundRequests[id])
 	}
 	var result any
 	var resolvedAt any
@@ -580,37 +597,45 @@ func save(ctx context.Context, tx pgx.Tx, aggregate *domain.Room, roles map[stri
 			}
 		}
 	}
-	if _, err := tx.Exec(ctx, "INSERT INTO room_rounds(room_code,number,result,resolved_at,forfeited_role) VALUES($1,$2,$3,CASE WHEN $4::text IS NULL THEN NULL ELSE now() END,$5) ON CONFLICT(room_code,number) DO UPDATE SET result=EXCLUDED.result,resolved_at=EXCLUDED.resolved_at,forfeited_role=EXCLUDED.forfeited_role", state.Code, state.Round, result, resolvedAt, forfeitedRole); err != nil {
-		return err
-	}
-	if state.Round > previousRound {
-		for role := range roles {
-			if _, err := tx.Exec(ctx, "INSERT INTO room_next_round_requests(room_code,round_number,role) VALUES($1,$2,$3) ON CONFLICT DO NOTHING", state.Code, previousRound, role); err != nil {
-				return err
-			}
-		}
-	}
-	if _, err := tx.Exec(ctx, "DELETE FROM room_moves WHERE room_code=$1 AND round_number=$2", state.Code, state.Round); err != nil {
-		return err
-	}
-	for role, id := range roles {
-		if move, ok := state.Moves[id]; ok {
-			if _, err := tx.Exec(ctx, "INSERT INTO room_moves(room_code,round_number,role,move) VALUES($1,$2,$3,$4)", state.Code, state.Round, role, move); err != nil {
-				return err
-			}
-		}
-	}
-	if _, err := tx.Exec(ctx, "DELETE FROM room_next_round_requests WHERE room_code=$1 AND round_number=$2", state.Code, state.Round); err != nil {
-		return err
-	}
-	for role, id := range roles {
-		if state.NextRoundRequests[id] {
-			if _, err := tx.Exec(ctx, "INSERT INTO room_next_round_requests(room_code,round_number,role) VALUES($1,$2,$3)", state.Code, state.Round, role); err != nil {
-				return err
-			}
-		}
-	}
-	return nil
+	_, err := tx.Exec(latency.WithQueryName(ctx, "room_aggregate_save"), `
+		WITH input AS MATERIALIZED (
+			SELECT * FROM unnest($8::text[],$9::text[],$10::integer[],$11::text[],$12::boolean[],$13::boolean[])
+				AS i(role,player_id,wins,move,has_move,wants_next)
+		), updated_room AS (
+			UPDATE room_rooms
+			SET status=$2,current_round=$3,revision=$4,updated_at=now(),
+			    closed_at=CASE WHEN $2='closed' THEN COALESCE(closed_at,now()) ELSE NULL END
+			WHERE code=$1
+		), updated_seats AS (
+			UPDATE room_seats s SET wins=i.wins FROM input i
+			WHERE s.room_code=$1 AND s.role=i.role
+		), upserted_round AS (
+			INSERT INTO room_rounds(room_code,number,result,resolved_at,forfeited_role)
+			VALUES($1,$3,$5,CASE WHEN $6::text IS NULL THEN NULL ELSE now() END,$7)
+			ON CONFLICT(room_code,number) DO UPDATE
+			SET result=EXCLUDED.result,resolved_at=EXCLUDED.resolved_at,forfeited_role=EXCLUDED.forfeited_role
+		), historical_requests AS (
+			INSERT INTO room_next_round_requests(room_code,round_number,role)
+			SELECT $1,$14,i.role FROM input i WHERE $3>$14
+			ON CONFLICT DO NOTHING
+		), deleted_moves AS (
+			DELETE FROM room_moves m
+			WHERE m.room_code=$1 AND m.round_number=$3
+			  AND NOT EXISTS (SELECT 1 FROM input i WHERE i.role=m.role AND i.has_move)
+		), upserted_moves AS (
+			INSERT INTO room_moves(room_code,round_number,role,move)
+			SELECT $1,$3,i.role,i.move FROM input i WHERE i.has_move
+			ON CONFLICT(room_code,round_number,role) DO UPDATE SET move=EXCLUDED.move
+		), deleted_requests AS (
+			DELETE FROM room_next_round_requests n
+			WHERE n.room_code=$1 AND n.round_number=$3
+			  AND NOT EXISTS (SELECT 1 FROM input i WHERE i.role=n.role AND i.wants_next)
+		)
+		INSERT INTO room_next_round_requests(room_code,round_number,role)
+		SELECT $1,$3,i.role FROM input i WHERE i.wants_next
+		ON CONFLICT DO NOTHING`, state.Code, status, state.Round, revision, result, resolvedAt, forfeitedRole,
+		roleValues, playerIDs, winsValues, moveValues, hasMoves, requestValues, previousRound)
+	return err
 }
 
 func ensureUserWallet(ctx context.Context, tx pgx.Tx, authUserID string) error {
@@ -625,57 +650,63 @@ func escrowAccountID(code string, round uint64) string {
 }
 
 func lockWallets(ctx context.Context, tx pgx.Tx, accountIDs []string) error {
-	rows, err := tx.Query(latency.WithQueryName(ctx, "wallet_lock_wait"), "SELECT account_id FROM wallet_accounts WHERE account_id=ANY($1) ORDER BY account_id FOR UPDATE", accountIDs)
+	_, err := lockWalletBalances(ctx, tx, accountIDs)
+	return err
+}
+
+func lockWalletBalances(ctx context.Context, tx pgx.Tx, accountIDs []string) (map[string]int64, error) {
+	rows, err := tx.Query(latency.WithQueryName(ctx, "wallet_lock_wait"), "SELECT account_id,balance FROM wallet_accounts WHERE account_id=ANY($1) ORDER BY account_id FOR UPDATE", accountIDs)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer rows.Close()
-	count := 0
+	balances := make(map[string]int64, len(accountIDs))
 	for rows.Next() {
-		count++
+		var accountID string
+		var balance int64
+		if err = rows.Scan(&accountID, &balance); err != nil {
+			return nil, err
+		}
+		balances[accountID] = balance
 	}
 	if err = rows.Err(); err != nil {
-		return err
+		return nil, err
 	}
-	if count != len(accountIDs) {
-		return errors.New("wallet account set is incomplete")
+	if len(balances) != len(accountIDs) {
+		return nil, errors.New("wallet account set is incomplete")
 	}
-	return nil
+	return balances, nil
 }
 
 func fundRound(ctx context.Context, tx pgx.Tx, code string, round uint64, joiningAuthUserID string) error {
-	if _, err := tx.Exec(ctx, "INSERT INTO room_rounds(room_code,number) VALUES($1,$2) ON CONFLICT (room_code,number) DO NOTHING", code, round); err != nil {
-		return err
-	}
 	var funded bool
-	if err := tx.QueryRow(ctx, "SELECT funded FROM room_rounds WHERE room_code=$1 AND number=$2", code, round).Scan(&funded); err != nil {
+	var owners []string
+	if err := tx.QueryRow(latency.WithQueryName(ctx, "round_funding_state"), `
+		WITH inserted_round AS (
+			INSERT INTO room_rounds(room_code,number) VALUES($1,$2)
+			ON CONFLICT (room_code,number) DO NOTHING
+			RETURNING funded
+		), round_state AS MATERIALIZED (
+			SELECT funded FROM inserted_round
+			UNION ALL
+			SELECT rr.funded FROM room_rounds rr
+			WHERE rr.room_code=$1 AND rr.number=$2 AND NOT EXISTS (SELECT 1 FROM inserted_round)
+		), existing_deadline AS (
+			INSERT INTO room_deadlines(room_code,round_number,kind,generation,due_at)
+			SELECT $1,$2,'inactivity',$2,now()+$3::interval FROM round_state WHERE funded
+			ON CONFLICT DO NOTHING
+		)
+		SELECT rs.funded,
+		       COALESCE(array_agg(s.auth_user_id::text ORDER BY CASE s.role WHEN 'host' THEN 0 ELSE 1 END)
+		                FILTER (WHERE s.auth_user_id IS NOT NULL), ARRAY[]::text[])
+		FROM round_state rs
+		LEFT JOIN room_seats s ON s.room_code=$1
+		GROUP BY rs.funded`, code, round, intervalString(application.FundedInactivityDeadline)).Scan(&funded, &owners); err != nil {
 		return err
 	}
 	if funded {
-		return scheduleInactivityDeadline(ctx, tx, code, round)
+		return nil
 	}
-	rows, err := tx.Query(ctx, "SELECT auth_user_id::text FROM room_seats WHERE room_code=$1 ORDER BY role", code)
-	if err != nil {
-		return err
-	}
-	owners := make([]string, 0, 2)
-	for rows.Next() {
-		var owner *string
-		if err = rows.Scan(&owner); err != nil {
-			rows.Close()
-			return err
-		}
-		if owner == nil || *owner == "" {
-			rows.Close()
-			return application.ErrUnauthorized
-		}
-		owners = append(owners, *owner)
-	}
-	if err = rows.Err(); err != nil {
-		rows.Close()
-		return err
-	}
-	rows.Close()
 	if joiningAuthUserID != "" {
 		owners = append(owners, joiningAuthUserID)
 	}
@@ -683,134 +714,118 @@ func fundRound(ctx context.Context, tx pgx.Tx, code string, round uint64, joinin
 		return domain.ErrRoomNotReady
 	}
 	accountIDs := []string{userAccountID(owners[0]), userAccountID(owners[1])}
-	for _, owner := range owners {
-		if err = ensureUserWallet(ctx, tx, owner); err != nil {
-			return err
-		}
-	}
 	escrow := escrowAccountID(code, round)
-	if _, err = tx.Exec(ctx, "INSERT INTO wallet_accounts(account_id,account_type,room_code,round_number) VALUES($1,'escrow',$2,$3) ON CONFLICT (room_code,round_number) DO NOTHING", escrow, code, round); err != nil {
+	if _, err := tx.Exec(latency.WithQueryName(ctx, "round_funding_accounts"), `
+		WITH owners AS MATERIALIZED (
+			SELECT owner FROM unnest($1::text[]) AS o(owner)
+		), inserted_users AS (
+			INSERT INTO wallet_accounts(account_id,account_type,auth_user_id)
+			SELECT 'user:'||owner,'user',owner::uuid FROM owners
+			ON CONFLICT (auth_user_id) DO NOTHING
+		)
+		INSERT INTO wallet_accounts(account_id,account_type,room_code,round_number)
+		VALUES($2,'escrow',$3,$4)
+		ON CONFLICT (room_code,round_number) DO NOTHING`, owners, escrow, code, round); err != nil {
 		return err
 	}
 	accountIDs = append(accountIDs, escrow)
-	if err = lockWallets(ctx, tx, accountIDs); err != nil {
+	balances, err := lockWalletBalances(ctx, tx, accountIDs)
+	if err != nil {
 		return err
 	}
 	for _, accountID := range accountIDs[:2] {
-		var balance int64
-		if err = tx.QueryRow(ctx, "SELECT balance FROM wallet_accounts WHERE account_id=$1", accountID).Scan(&balance); err != nil {
-			return err
-		}
-		if balance < application.RoundStake {
+		if balances[accountID] < application.RoundStake {
 			return application.ErrInsufficientFunds
 		}
 	}
 	businessKey := fmt.Sprintf("stake:%s:%d", code, round)
-	var transactionID int64
-	err = tx.QueryRow(ctx, "INSERT INTO wallet_transactions(business_key,transaction_type) VALUES($1,'stake') ON CONFLICT (business_key) DO NOTHING RETURNING transaction_id", businessKey).Scan(&transactionID)
-	if errors.Is(err, pgx.ErrNoRows) {
-		if _, err = tx.Exec(ctx, "UPDATE room_rounds SET funded=true WHERE room_code=$1 AND number=$2", code, round); err != nil {
-			return err
-		}
-		return scheduleInactivityDeadline(ctx, tx, code, round)
-	}
-	if err != nil {
-		return err
-	}
-	if _, err = tx.Exec(ctx, "INSERT INTO wallet_postings(transaction_id,account_id,amount) VALUES($1,$2,$4),($1,$3,$4),($1,$5,$6)", transactionID, accountIDs[0], accountIDs[1], -application.RoundStake, escrow, application.RoundStake*2); err != nil {
-		return err
-	}
-	if _, err = tx.Exec(ctx, "UPDATE wallet_accounts SET balance=balance-$2 WHERE account_id=ANY($1)", accountIDs[:2], application.RoundStake); err != nil {
-		return err
-	}
-	if _, err = tx.Exec(ctx, "UPDATE wallet_accounts SET balance=balance+$2 WHERE account_id=$1", escrow, application.RoundStake*2); err != nil {
-		return err
-	}
-	if _, err = tx.Exec(ctx, "UPDATE room_rounds SET funded=true WHERE room_code=$1 AND number=$2", code, round); err != nil {
-		return err
-	}
-	return scheduleInactivityDeadline(ctx, tx, code, round)
+	_, err = tx.Exec(latency.WithQueryName(ctx, "round_funding_effects"), `
+		WITH created_transaction AS MATERIALIZED (
+			INSERT INTO wallet_transactions(business_key,transaction_type) VALUES($1,'stake')
+			ON CONFLICT (business_key) DO NOTHING
+			RETURNING transaction_id
+		), deltas(account_id,amount) AS MATERIALIZED (
+			VALUES($2::text,$5::bigint),($3::text,$5::bigint),($4::text,$6::bigint)
+		), inserted_postings AS (
+			INSERT INTO wallet_postings(transaction_id,account_id,amount)
+			SELECT t.transaction_id,d.account_id,d.amount FROM created_transaction t CROSS JOIN deltas d
+			RETURNING transaction_id
+		), updated_accounts AS (
+			UPDATE wallet_accounts a SET balance=a.balance+d.amount
+			FROM deltas d
+			WHERE a.account_id=d.account_id AND EXISTS (SELECT 1 FROM inserted_postings)
+			RETURNING a.account_id
+		), marked_round AS MATERIALIZED (
+			UPDATE room_rounds SET funded=true WHERE room_code=$7 AND number=$8
+			RETURNING room_code,number
+		)
+		INSERT INTO room_deadlines(room_code,round_number,kind,generation,due_at)
+		SELECT room_code,number,'inactivity',number,now()+$9::interval FROM marked_round
+		ON CONFLICT DO NOTHING`, businessKey, accountIDs[0], accountIDs[1], escrow,
+		-application.RoundStake, application.RoundStake*2, code, round, intervalString(application.FundedInactivityDeadline))
+	return err
 }
 
 func settleRound(ctx context.Context, tx pgx.Tx, code string, state domain.State) error {
 	var alreadyRecorded bool
-	if err := tx.QueryRow(ctx, "SELECT EXISTS(SELECT 1 FROM game_round_history WHERE room_code=$1 AND round_number=$2)", code, state.Round).Scan(&alreadyRecorded); err != nil || alreadyRecorded {
+	var accounts []string
+	if err := tx.QueryRow(latency.WithQueryName(ctx, "round_settlement_state"), `
+		SELECT EXISTS(SELECT 1 FROM game_round_history WHERE room_code=$1 AND round_number=$2),
+		       COALESCE(array_agg('user:'||auth_user_id::text ORDER BY CASE role WHEN 'host' THEN 0 ELSE 1 END), ARRAY[]::text[])
+		FROM room_seats WHERE room_code=$1`, code, state.Round).Scan(&alreadyRecorded, &accounts); err != nil || alreadyRecorded {
 		return err
 	}
-	rows, err := tx.Query(ctx, "SELECT role,'user:' || auth_user_id::text FROM room_seats WHERE room_code=$1 ORDER BY CASE role WHEN 'host' THEN 0 ELSE 1 END", code)
-	if err != nil {
-		return err
-	}
-	accounts := make([]string, 0, 2)
-	for rows.Next() {
-		var role, accountID string
-		if err = rows.Scan(&role, &accountID); err != nil {
-			rows.Close()
-			return err
-		}
-		accounts = append(accounts, accountID)
-	}
-	if err = rows.Err(); err != nil {
-		rows.Close()
-		return err
-	}
-	rows.Close()
 	if len(accounts) != 2 {
 		return domain.ErrRoomNotReady
 	}
 	escrow := escrowAccountID(code, state.Round)
 	lockIDs := []string{"house", accounts[0], accounts[1], escrow}
-	if err = lockWallets(ctx, tx, lockIDs); err != nil {
-		return err
-	}
-	var escrowBalance int64
-	if err = tx.QueryRow(ctx, "SELECT balance FROM wallet_accounts WHERE account_id=$1", escrow).Scan(&escrowBalance); err != nil {
-		return err
-	}
-	if escrowBalance != application.RoundStake*2 {
-		return errors.New("funded round escrow has invalid balance")
-	}
-	var transactionID int64
-	businessKey := fmt.Sprintf("settlement:%s:%d", code, state.Round)
-	err = tx.QueryRow(ctx, "INSERT INTO wallet_transactions(business_key,transaction_type) VALUES($1,'settlement') ON CONFLICT (business_key) DO NOTHING RETURNING transaction_id", businessKey).Scan(&transactionID)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return nil
-	}
+	balances, err := lockWalletBalances(ctx, tx, lockIDs)
 	if err != nil {
 		return err
 	}
-	winnerRole := ""
-	houseEarnings := int64(0)
-	if state.Result == domain.Draw {
-		if _, err = tx.Exec(ctx, "INSERT INTO wallet_postings(transaction_id,account_id,amount) VALUES($1,$2,$3),($1,$4,$5),($1,$6,$5)", transactionID, escrow, -application.RoundStake*2, accounts[0], application.RoundStake, accounts[1]); err != nil {
-			return err
-		}
-		if _, err = tx.Exec(ctx, "UPDATE wallet_accounts SET balance=balance+$2 WHERE account_id=ANY($1)", accounts, application.RoundStake); err != nil {
-			return err
-		}
-	} else {
-		winnerAccount := accounts[0]
-		winnerRole = "host"
-		if state.Result == domain.PlayerTwoWins {
-			winnerAccount = accounts[1]
-			winnerRole = "guest"
-		}
-		houseEarnings = application.HousePayout
-		if _, err = tx.Exec(ctx, "INSERT INTO wallet_postings(transaction_id,account_id,amount) VALUES($1,$2,$3),($1,$4,$5),($1,'house',$6)", transactionID, escrow, -application.RoundStake*2, winnerAccount, application.WinnerPayout, application.HousePayout); err != nil {
-			return err
-		}
-		if _, err = tx.Exec(ctx, "UPDATE wallet_accounts SET balance=balance+$2 WHERE account_id=$1", winnerAccount, application.WinnerPayout); err != nil {
-			return err
-		}
-		if _, err = tx.Exec(ctx, "UPDATE wallet_accounts SET balance=balance+$1 WHERE account_id='house'", application.HousePayout); err != nil {
-			return err
-		}
+	if balances[escrow] != application.RoundStake*2 {
+		return errors.New("funded round escrow has invalid balance")
 	}
-	if _, err = tx.Exec(ctx, "UPDATE wallet_accounts SET balance=0 WHERE account_id=$1", escrow); err != nil {
-		return err
-	}
-	_, err = tx.Exec(ctx, "INSERT INTO game_round_history(room_code,round_number,host_account_id,guest_account_id,result,winner_role,forfeited,house_earnings) VALUES($1,$2,$3,$4,$5,NULLIF($6,''),$7,$8)", code, state.Round, accounts[0], accounts[1], state.Result, winnerRole, state.Forfeit, houseEarnings)
+	businessKey := fmt.Sprintf("settlement:%s:%d", code, state.Round)
+	deltaAccounts, deltaAmounts, winnerRole, houseEarnings := settlementEffects(state, accounts, escrow)
+	_, err = tx.Exec(latency.WithQueryName(ctx, "round_settlement_effects"), `
+		WITH created_transaction AS MATERIALIZED (
+			INSERT INTO wallet_transactions(business_key,transaction_type) VALUES($1,'settlement')
+			ON CONFLICT (business_key) DO NOTHING
+			RETURNING transaction_id
+		), deltas AS MATERIALIZED (
+			SELECT * FROM unnest($2::text[],$3::bigint[]) AS d(account_id,amount)
+		), inserted_postings AS (
+			INSERT INTO wallet_postings(transaction_id,account_id,amount)
+			SELECT t.transaction_id,d.account_id,d.amount FROM created_transaction t CROSS JOIN deltas d
+			RETURNING transaction_id
+		), updated_accounts AS (
+			UPDATE wallet_accounts a SET balance=a.balance+d.amount
+			FROM deltas d
+			WHERE a.account_id=d.account_id AND EXISTS (SELECT 1 FROM inserted_postings)
+			RETURNING a.account_id
+		)
+		INSERT INTO game_round_history(room_code,round_number,host_account_id,guest_account_id,result,winner_role,forfeited,house_earnings)
+		SELECT $4,$5,$6,$7,$8,NULLIF($9,''),$10,$11 FROM created_transaction
+		ON CONFLICT (room_code,round_number) DO NOTHING`, businessKey, deltaAccounts, deltaAmounts,
+		code, state.Round, accounts[0], accounts[1], state.Result, winnerRole, state.Forfeit, houseEarnings)
 	return err
+}
+
+func settlementEffects(state domain.State, accounts []string, escrow string) ([]string, []int64, string, int64) {
+	if state.Result == domain.Draw {
+		return []string{escrow, accounts[0], accounts[1]},
+			[]int64{-application.RoundStake * 2, application.RoundStake, application.RoundStake}, "", 0
+	}
+	winnerIndex := 0
+	winnerRole := "host"
+	if state.Result == domain.PlayerTwoWins {
+		winnerIndex = 1
+		winnerRole = "guest"
+	}
+	return []string{escrow, accounts[winnerIndex], "house"},
+		[]int64{-application.RoundStake * 2, application.WinnerPayout, application.HousePayout}, winnerRole, application.HousePayout
 }
 
 func isUnique(err error) bool {
