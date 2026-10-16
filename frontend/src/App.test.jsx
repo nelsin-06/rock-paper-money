@@ -1,6 +1,6 @@
 import { StrictMode } from 'react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { act, render, screen, waitFor, within } from '@testing-library/react'
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { AccountPanel, GameApp } from './App.jsx'
 import * as api from './api.js'
@@ -96,9 +96,9 @@ describe('token-free room flow', () => {
     api.leaveRoom.mockResolvedValue()
     render(<GameApp />)
 
-    await userEvent.click(await screen.findByRole('button', { name: 'Request next round' }))
+    await userEvent.click(await screen.findByRole('button', { name: 'Play again' }))
     expect(api.startNextRound).toHaveBeenCalledWith('ABC234', 1)
-    await userEvent.click(screen.getByRole('button', { name: 'Leave room' }))
+    await userEvent.click(screen.getByRole('button', { name: 'Menu' }))
     expect(api.leaveRoom).toHaveBeenCalledWith('ABC234')
     expect(localStorage.getItem(STORAGE_KEY)).toBeNull()
     expect(closeSocket).toHaveBeenCalledOnce()
@@ -148,17 +148,163 @@ describe('token-free room flow', () => {
     expect(closeSocket).toHaveBeenCalledOnce()
   })
 
-  it('shows wallet analytics and reuses a recharge key after ambiguity', async () => {
+  it('loads only the player wallet and reuses a recharge key after ambiguity', async () => {
     api.getWallet.mockResolvedValue({ balance: '0' })
-    api.getRoundAnalytics.mockResolvedValue({ totalHouseEarnings: '0', rounds: [] })
     api.rechargeWallet.mockRejectedValueOnce(new Error('Connection lost')).mockResolvedValueOnce({ balance: '50' })
     vi.spyOn(crypto, 'randomUUID').mockReturnValue('stable-retry-key')
     render(<AccountPanel onBalance={() => {}} />)
     await screen.findByText('0 coins')
+    expect(api.getRoundAnalytics).not.toHaveBeenCalled()
+    expect(screen.queryByText(/house earnings|played rounds/i)).not.toBeInTheDocument()
+    await userEvent.click(screen.getByRole('button', { name: /coin wallet/i }))
     await userEvent.type(screen.getByLabelText('Recharge amount'), '50')
     await userEvent.click(screen.getByRole('button', { name: 'Add coins' }))
     await screen.findByText('Connection lost')
     await userEvent.click(screen.getByRole('button', { name: 'Add coins' }))
     await waitFor(() => expect(api.rechargeWallet).toHaveBeenNthCalledWith(2, '50', 'stable-retry-key'))
+    expect(within(screen.getByRole('dialog')).getByText('50 coins')).toBeInTheDocument()
+  })
+
+  it('opens a functional join dialog and locks duplicate join submissions', async () => {
+    api.joinRoom.mockResolvedValue(roomSession)
+    streamRoomState({ ...readyState, playerRole: 'guest' })
+    render(<GameApp walletBalance="100" />)
+    await userEvent.click(screen.getByRole('button', { name: 'Join room' }))
+    const dialog = screen.getByRole('dialog', { name: 'Join a room' })
+    await userEvent.type(within(dialog).getByLabelText('Six-character room code'), 'ab-c234')
+    expect(within(dialog).getByLabelText('Six-character room code')).toHaveValue('ABC234')
+    const join = within(dialog).getByRole('button', { name: 'Join room' })
+    act(() => { join.click(); join.click() })
+    expect(api.joinRoom).toHaveBeenCalledExactlyOnceWith('ABC234')
+    await screen.findByRole('heading', { name: 'Choose your move' })
+    expect(JSON.parse(localStorage.getItem(STORAGE_KEY))).toEqual(persistedSession)
+  })
+
+  it('closes the join dialog on cancel and returns focus to its trigger', async () => {
+    render(<GameApp />)
+    const trigger = screen.getByRole('button', { name: 'Join room' })
+    await userEvent.click(trigger)
+    fireEvent(screen.getByRole('dialog'), new Event('cancel', { bubbles: false, cancelable: true }))
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+    expect(trigger).toHaveFocus()
+  })
+
+  it('blocks underfunded entry and makes the wallet the recharge path', () => {
+    render(<GameApp walletBalance="49" />)
+    expect(screen.getByRole('button', { name: 'Create room' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: 'Join room' })).toBeDisabled()
+    expect(screen.getByText(/use your wallet to recharge/i)).toBeInTheDocument()
+    expect(api.createRoom).not.toHaveBeenCalled()
+  })
+
+  it('copies the real waiting room code and permits an allowed exit', async () => {
+    const user = userEvent.setup()
+    const copy = vi.spyOn(navigator.clipboard, 'writeText').mockResolvedValue()
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(persistedSession))
+    streamRoomState(waitingState)
+    api.leaveRoom.mockResolvedValue()
+    render(<GameApp />)
+    await user.click(screen.getByRole('button', { name: 'Copy room code' }))
+    expect(copy).toHaveBeenCalledWith('ABC234')
+    expect(screen.getByText('Copied to clipboard.')).toBeInTheDocument()
+    expect(screen.getByText('Awaiting funding')).toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: 'Leave room' }))
+    expect(api.leaveRoom).toHaveBeenCalledWith('ABC234')
+    expect(await screen.findByRole('button', { name: 'Create room' })).toBeInTheDocument()
+  })
+
+  it('keeps a committed move locked until authoritative snapshots resolve it', async () => {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(persistedSession))
+    streamRoomState(readyState)
+    api.submitMove.mockResolvedValue()
+    render(<GameApp />)
+    await userEvent.click(screen.getByRole('button', { name: 'Rock' }))
+    expect(screen.getByRole('heading', { name: 'Move submitted' })).toBeInTheDocument()
+    expect(screen.queryByRole('region', { name: 'Round result' })).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Paper' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: 'Leave room' })).toBeDisabled()
+    act(() => activeSocket.onState({ ...readyState, revision: 3 }))
+    expect(screen.getByRole('button', { name: 'Rock' })).toBeDisabled()
+    act(() => activeSocket.onState(resolvedState))
+    expect(screen.getByRole('heading', { name: 'You won' })).toBeInTheDocument()
+  })
+
+  it('unlocks a failed move and displays its error', async () => {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(persistedSession))
+    streamRoomState(readyState)
+    api.submitMove.mockRejectedValue(new Error('Move rejected'))
+    render(<GameApp />)
+    await userEvent.click(screen.getByRole('button', { name: 'Rock' }))
+    expect(await screen.findByRole('alert')).toHaveTextContent('Move rejected')
+    expect(screen.getByRole('button', { name: 'Rock' })).toBeEnabled()
+  })
+
+  it('uses actual round numbers without a fabricated countdown or round limit', () => {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(persistedSession))
+    streamRoomState({ ...readyState, round: 12 })
+    render(<GameApp />)
+    expect(screen.getByLabelText('Round details')).toHaveTextContent('Round 12')
+    expect(screen.getByLabelText('Round details')).toHaveTextContent('100 coins · Pot')
+    expect(screen.getByLabelText('Round details')).not.toHaveTextContent(/\d+\/3|\d+:\d+/)
+  })
+
+  it('waits for mutual rematch consent and preserves action locking', async () => {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(persistedSession))
+    streamRoomState(resolvedState)
+    let finishRequest
+    api.startNextRound.mockReturnValue(new Promise((resolve) => { finishRequest = resolve }))
+    render(<GameApp walletBalance="100" />)
+    const play = screen.getByRole('button', { name: 'Play again' })
+    act(() => { play.click(); play.click() })
+    expect(api.startNextRound).toHaveBeenCalledExactlyOnceWith('ABC234', 1)
+    expect(screen.getByRole('button', { name: 'Menu' })).toBeDisabled()
+    await act(async () => finishRequest())
+    expect(screen.getByRole('heading', { name: 'You won' })).toBeInTheDocument()
+    act(() => activeSocket.onState({ ...resolvedState, players: resolvedState.players.map((player) => ({ ...player, wantsNextRound: player.role === 'host' })) }))
+    expect(screen.getByRole('button', { name: 'Waiting for opponent…' })).toBeDisabled()
+    expect(screen.getByText(/only when both players agree/)).toBeInTheDocument()
+    act(() => activeSocket.onState({ ...readyState, round: 2 }))
+    expect(screen.getByRole('heading', { name: 'Choose your move' })).toBeInTheDocument()
+  })
+
+  it('requires enough balance to accept an opponent rematch request', () => {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(persistedSession))
+    streamRoomState({ ...resolvedState, players: resolvedState.players.map((player) => ({ ...player, wantsNextRound: player.role === 'guest' })) })
+    const { rerender } = render(<GameApp walletBalance="49" />)
+    expect(screen.getByRole('button', { name: 'Accept next round' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: 'Menu' })).toBeEnabled()
+    rerender(<GameApp walletBalance="50" />)
+    expect(screen.getByRole('button', { name: 'Accept next round' })).toBeEnabled()
+    expect(connectToRoom).toHaveBeenCalledOnce()
+  })
+
+  it('preserves the room and displays feedback when leaving fails', async () => {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(persistedSession))
+    streamRoomState(resolvedState)
+    api.leaveRoom.mockRejectedValue(new Error('Unable to leave'))
+    render(<GameApp />)
+    const menu = screen.getByRole('button', { name: 'Menu' })
+    act(() => { menu.click(); menu.click() })
+    expect(api.leaveRoom).toHaveBeenCalledOnce()
+    expect(await screen.findByRole('alert')).toHaveTextContent('Unable to leave')
+    expect(localStorage.getItem(STORAGE_KEY)).not.toBeNull()
+    expect(closeSocket).not.toHaveBeenCalled()
+  })
+
+  it('refreshes only the wallet on funding, resolution, and the next round without replacing the socket', async () => {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(persistedSession))
+    streamRoomState(waitingState)
+    api.getWallet.mockResolvedValue({ balance: '100' })
+    const onBalance = vi.fn()
+    render(<><AccountPanel onBalance={onBalance} /><GameApp walletBalance="100" /></>)
+    await waitFor(() => expect(api.getWallet).toHaveBeenCalledTimes(1))
+    act(() => activeSocket.onState(readyState))
+    await waitFor(() => expect(api.getWallet).toHaveBeenCalledTimes(2))
+    act(() => activeSocket.onState(resolvedState))
+    await waitFor(() => expect(api.getWallet).toHaveBeenCalledTimes(3))
+    act(() => activeSocket.onState({ ...readyState, round: 2 }))
+    await waitFor(() => expect(api.getWallet).toHaveBeenCalledTimes(4))
+    expect(api.getRoundAnalytics).not.toHaveBeenCalled()
+    expect(connectToRoom).toHaveBeenCalledOnce()
   })
 })

@@ -1,15 +1,15 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import * as api from './api.js'
 import { connectToRoom } from './realtime.js'
-import firstMove from './assets/first-move.png'
-import secondMove from './assets/second-move.png'
+import { Character, CopyButton, GameIcon, GameLogo, Modal, ReportProblem, RoundResult } from './GamePresentation.jsx'
+import { ROUND_STAKE, WINNER_PAYOUT, roundOutcome } from './gamePresentation.js'
 import { clearSession, loadSession, saveSession } from './storage.js'
 import { supabase } from './supabase.js'
 
 const MOVES = [
-  { value: 'rock', label: 'Rock', symbol: '●' },
-  { value: 'paper', label: 'Paper', symbol: '▰' },
-  { value: 'scissors', label: 'Scissors', symbol: '✦' },
+  { value: 'rock', label: 'Rock' },
+  { value: 'paper', label: 'Paper' },
+  { value: 'scissors', label: 'Scissors' },
 ]
 
 function displayError(error) {
@@ -51,17 +51,16 @@ export function ErrorNotice({ message, onDismiss, children }) {
 export function AccountPanel({ onBalance }) {
   const [balance, setBalance] = useState(null)
   const [amount, setAmount] = useState('')
-  const [analytics, setAnalytics] = useState({ totalHouseEarnings: '0', rounds: [] })
+  const [open, setOpen] = useState(false)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
   const pendingRechargeRef = useRef(null)
 
   const refresh = useCallback(async () => {
     try {
-      const [wallet, report] = await Promise.all([api.getWallet(), api.getRoundAnalytics()])
+      const wallet = await api.getWallet()
       setBalance(wallet.balance)
       onBalance(wallet.balance)
-      setAnalytics(report)
       setError('')
     } catch (requestError) {
       setError(displayError(requestError))
@@ -102,35 +101,30 @@ export function AccountPanel({ onBalance }) {
   }
 
   return (
-    <aside className="economy-panel" aria-label="Coin wallet and round analytics">
-      <section className="wallet-card">
-        <div><p className="eyebrow">Coin wallet</p><strong>{balance ?? '…'} coins</strong></div>
-        <form className="recharge-form" onSubmit={recharge}>
-          <label htmlFor="recharge-amount">Recharge amount</label>
-          <input id="recharge-amount" inputMode="numeric" pattern="[1-9][0-9]*" value={amount} onChange={(event) => {
-            setAmount(event.target.value.replace(/\D/g, ''))
-            pendingRechargeRef.current = null
-          }} placeholder="100" />
-          <button className="button button-secondary" disabled={busy || !amount}>{busy ? 'Recharging…' : 'Add coins'}</button>
-        </form>
-        <ErrorNotice message={error} onDismiss={() => setError('')} />
-      </section>
-      <section className="analytics-card" aria-labelledby="analytics-title">
-        <div className="house-banner"><span>Total house earnings</span><strong>{analytics.totalHouseEarnings} coins</strong></div>
-        <h2 id="analytics-title">Played rounds</h2>
-        {analytics.rounds.length === 0 ? <p>No paid rounds have been played yet.</p> : (
-          <div className="analytics-list">
-            {analytics.rounds.map((round) => (
-              <article key={`${round.roomCode}:${round.round}`}>
-                <strong>{round.roomCode} · Round {round.round}</strong>
-                <span>{round.result === 'draw' ? 'Draw' : `${round.winnerRole === 'host' ? 'Host' : 'Guest'} won${round.forfeit ? ' by forfeit' : ''}`}</span>
-                <span>House: {round.houseEarnings} coins</span>
-              </article>
-            ))}
-          </div>
-        )}
-      </section>
-    </aside>
+    <div className="wallet-control">
+      <button className="wallet-button" aria-label={`Coin wallet: ${balance ?? 'loading'} coins. Recharge`} onClick={() => setOpen(true)}>
+        <GameIcon name="coin" /><span>{balance ?? '…'} coins</span><span aria-hidden="true">+</span>
+      </button>
+      {!open && error && <ErrorNotice message={error} onDismiss={() => setError('')}>
+        <button type="button" onClick={refresh}>Retry wallet</button>
+      </ErrorNotice>}
+      {open && <Modal title="Coin wallet" onClose={() => setOpen(false)}>
+        <div className="wallet-card">
+          <p className="wallet-balance" aria-live="polite"><GameIcon name="coin" /><strong>{balance ?? '…'} coins</strong></p>
+          <p>Each round costs {ROUND_STAKE} coins. Creating a room does not charge coins; both players fund it when an opponent joins.</p>
+          <form className="recharge-form" onSubmit={recharge}>
+            <label htmlFor="recharge-amount">Recharge amount</label>
+            <input id="recharge-amount" inputMode="numeric" pattern="[1-9][0-9]*" value={amount} onChange={(event) => {
+              setAmount(event.target.value.replace(/\D/g, ''))
+              pendingRechargeRef.current = null
+            }} placeholder="100" />
+            <button className="button button-secondary" disabled={busy || !amount}>{busy ? 'Recharging…' : 'Add coins'}</button>
+          </form>
+          <p className="wallet-update" role="status">{busy ? 'Adding coins…' : 'Balance updates after funding and completed rounds.'}</p>
+          <ErrorNotice message={error} onDismiss={() => setError('')} />
+        </div>
+      </Modal>}
+    </div>
   )
 }
 
@@ -138,6 +132,7 @@ function Home({ onEnterRoom, walletBalance }) {
   const [code, setCode] = useState('')
   const [busy, setBusy] = useState(null)
   const [error, setError] = useState('')
+  const [joinOpen, setJoinOpen] = useState(false)
   const entryLockRef = useRef(false)
 
   async function enter(action, role) {
@@ -166,22 +161,31 @@ function Home({ onEnterRoom, walletBalance }) {
     enter(() => api.joinRoom(code), 'guest')
   }
 
-  const insufficientForRound = walletBalance !== null && BigInt(walletBalance) < 50n
+  const insufficientForRound = walletBalance !== null && BigInt(walletBalance) < BigInt(ROUND_STAKE)
 
   return (
     <main className="page home-page">
+      <Character className="menu-character menu-character-left" />
+      <Character color="red" className="menu-character menu-character-right" />
       <section className="hero" aria-labelledby="home-title">
-        <p className="eyebrow">Two players · One room</p>
-        <h1 id="home-title">Rock. Paper. <span>Money.</span></h1>
-        <p className="hero-copy">Open a room, share the code, and settle it in three moves.</p>
+        <h1 id="home-title"><span>Rock,</span><span>Paper,</span><em>Money</em></h1>
+        <p className="hero-copy">Two players. One choice. Make it count.</p>
       </section>
 
-      <section className="entry-card" aria-label="Enter a game">
+      <section className="menu-actions" aria-label="Enter a game">
         <button className="button button-primary" disabled={busy !== null || insufficientForRound} onClick={() => enter(api.createRoom, 'host')}>
+          <GameIcon name="rock" />
           {busy === 'host' ? 'Creating room…' : 'Create room'}
         </button>
-        <div className="divider"><span>or join</span></div>
-        <form onSubmit={handleJoin}>
+        <button className="button button-secondary" disabled={busy !== null || insufficientForRound} onClick={() => setJoinOpen(true)}><GameIcon name="paper" />Join room</button>
+        <ReportProblem />
+        <p className="entry-rules">{ROUND_STAKE} coins per player · Winner receives {WINNER_PAYOUT} coins</p>
+        {insufficientForRound && <div className="notice notice-error" role="status">You need at least 50 coins to create or join a room. Use your wallet to recharge.</div>}
+        {!joinOpen && <ErrorNotice message={error} onDismiss={() => setError('')} />}
+      </section>
+      {joinOpen && <Modal title="Join a room" onClose={() => setJoinOpen(false)}>
+        <p>Get the room code from your opponent. Both players contribute {ROUND_STAKE} coins when you join.</p>
+        <form className="join-form" onSubmit={handleJoin}>
           <label htmlFor="room-code">Six-character room code</label>
           <input
             id="room-code"
@@ -197,9 +201,8 @@ function Home({ onEnterRoom, walletBalance }) {
             {busy === 'guest' ? 'Joining room…' : 'Join room'}
           </button>
         </form>
-        {insufficientForRound && <div className="notice notice-error">You need at least 50 coins to create or join a room. Creating a room does not charge coins.</div>}
         <ErrorNotice message={error} onDismiss={() => setError('')} />
-      </section>
+      </Modal>}
     </main>
   )
 }
@@ -208,6 +211,7 @@ function SessionRecovery({ error, onRetry, onForget }) {
   return (
     <main className="page recovery-page">
       <section className="entry-card centered" aria-live="polite">
+        <GameLogo />
         {error ? (
           <>
             <p className="eyebrow">Session unavailable</p>
@@ -221,8 +225,8 @@ function SessionRecovery({ error, onRetry, onForget }) {
         ) : (
           <>
             <div className="loader" />
-            <h1>Restoring your room…</h1>
-            <p>Checking your saved player credentials.</p>
+            <h1>Getting your game ready…</h1>
+            <p>Checking your account session.</p>
           </>
         )}
       </section>
@@ -230,7 +234,7 @@ function SessionRecovery({ error, onRetry, onForget }) {
   )
 }
 
-function Scoreboard({ players = [], role, resolved = false }) {
+function Scoreboard({ players = [], role, resolved = false, presence = {} }) {
   return (
     <section className="scoreboard" aria-label="Score and readiness">
       {['host', 'guest'].map((playerRole) => {
@@ -238,49 +242,19 @@ function Scoreboard({ players = [], role, resolved = false }) {
         return (
           <div className={`player-card ${playerRole === role ? 'player-card-you' : ''}`} key={playerRole}>
             <div>
-              <p>{playerRole === 'host' ? 'Host' : 'Guest'} {playerRole === role && <span className="you">You</span>}</p>
+              <p>{playerRole === role ? 'You' : 'Opponent'}</p>
               <span className={`status-dot ${(resolved ? player?.wantsNextRound : player?.submitted) ? 'status-ready' : ''}`}>
                 {resolved
                   ? player?.wantsNextRound ? 'Wants another round' : 'Deciding'
                   : player?.submitted ? 'Move locked' : player ? 'Choosing' : 'Not connected'}
               </span>
+              {player && presence[playerRole] === false && <span className="presence-status">Reconnecting</span>}
             </div>
             <strong aria-label={`${playerRole} score`}>{player?.wins ?? 0}</strong>
           </div>
         )
       })}
     </section>
-  )
-}
-
-function RoundResult({ state, role }) {
-  const localWon = (state.result === 'player_one_wins' && role === 'host') ||
-    (state.result === 'player_two_wins' && role === 'guest')
-  const title = state.result === 'draw' ? 'Draw round' : localWon ? 'You won' : 'You lost'
-  const moveFor = (playerRole) => state.moves.find((item) => item.role === playerRole)?.move ?? 'unknown'
-
-  return (
-    <section className="result-panel" aria-live="polite">
-      <p className="eyebrow">Round complete</p>
-      <h2>{title}</h2>
-      {state.forfeit ? (
-        <p>{localWon ? 'Your opponent disconnected and did not return.' : 'You did not reconnect before the grace period ended.'}</p>
-      ) : (
-        <div className="revealed-moves">
-          <p><span>Your move</span><strong>{moveFor(role)}</strong></p>
-          <p><span>Opponent</span><strong>{moveFor(role === 'host' ? 'guest' : 'host')}</strong></p>
-        </div>
-      )}
-    </section>
-  )
-}
-
-function ChoosingAnimation() {
-  return (
-    <div className="choosing-animation" role="img" aria-label="Players choosing their moves">
-      <img className="choosing-frame choosing-frame-first" src={firstMove} alt="" />
-      <img className="choosing-frame choosing-frame-second" src={secondMove} alt="" />
-    </div>
   )
 }
 
@@ -365,7 +339,15 @@ function Room({ session, onLeave, walletBalance }) {
   const opponent = state?.players.find((player) => player.role !== role)
   const wantsNextRound = currentPlayer?.wantsNextRound ?? false
   const canLeave = state?.resolved || (state?.ready === false && state.players.length === 1)
-  const insufficientForRound = walletBalance !== null && BigInt(walletBalance) < 50n
+  const insufficientForRound = walletBalance !== null && BigInt(walletBalance) < BigInt(ROUND_STAKE)
+  const outcome = state?.resolved ? roundOutcome(state, role) : null
+
+  function leave() {
+    performAction('leave', async () => {
+      await api.leaveRoom(session.roomCode)
+      if (mountedRef.current) onLeave()
+    })
+  }
 
   function retryConnection() {
     setLoading(true)
@@ -374,26 +356,23 @@ function Room({ session, onLeave, walletBalance }) {
   }
 
   return (
-    <main className="page room-page">
+    <main className={`page room-page${outcome ? ` result-page result-${outcome.kind}` : ''}`}>
       <header className="room-header">
         <div>
           <p className="eyebrow">Room code</p>
           <h1 aria-label={`Room code ${session.roomCode}`}>{session.roomCode}</h1>
-          <p className="share-hint">Share this code with your opponent.</p>
+          <p className="share-hint">{state?.resolved ? `Round ${state.round} settled` : 'Keep this room open while you play.'}</p>
         </div>
-        <button
+        {!state?.resolved && <button
           className="button button-quiet"
           disabled={action !== null || !canLeave}
-          onClick={() => performAction('leave', async () => {
-            await api.leaveRoom(session.roomCode)
-            if (mountedRef.current) onLeave()
-          })}
+          onClick={leave}
         >
           {action === 'leave' ? 'Leaving room…' : 'Leave room'}
-        </button>
+        </button>}
       </header>
 
-      <Scoreboard players={state?.players} role={role} resolved={state?.resolved} />
+      {state && <Scoreboard players={state.players} role={role} resolved={state.resolved} presence={state.presence} />}
 
       <ErrorNotice
         message={error || connectionError}
@@ -402,63 +381,94 @@ function Room({ session, onLeave, walletBalance }) {
         {connectionError && <button type="button" onClick={retryConnection}>Retry</button>}
       </ErrorNotice>
 
-      {loading && !state && <section className="game-panel centered" aria-live="polite"><div className="loader" /><h2>Loading room…</h2></section>}
+      {loading && <p className="connection-status" role="status">{state ? 'Reconnecting to your room…' : 'Connecting to your room…'}</p>}
 
-      {state && !state.ready && (
-        <section className="game-panel centered" aria-live="polite">
-          <div className="waiting-mark"><span /><span /><span /></div>
-          <p className="eyebrow">Room is open</p>
-          <h2>Waiting for a guest</h2>
-          <p>Keep this page open while your opponent joins with the code above.</p>
-          {insufficientForRound && <div className="notice notice-error">Recharge to at least 50 coins before a guest can fund this round.</div>}
-        </section>
-      )}
-
-      {state?.ready && !state.resolved && (
-        <section className="game-panel" aria-labelledby="round-title">
-          <p className="eyebrow">Current round</p>
-          <h2 id="round-title">{hasSubmitted ? 'Move submitted' : 'Choose your move'}</h2>
-          <p>{hasSubmitted ? 'Your choice is hidden. Waiting for your opponent.' : 'Your move stays secret until both players submit.'}</p>
-          <ChoosingAnimation />
-          <div className="move-grid" aria-label="Choose a move">
-            {MOVES.map((move) => (
-              <button
-                className="move-button"
-                key={move.value}
-                disabled={hasSubmitted || action !== null}
-                onClick={() => performAction('move', () => api.submitMove(session.roomCode, move.value))}
-              >
-                <span aria-hidden="true">{move.symbol}</span>
-                {move.label}
-              </button>
-            ))}
+      {!state?.resolved && <div className="arena">
+        <div className="arena-panes">
+          <section className="fighter-pane opponent-pane" aria-label="Opponent arena">
+            <div className="fighter-copy">
+              <span className="fighter-tag opponent-tag">Opponent</span>
+              <p>{!state?.ready ? 'A challenger awaits' : opponent?.submitted ? 'Their move is locked' : 'Choosing in secret'}</p>
+            </div>
+            <Character color="red" />
+          </section>
+          <div className="arena-hud" aria-label="Round details">
+            <span>{state ? `Round ${state.round}` : 'Connecting'}</span>
+            <span className="pot"><GameIcon name="coin" />{state?.ready ? `${ROUND_STAKE * 2} coins · Pot` : 'Awaiting funding'}</span>
+            <span>{hasSubmitted ? 'Locked' : state?.ready ? 'Choose' : 'Waiting'}</span>
           </div>
-          {action === 'move' && <p className="action-status" role="status">Locking your move…</p>}
-        </section>
-      )}
+          <section className="fighter-pane local-pane" aria-label="Your arena">
+            <Character />
+            <div className="local-controls">
+              <span className="fighter-tag local-tag">Your side</span>
+              {state?.ready && <>
+                <h2 id="round-title">{hasSubmitted ? 'Move submitted' : 'Choose your move'}</h2>
+                <p aria-live="polite">{hasSubmitted ? 'Your choice is hidden. Waiting for your opponent.' : 'Your move stays secret until both players submit.'}</p>
+                <div className="move-grid" aria-label="Choose a move">
+                  {MOVES.map((move) => (
+                    <button
+                      className={`move-button move-${move.value}`}
+                      key={move.value}
+                      disabled={hasSubmitted || action !== null}
+                      onClick={() => performAction('move', () => api.submitMove(session.roomCode, move.value))}
+                    >
+                      <GameIcon name={move.value} />
+                      <span>{move.label}</span>
+                    </button>
+                  ))}
+                </div>
+                {action === 'move' && <p className="action-status" role="status">Locking your move…</p>}
+              </>}
+            </div>
+          </section>
+        </div>
+        {(!state || !state.ready) && <div className="waiting-overlay">
+          <section className="waiting-card" aria-live="polite">
+            <div className="loader" />
+            <p className="eyebrow">{state ? 'Room is open' : 'Joining the arena'}</p>
+            <h2>{state ? 'Waiting for a guest' : loading ? 'Loading room…' : 'Room connection unavailable'}</h2>
+            {state ? <>
+              <p>Share your room code with an opponent.</p>
+              <p className="room-code">{session.roomCode}</p>
+              <CopyButton text={session.roomCode} />
+              <p>Keep this page open. Each player contributes {ROUND_STAKE} coins when the round starts.</p>
+              {insufficientForRound && <div className="notice notice-error">Recharge to at least 50 coins before a guest can fund this round.</div>}
+            </> : <p>Waiting for the server to confirm your room.</p>}
+          </section>
+        </div>}
+      </div>}
 
       {state?.resolved && (
-        <section className="game-panel">
-          <RoundResult state={state} role={role} />
-          <p aria-live="polite">
-            {wantsNextRound
-              ? 'You want another round. Waiting for your opponent to decide.'
-              : opponent?.wantsNextRound
-                ? 'Your opponent wants another round. Accept or leave the room.'
-                : 'Request another round, or leave the room.'}
-          </p>
-          <button
-            className="button button-primary"
-            disabled={action !== null || wantsNextRound || insufficientForRound}
-            onClick={() => performAction('next', () => api.startNextRound(session.roomCode, state.round))}
-          >
-            {action === 'next'
-              ? 'Sending request…'
-              : wantsNextRound
-                ? 'Waiting for opponent…'
-                : opponent?.wantsNextRound ? 'Accept next round' : 'Request next round'}
-          </button>
-          {insufficientForRound && <div className="notice notice-error">Recharge to at least 50 coins before accepting another paid round.</div>}
+        <section className="game-panel result-stage">
+          <Character className="result-character" />
+          <div className="result-content">
+            <RoundResult state={state} role={role} />
+            <p aria-live="polite">
+              {wantsNextRound
+                ? 'You want another round. Waiting for your opponent to decide.'
+                : opponent?.wantsNextRound
+                  ? 'Your opponent wants another round. Accept or leave the room.'
+                  : 'Request another round, or leave the room.'}
+            </p>
+            <div className="result-actions">
+              <button
+                className="button button-primary"
+                disabled={action !== null || wantsNextRound || insufficientForRound}
+                onClick={() => performAction('next', () => api.startNextRound(session.roomCode, state.round))}
+              >
+                {action === 'next'
+                  ? 'Sending request…'
+                  : wantsNextRound
+                    ? 'Waiting for opponent…'
+                    : opponent?.wantsNextRound ? 'Accept next round' : 'Play again'}
+              </button>
+              <button className="button button-cream" disabled={action !== null || !canLeave} onClick={leave}>
+                {action === 'leave' ? 'Leaving room…' : 'Menu'}
+              </button>
+            </div>
+            <p className="rematch-hint">A new round starts only when both players agree and have {ROUND_STAKE} coins each.</p>
+            {insufficientForRound && <div className="notice notice-error">Recharge to at least 50 coins before accepting another paid round.</div>}
+          </div>
         </section>
       )}
 
@@ -523,6 +533,7 @@ function AuthForm({ initialError, onAuthenticated, onPending, onDismissInitialEr
   return (
     <main className="page recovery-page">
       <section className="entry-card auth-card" aria-labelledby="auth-title">
+        <GameLogo />
         <p className="eyebrow">Account required</p>
         <h1 id="auth-title">{mode === 'login' ? 'Sign in to play' : 'Create your account'}</h1>
         <form className="auth-form" onSubmit={submit}>
@@ -632,12 +643,13 @@ export default function App() {
 
   if (loading) return <SessionRecovery error="" onRetry={() => {}} onForget={() => {}} />
   if (error && !supabase) {
-    return <main className="page recovery-page"><div className="notice notice-error" role="alert">{error}</div></main>
+    return <main className="page recovery-page"><section className="entry-card centered"><GameLogo /><h1>Game unavailable</h1><div className="notice notice-error" role="alert">{error}</div><p>Authentication must be configured before you can play.</p></section></main>
   }
   if (pendingEmail) {
     return (
       <main className="page recovery-page">
         <section className="entry-card centered" aria-live="polite">
+          <GameLogo />
           <p className="eyebrow">Confirm your email</p>
           <h1>Check your inbox</h1>
           <p>We sent a confirmation link to {pendingEmail}. Confirm your email, then return here to sign in.</p>
@@ -650,14 +662,19 @@ export default function App() {
 
   return (
     <div className="authenticated-app">
-      <div className="account-bar">
-        <span>Signed in</span>
-        <button className="button button-quiet" onClick={signOut}>Sign out</button>
-      </div>
+      <header className="account-bar">
+        <GameLogo compact />
+        <div className="player-account">
+          <span className="player-identity" title={authSession.user?.email}>
+            {authSession.user?.user_metadata?.username || authSession.user?.user_metadata?.display_name || authSession.user?.email || 'Player'}
+          </span>
+          <AccountPanel onBalance={setWalletBalance} />
+          <button className="button button-quiet" onClick={signOut}>Sign out</button>
+        </div>
+      </header>
       <div className="page account-error">
         <ErrorNotice message={error} onDismiss={() => setError('')} />
       </div>
-      <AccountPanel onBalance={setWalletBalance} />
       <GameApp walletBalance={walletBalance} />
     </div>
   )
