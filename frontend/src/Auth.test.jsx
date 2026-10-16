@@ -29,6 +29,8 @@ describe('account authentication boundary', () => {
     })
     api.bootstrapSession.mockReset().mockResolvedValue()
     api.logoutSession.mockReset().mockResolvedValue()
+    api.getWallet.mockReset().mockResolvedValue({ balance: '125' })
+    api.getRoundAnalytics.mockReset()
   })
 
   it('restores a Supabase session before enabling game actions', async () => {
@@ -42,6 +44,17 @@ describe('account authentication boundary', () => {
     expect(await screen.findByRole('button', { name: 'Create room' })).toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Sign out' })).toBeInTheDocument()
     expect(api.bootstrapSession).toHaveBeenCalledWith('current')
+  })
+
+  it('shows only the authenticated player identity and wallet on the main menu', async () => {
+    auth.getSession.mockResolvedValue({ data: { session: {
+      access_token: 'current', user: { email: 'player@example.com', user_metadata: { username: 'PLAYER_ONE' } },
+    } }, error: null })
+    render(<App />)
+    expect(await screen.findByText('PLAYER_ONE')).toBeInTheDocument()
+    expect(await screen.findByRole('button', { name: 'Coin wallet: 125 coins. Recharge' })).toBeInTheDocument()
+    expect(api.getRoundAnalytics).not.toHaveBeenCalled()
+    expect(screen.queryByText(/house earnings|played rounds/i)).not.toBeInTheDocument()
   })
 
   it('signs in with email and password', async () => {
