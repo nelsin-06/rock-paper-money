@@ -133,11 +133,11 @@ func TestRequestSecurityRequiresExactOriginAndSessionBoundCSRF(t *testing.T) {
 
 func TestSessionCookiesUseSecureBrowserBoundaries(t *testing.T) {
 	sessionCookie := NewSessionCookie("opaque")
-	if !sessionCookie.HttpOnly || !sessionCookie.Secure || sessionCookie.SameSite != http.SameSiteLaxMode || sessionCookie.Path != "/" {
+	if !sessionCookie.HttpOnly || !sessionCookie.Secure || sessionCookie.SameSite != http.SameSiteLaxMode || sessionCookie.Path != "/" || sessionCookie.Domain != "" {
 		t.Fatalf("session cookie = %#v", sessionCookie)
 	}
 	csrfCookie := NewCSRFCookie("csrf")
-	if csrfCookie.HttpOnly || !csrfCookie.Secure || csrfCookie.SameSite != http.SameSiteLaxMode || csrfCookie.Path != "/" {
+	if csrfCookie.HttpOnly || !csrfCookie.Secure || csrfCookie.SameSite != http.SameSiteLaxMode || csrfCookie.Path != "/" || csrfCookie.Domain != "" {
 		t.Fatalf("CSRF cookie = %#v", csrfCookie)
 	}
 }
@@ -176,6 +176,9 @@ func TestSessionHTTPBootstrapAndLogout(t *testing.T) {
 	}
 	if sessionCookie == nil || !sessionCookie.HttpOnly || csrfCookie == nil || csrfCookie.HttpOnly {
 		t.Fatalf("session=%#v csrf=%#v", sessionCookie, csrfCookie)
+	}
+	if bootstrapResponse.Header().Get(CSRFHeaderName) != csrfCookie.Value || bootstrapResponse.Header().Get("Cache-Control") != "no-store" || bootstrapResponse.Body.Len() != 0 {
+		t.Fatalf("bootstrap token response: %v %s", bootstrapResponse.Header(), bootstrapResponse.Body.String())
 	}
 	if session, authenticateErr := sessions.Authenticate(context.Background(), sessionCookie.Value); authenticateErr != nil || session.AccountID != "verified-account" {
 		t.Fatalf("durable session account=%q error=%v", session.AccountID, authenticateErr)
@@ -266,6 +269,9 @@ func TestRepeatedBootstrapReusesBrowserSessionRevokedByLogout(t *testing.T) {
 		t.Fatalf("first bootstrap cookies: session=%#v csrf=%#v", sessionCookie, csrfCookie)
 	}
 	second := bootstrap(sessionCookie, csrfCookie)
+	if second.Header().Get(CSRFHeaderName) != csrfCookie.Value || second.Header().Get("Cache-Control") != "no-store" || second.Body.Len() != 0 {
+		t.Fatalf("reused bootstrap token response: %v %s", second.Header(), second.Body.String())
+	}
 	if second.Code != http.StatusNoContent || len(second.Result().Cookies()) != 0 {
 		t.Fatalf("repeated bootstrap replaced browser session: status=%d cookies=%#v", second.Code, second.Result().Cookies())
 	}

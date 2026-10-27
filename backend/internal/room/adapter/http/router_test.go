@@ -360,6 +360,9 @@ func TestCookieSessionRESTRejectsBearerAndChecksCSRFBeforeEffects(t *testing.T) 
 	bearerResponse := httptest.NewRecorder()
 	handler.ServeHTTP(bearerResponse, bearerOnly)
 	assertStatus(t, bearerResponse, http.StatusUnauthorized)
+	if bearerResponse.Header().Get("Access-Control-Allow-Origin") != "https://game.example" || bearerResponse.Header().Get("X-Request-ID") == "" || bearerResponse.Header().Get("Access-Control-Expose-Headers") != "X-CSRF-Token, X-Request-ID" {
+		t.Fatalf("authentication error lost CORS or request ID: %v", bearerResponse.Header())
+	}
 
 	for _, test := range []struct {
 		name   string
@@ -392,6 +395,46 @@ func TestCookieSessionRESTRejectsBearerAndChecksCSRFBeforeEffects(t *testing.T) 
 	assertStatus(t, validResponse, http.StatusCreated)
 	if strings.Contains(validResponse.Body.String(), "player_token") {
 		t.Fatalf("cookie response exposed legacy room token: %s", validResponse.Body.String())
+	}
+}
+
+func TestSessionCORSPreflight(t *testing.T) {
+	security, err := auth.NewRequestSecurity("https://game.example", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := NewSessionRouter(fixedService(), testVerifier{}, auth.NewSessionService(newRouterSessionStore(), bytes.NewReader(nil), time.Now), security, nil, nil)
+	for _, tt := range []struct {
+		name, origin, method, headers string
+		status                        int
+	} {
+		{"bootstrap", "https://game.example", "POST", "authorization", 204},
+		{"mutation", "https://game.example", "POST", "content-type, x-csrf-token, idempotency-key", 204},
+		{"logout", "https://game.example", "DELETE", "X-CSRF-Token", 204},
+		{"hostile origin", "https://game.example.evil.test", "POST", "authorization", 403},
+		{"hostile method", "https://game.example", "PUT", "authorization", 403},
+		{"hostile header", "https://game.example", "POST", "x-room-token", 403},
+		{"null origin", "null", "POST", "authorization", 403},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			r := httptest.NewRequest("OPTIONS", "/api/session", nil)
+			r.Header.Set("Origin", tt.origin)
+			r.Header.Set("Access-Control-Request-Method", tt.method)
+			r.Header.Set("Access-Control-Request-Headers", tt.headers)
+			w := httptest.NewRecorder()
+			handler.ServeHTTP(w, r)
+			assertStatus(t, w, tt.status)
+			if len(w.Result().Cookies()) != 0 {
+				t.Fatal("preflight set cookies")
+			}
+			if tt.status == 204 {
+				if w.Body.Len() != 0 || w.Header().Get("Access-Control-Allow-Origin") != tt.origin || w.Header().Get("Access-Control-Allow-Credentials") != "true" {
+					t.Fatalf("preflight response: %v %s", w.Header(), w.Body.String())
+				}
+			} else if w.Header().Get("Access-Control-Allow-Origin") != "" {
+				t.Fatal("rejected preflight allowed CORS")
+			}
+		})
 	}
 }
 
