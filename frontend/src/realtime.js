@@ -1,7 +1,8 @@
 import { ApiError, mapRoomState } from './api.js'
+import { backendURL } from './backendURL.js'
 
 function socketURL(roomCode) {
-  const url = new URL(`/api/rooms/${encodeURIComponent(roomCode)}/socket`, window.location.href)
+  const url = new URL(backendURL(`/api/rooms/${encodeURIComponent(roomCode)}/socket`), window.location.href)
   url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:'
   return url.toString()
 }

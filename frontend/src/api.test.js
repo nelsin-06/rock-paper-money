@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import {
   ApiError,
@@ -22,10 +22,32 @@ function response(body, { status = 200, requestId = 'request-123' } = {}) {
 }
 
 describe('cookie session API client', () => {
+  afterEach(() => vi.unstubAllEnvs())
+
   beforeEach(() => {
+    vi.stubEnv('VITE_BACKEND_PROXY_TARGET', '')
     vi.stubGlobal('fetch', vi.fn())
     vi.spyOn(crypto, 'randomUUID').mockReturnValue('generated-key')
     document.cookie = 'rpm_csrf=csrf-token; Path=/'
+  })
+
+  it.each(['http://backend.example:8080', 'https://backend.example/'])('routes HTTP requests to %s without changing session options or path encoding', async (target) => {
+    vi.stubEnv('VITE_BACKEND_PROXY_TARGET', target)
+    fetch.mockResolvedValue(response({ room_code: 'A/B ?' }, { status: 201 }))
+
+    await expect(joinRoom(' a/b ? ')).resolves.toEqual({ roomCode: 'A/B ?' })
+
+    expect(fetch).toHaveBeenCalledExactlyOnceWith(`${target.replace(/\/$/, '')}/api/rooms/A%2FB%20%3F/join`, expect.objectContaining({
+      method: 'POST', credentials: 'same-origin',
+      headers: { 'X-CSRF-Token': 'csrf-token', 'Idempotency-Key': 'generated-key' },
+    }))
+  })
+
+  it.each([undefined, ''])('keeps relative HTTP destinations when the backend target is %s', async (target) => {
+    vi.stubEnv('VITE_BACKEND_PROXY_TARGET', target)
+    fetch.mockResolvedValue(response({ balance: '50' }))
+    await expect(getWallet()).resolves.toEqual({ balance: '50' })
+    expect(fetch).toHaveBeenCalledExactlyOnceWith('/api/wallet', { credentials: 'same-origin', signal: undefined })
   })
 
   it('bootstraps cookies once, then logs out with session-bound CSRF', async () => {
