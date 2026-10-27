@@ -572,8 +572,15 @@ export default function App() {
 
   const establishSession = useCallback((nextSession) => {
     const sequence = ++authSequenceRef.current
+    if (!nextSession) {
+      backendTokenRef.current = ''
+      api.clearSessionSecurity()
+    }
+    if (backendTokenRef.current !== nextSession?.access_token) setAuthSession(null)
     const task = backendSessionTaskRef.current.then(async () => {
+      if (sequence !== authSequenceRef.current) return
       if (!nextSession) {
+        api.clearSessionSecurity()
         backendTokenRef.current = ''
         if (sequence === authSequenceRef.current) {
           clearSession()
@@ -582,7 +589,10 @@ export default function App() {
         return
       }
       if (backendTokenRef.current !== nextSession.access_token) {
+        backendTokenRef.current = ''
         await api.bootstrapSession(nextSession.access_token)
+        // A superseded bootstrap cannot certify the latest security context.
+        if (sequence !== authSequenceRef.current) return
         backendTokenRef.current = nextSession.access_token
       }
       if (sequence === authSequenceRef.current) setAuthSession(nextSession)
@@ -627,6 +637,7 @@ export default function App() {
   async function signOut() {
     setError('')
     try {
+      await backendSessionTaskRef.current
       await api.logoutSession()
       const { error: signOutError } = await supabase.auth.signOut()
       if (signOutError) {

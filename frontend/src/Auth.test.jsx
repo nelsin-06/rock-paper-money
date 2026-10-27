@@ -93,7 +93,7 @@ describe('account authentication boundary', () => {
     expect(screen.getByRole('button', { name: 'Create room' })).toBeInTheDocument()
   })
 
-  it('serializes duplicate bootstrap signals for the same browser session', async () => {
+  it('serializes bootstrap signals and revalidates a superseded completion', async () => {
     let resolveBootstrap
     api.bootstrapSession.mockReturnValue(new Promise((resolve) => { resolveBootstrap = resolve }))
     auth.getSession.mockResolvedValue({ data: { session: { access_token: 'current' } }, error: null })
@@ -104,7 +104,45 @@ describe('account authentication boundary', () => {
     await act(async () => resolveBootstrap())
 
     expect(await screen.findByRole('button', { name: 'Create room' })).toBeInTheDocument()
-    expect(api.bootstrapSession).toHaveBeenCalledOnce()
+    expect(api.bootstrapSession).toHaveBeenCalledTimes(2)
+  })
+
+  it('bootstraps again on reload before enabling mutations', async () => {
+    auth.getSession.mockResolvedValue({ data: { session: { access_token: 'current' } }, error: null })
+    const first = render(<App />)
+    await screen.findByRole('button', { name: 'Create room' })
+    first.unmount()
+    let resolveBootstrap
+    api.bootstrapSession.mockReturnValueOnce(new Promise((resolve) => { resolveBootstrap = resolve }))
+    render(<App />)
+    await waitFor(() => expect(api.bootstrapSession).toHaveBeenCalledTimes(2))
+    expect(screen.queryByRole('button', { name: 'Create room' })).not.toBeInTheDocument()
+    await act(async () => resolveBootstrap())
+    expect(await screen.findByRole('button', { name: 'Create room' })).toBeInTheDocument()
+  })
+
+  it('clears security context and hides game actions when the account signs out externally', async () => {
+    auth.getSession.mockResolvedValue({ data: { session: { access_token: 'current' } }, error: null })
+    render(<App />)
+    await screen.findByRole('button', { name: 'Create room' })
+    api.clearSessionSecurity.mockClear()
+    act(() => authStateChanged('SIGNED_OUT', null))
+    expect(screen.queryByRole('button', { name: 'Create room' })).not.toBeInTheDocument()
+    expect(await screen.findByRole('heading', { name: 'Sign in to play' })).toBeInTheDocument()
+    expect(api.clearSessionSecurity).toHaveBeenCalled()
+  })
+
+  it('gates game actions while a changed account bootstraps', async () => {
+    auth.getSession.mockResolvedValue({ data: { session: { access_token: 'account-a' } }, error: null })
+    render(<App />)
+    await screen.findByRole('button', { name: 'Create room' })
+    let resolveBootstrap
+    api.bootstrapSession.mockReturnValueOnce(new Promise((resolve) => { resolveBootstrap = resolve }))
+    act(() => authStateChanged('SIGNED_IN', { access_token: 'account-b' }))
+    await waitFor(() => expect(api.bootstrapSession).toHaveBeenCalledWith('account-b'))
+    expect(screen.queryByRole('button', { name: 'Create room' })).not.toBeInTheDocument()
+    await act(async () => resolveBootstrap())
+    expect(await screen.findByRole('button', { name: 'Create room' })).toBeInTheDocument()
   })
 
   it('shows email confirmation pending when registration has no session', async () => {

@@ -111,6 +111,8 @@ func (h *sessionHTTPHandler) bootstrap(w http.ResponseWriter, r *http.Request) {
 		if authenticateErr == nil {
 			csrfCookie, csrfErr := r.Cookie(CSRFCookieName)
 			if current.AccountID == principal.Subject && csrfErr == nil && h.sessions.ValidateCSRF(current, csrfCookie.Value) {
+				w.Header().Set(CSRFHeaderName, csrfCookie.Value)
+				w.Header().Set("Cache-Control", "no-store")
 				w.WriteHeader(http.StatusNoContent)
 				return
 			}
@@ -128,6 +130,8 @@ func (h *sessionHTTPHandler) bootstrap(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 		return
 	}
+	w.Header().Set(CSRFHeaderName, credentials.CSRFToken)
+	w.Header().Set("Cache-Control", "no-store")
 	http.SetCookie(w, NewSessionCookie(credentials.Token))
 	http.SetCookie(w, NewCSRFCookie(credentials.CSRFToken))
 	w.WriteHeader(http.StatusNoContent)

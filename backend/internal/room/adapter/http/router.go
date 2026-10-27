@@ -90,7 +90,11 @@ func newRouter(service *application.Service, verifier auth.Verifier, sessions *a
 	registerRoute(mux, http.MethodPost, "/api/wallet/recharges", handler.protected("recharge_wallet", handler.rechargeWallet))
 	registerRoute(mux, http.MethodGet, "/api/analytics/rounds", handler.protected("list_round_analytics", handler.analytics))
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) { writeAPIError(w, r, errorEndpointNotFound) })
-	return observeRequests(logger, mux)
+	var routes http.Handler = mux
+	if security != nil {
+		routes = security.CORS(routes)
+	}
+	return observeRequests(logger, routes)
 }
 
 func registerRoute(mux *http.ServeMux, method, path string, handler http.HandlerFunc) {

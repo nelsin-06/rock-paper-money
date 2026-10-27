@@ -11,15 +11,17 @@ export class ApiError extends Error {
   }
 }
 
-function csrfToken() {
-  const prefix = 'rpm_csrf='
-  const cookie = document.cookie.split(';').map((value) => value.trim()).find((value) => value.startsWith(prefix))
-  return cookie ? decodeURIComponent(cookie.slice(prefix.length)) : ''
+let sessionCSRF = ''
+let sessionGeneration = 0
+
+export function clearSessionSecurity() {
+  sessionCSRF = ''
+  sessionGeneration += 1
 }
 
 async function request(path, options = {}) {
-  const { retryNetwork = false, ...fetchOptions } = options
-  const requestOptions = { credentials: 'same-origin', ...fetchOptions }
+  const { retryNetwork = false, returnResponse = false, ...fetchOptions } = options
+  const requestOptions = { credentials: 'include', ...fetchOptions }
   let response
   for (let attempt = 0; attempt < 2; attempt += 1) {
     try {
@@ -58,6 +60,7 @@ async function request(path, options = {}) {
     }
     throw fallback
   }
+  if (returnResponse) return response
   if (response.status === 204) return null
   try {
     return await response.json()
@@ -67,7 +70,7 @@ async function request(path, options = {}) {
 }
 
 function mutationHeaders({ json = false, idempotent = true, idempotencyKey } = {}) {
-  const csrf = csrfToken()
+  const csrf = sessionCSRF
   if (!csrf) throw new ApiError('Your browser session is missing its security token. Sign in again.', 401)
   const headers = { 'X-CSRF-Token': csrf }
   if (json) headers['Content-Type'] = 'application/json'
@@ -106,22 +109,26 @@ function coinValue(value, field) {
 }
 
 export async function bootstrapSession(accessToken, { signal } = {}) {
+  clearSessionSecurity()
+  const generation = sessionGeneration
   if (typeof accessToken !== 'string' || !accessToken) throw new ApiError('Your account session has expired. Sign in again.', 401)
-  await request('/api/session', {
+  const response = await request('/api/session', {
     method: 'POST',
-    credentials: 'same-origin',
     headers: { Authorization: `Bearer ${accessToken}` },
     signal,
+    returnResponse: true,
   })
+  const csrf = response.headers.get('X-CSRF-Token')
+  if (!csrf) throw new ApiError('Your browser session is missing its security token. Sign in again.', 401)
+  if (generation === sessionGeneration && !signal?.aborted) sessionCSRF = csrf
 }
 
 export async function logoutSession({ signal } = {}) {
-  await request('/api/session', {
-    method: 'DELETE',
-    credentials: 'same-origin',
-    headers: mutationHeaders({ idempotent: false }),
-    signal,
-  })
+  const headers = mutationHeaders({ idempotent: false })
+  const generation = sessionGeneration
+  // Keep failed logout retryable, but never alter a newer account/reset's token.
+  await request('/api/session', { method: 'DELETE', headers, signal })
+  if (generation === sessionGeneration) clearSessionSecurity()
 }
 
 export async function createRoom({ signal } = {}) {
