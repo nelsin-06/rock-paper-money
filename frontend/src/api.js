@@ -1,3 +1,5 @@
+import { backendURL } from './backendURL.js'
+
 export class ApiError extends Error {
   constructor(message, status = 0, { code = '', requestId = '', rawError } = {}) {
     super(message)
@@ -21,7 +23,7 @@ async function request(path, options = {}) {
   let response
   for (let attempt = 0; attempt < 2; attempt += 1) {
     try {
-      response = await fetch(path, requestOptions)
+      response = await fetch(backendURL(path), requestOptions)
       break
     } catch (error) {
       if (error?.name === 'AbortError') throw error

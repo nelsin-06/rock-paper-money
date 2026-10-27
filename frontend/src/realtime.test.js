@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { connectToRoom } from './realtime.js'
 
@@ -42,10 +42,36 @@ function frame(revision, role = 'host') {
 }
 
 describe('room WebSocket client', () => {
+  afterEach(() => {
+    vi.unstubAllEnvs()
+    vi.useRealTimers()
+  })
+
   beforeEach(() => {
+    vi.stubEnv('VITE_BACKEND_PROXY_TARGET', '')
     vi.useFakeTimers()
     FakeWebSocket.instances = []
     vi.stubGlobal('WebSocket', FakeWebSocket)
+  })
+
+  it.each([
+    ['http://backend.example:8080', 'ws://backend.example:8080'],
+    ['https://backend.example/', 'wss://backend.example'],
+  ])('uses configured backend %s for initial and reconnected sockets', (target, expected) => {
+    vi.stubEnv('VITE_BACKEND_PROXY_TARGET', target)
+    const close = connectToRoom('A/B ?', {}, { reconnectDelay: () => 5 })
+    expect(FakeWebSocket.instances[0].url).toBe(`${expected}/api/rooms/A%2FB%20%3F/socket`)
+    FakeWebSocket.instances[0].disconnect()
+    vi.advanceTimersByTime(5)
+    expect(FakeWebSocket.instances[1].url).toBe(`${expected}/api/rooms/A%2FB%20%3F/socket`)
+    close()
+  })
+
+  it.each([undefined, ''])('uses the current origin when the backend target is %s', (target) => {
+    vi.stubEnv('VITE_BACKEND_PROXY_TARGET', target)
+    const close = connectToRoom('A/B ?')
+    expect(FakeWebSocket.instances[0].url).toBe('ws://localhost:3000/api/rooms/A%2FB%20%3F/socket')
+    close()
   })
 
   it('accepts monotonic authoritative snapshots, ignores duplicates, and reconnects across gaps', () => {
