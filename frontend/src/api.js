@@ -166,6 +166,14 @@ export async function leaveRoom(code, { signal } = {}) {
   })
 }
 
+export async function submitProblemReport({ description, section, app_version }) {
+  return request('/api/problem-reports', {
+    method: 'POST',
+    headers: mutationHeaders({ json: true, idempotent: false }),
+    body: JSON.stringify({ description, section, app_version }),
+  })
+}
+
 export async function getWallet({ signal } = {}) {
   const dto = await request('/api/wallet', { signal })
   return { balance: coinValue(dto?.balance, 'wallet balance') }

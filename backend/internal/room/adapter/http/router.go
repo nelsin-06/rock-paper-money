@@ -77,6 +77,7 @@ func newRouter(service *application.Service, verifier auth.Verifier, sessions *a
 	if sessions != nil && security != nil {
 		mux.Handle("/api/session", auth.NewSessionHTTPHandler(verifier, sessions, security))
 	}
+	registerRoute(mux, http.MethodPost, "/api/problem-reports", handler.protected("create_problem_report", handler.createProblemReport))
 	registerRoute(mux, http.MethodPost, "/api/rooms", handler.protected("create_room", handler.createRoom))
 	registerRoute(mux, http.MethodPost, "/api/rooms/{code}/join", handler.protected("join_room", handler.joinRoom))
 	registerRoute(mux, http.MethodPost, "/api/rooms/{code}/moves", handler.protected("submit_move", handler.submitMove))

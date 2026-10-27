@@ -13,6 +13,7 @@ import {
   rechargeWallet,
   startNextRound,
   submitMove,
+  submitProblemReport,
 } from './api.js'
 
 function response(body, { status = 200, requestId = 'request-123' } = {}) {
@@ -51,6 +52,21 @@ describe('cookie session API client', () => {
     fetch.mockResolvedValue(response({ balance: '50' }))
     await expect(getWallet()).resolves.toEqual({ balance: '50' })
     expect(fetch).toHaveBeenCalledExactlyOnceWith('/api/wallet', { credentials: 'include', signal: undefined })
+  })
+
+  it('submits reports with session security and without automatic retries', async () => {
+    const report = { description: 'Cannot join', section: 'join_room', app_version: '1.0.0' }
+    fetch.mockResolvedValueOnce(response({ status: 'created' }, { status: 201 }))
+    await submitProblemReport(report)
+    expect(fetch).toHaveBeenCalledExactlyOnceWith('/api/problem-reports', {
+      credentials: 'include', method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': 'csrf-token' },
+      body: JSON.stringify(report),
+    })
+    fetch.mockClear()
+    fetch.mockRejectedValue(new TypeError('offline'))
+    await expect(submitProblemReport(report)).rejects.toThrow('Cannot reach')
+    expect(fetch).toHaveBeenCalledTimes(1)
   })
 
   it('uses bootstrap CSRF without frontend cookies and clears it on logout', async () => {

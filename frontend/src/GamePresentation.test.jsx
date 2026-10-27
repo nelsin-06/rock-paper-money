@@ -2,6 +2,8 @@ import { describe, expect, it, vi } from 'vitest'
 import { render, screen, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { CopyButton, ReportProblem, RoundResult } from './GamePresentation.jsx'
+import * as api from './api.js'
+vi.mock('./api.js', () => ({ submitProblemReport: vi.fn() }))
 
 const completedRound = {
   round: 7,
@@ -64,21 +66,36 @@ describe('local clipboard tools', () => {
     expect(screen.getByRole('status')).toHaveTextContent('Could not copy. Select and copy the text manually.')
   })
 
-  it('creates a copy-only report containing only entered text and allowlisted context', async () => {
+  it('preserves the report after failure and disables duplicate sends while pending', async () => {
     const user = userEvent.setup()
-    const copy = vi.spyOn(navigator.clipboard, 'writeText').mockResolvedValue()
-    const fetchSpy = vi.spyOn(globalThis, 'fetch')
+    let reject
+    api.submitProblemReport.mockImplementationOnce(() => new Promise((_, fail) => { reject = fail }))
     render(<ReportProblem />)
     await user.click(screen.getByRole('button', { name: 'Report problem' }))
-    expect(screen.getByText(/nothing is sent or saved/i)).toBeInTheDocument()
+    await user.selectOptions(screen.getByLabelText('Where did it happen?'), 'wallet')
+    await user.type(screen.getByLabelText('What happened?'), 'Coins missing')
+    await user.click(screen.getByRole('button', { name: 'Send report' }))
+    expect(screen.getByRole('button', { name: 'Sending…' })).toBeDisabled()
+    reject(new Error('offline'))
+    expect(await screen.findByRole('alert')).toHaveTextContent('Could not confirm submission.')
+    expect(screen.getByLabelText('What happened?')).toHaveValue('Coins missing')
+    expect(screen.getByLabelText('Where did it happen?')).toHaveValue('wallet')
+    expect(screen.getByRole('button', { name: 'Send report' })).toBeEnabled()
+  })
+
+  it('sends only description, selected Spanish section and app version', async () => {
+    const user = userEvent.setup()
+    api.submitProblemReport.mockResolvedValue({ status: 'created' })
+    render(<ReportProblem />)
+    await user.click(screen.getByRole('button', { name: 'Report problem' }))
+    expect(screen.getByRole('button', { name: 'Send report' })).toBeDisabled()
+    await user.selectOptions(screen.getByLabelText('Where did it happen?'), 'join_room')
+    expect(screen.getByRole('option', { name: 'Unirse a una sala' }).selected).toBe(true)
     await user.type(screen.getByLabelText('What happened?'), 'The room did not load.')
-    const report = screen.getByLabelText('Report text').value
-    expect(report).toContain('Screen: Main menu')
-    expect(report).toContain('The room did not load.')
-    expect(report).not.toMatch(/access_token|cookie|authorization|email/i)
-    await user.click(screen.getByRole('button', { name: 'Copy report' }))
-    expect(copy).toHaveBeenCalledWith(report)
-    expect(fetchSpy).not.toHaveBeenCalled()
+    expect(screen.queryByLabelText('Report text')).not.toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: 'Send report' }))
+    expect(api.submitProblemReport).toHaveBeenCalledWith({ description: 'The room did not load.', section: 'join_room', app_version: '1.0.0' })
+    expect(screen.getByRole('status')).toHaveTextContent('Report sent. Thank you.')
     await user.click(screen.getByRole('button', { name: 'Close report a problem' }))
     expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
   })
