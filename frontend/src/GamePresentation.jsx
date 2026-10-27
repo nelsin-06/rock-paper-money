@@ -3,6 +3,7 @@ import blueCharacter from './assets/personaje-azul.png'
 import redCharacter from './assets/personaje-rojo.png'
 import { APP_VERSION } from './storage.js'
 import { ROUND_STAKE, roundOutcome } from './gamePresentation.js'
+import { submitProblemReport } from './api.js'
 
 export function GameIcon({ name, ...props }) {
   return (
@@ -103,19 +104,65 @@ export function CopyButton({ text, label = 'Copy room code' }) {
   </div>
 }
 
+const REPORT_SECTIONS = [
+  ['main_menu', 'Menú principal'],
+  ['create_room', 'Crear sala'],
+  ['join_room', 'Unirse a una sala'],
+  ['wallet', 'Monedero y recarga de monedas'],
+  ['waiting_room', 'Sala de espera / código de sala'],
+  ['gameplay', 'Partida / selección de jugada'],
+  ['round_result', 'Resultado de la ronda'],
+  ['next_round', 'Jugar otra ronda'],
+  ['connection', 'Conexión y recuperación de sesión'],
+  ['account', 'Cuenta e inicio de sesión'],
+]
+
 export function ReportProblem() {
   const [open, setOpen] = useState(false)
   const [issue, setIssue] = useState('')
-  const report = `Rock Paper Money — local problem report\nApp version: ${APP_VERSION}\nScreen: Main menu\n\nIssue:\n${issue}`
+  const [section, setSection] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [feedback, setFeedback] = useState('')
+  const [error, setError] = useState('')
+  const sending = useRef(false)
+
+  async function send(event) {
+    event.preventDefault()
+    if (sending.current || !issue.trim() || !section) return
+    sending.current = true
+    setBusy(true)
+    setFeedback('')
+    setError('')
+    try {
+      await submitProblemReport({ description: issue.trim(), section, app_version: APP_VERSION })
+      setIssue('')
+      setSection('')
+      setFeedback('Report sent. Thank you.')
+    } catch {
+      setError('Could not confirm submission. Your text is preserved. Retrying may create a duplicate if the server already received it.')
+    } finally {
+      sending.current = false
+      setBusy(false)
+    }
+  }
+
   return <>
     <button className="button button-report" onClick={() => setOpen(true)}><GameIcon name="scissors" />Report problem</button>
     {open && <Modal title="Report a problem" onClose={() => setOpen(false)}>
-      <p>This report stays in your browser. Nothing is sent or saved. Copy it to share through a support channel you already use.</p>
-      <label htmlFor="report-issue">What happened?</label>
-      <textarea id="report-issue" rows="4" value={issue} onChange={(event) => setIssue(event.target.value)} placeholder="Describe the issue. Do not include passwords or access tokens." />
-      <label htmlFor="report-preview">Report text</label>
-      <textarea id="report-preview" rows="6" value={report} readOnly />
-      <CopyButton key={report} text={report} label="Copy report" />
+      <p>Your report will be saved with your account identifier and app version. Do not include passwords or access tokens.</p>
+      <form onSubmit={send}>
+        <label htmlFor="report-section">Where did it happen?</label>
+        <select id="report-section" className="report-section" value={section} onChange={(event) => setSection(event.target.value)} required disabled={busy}>
+          <option value="">Selecciona una sección</option>
+          {REPORT_SECTIONS.map(([value, label]) => <option key={value} value={value}>{label}</option>)}
+        </select>
+        <label htmlFor="report-issue">What happened?</label>
+        <textarea id="report-issue" rows="4" value={issue} onChange={(event) => setIssue(event.target.value)} maxLength={5000} required disabled={busy} placeholder="Describe the issue. Do not include passwords or access tokens." />
+        <p>App version: {APP_VERSION}</p>
+        <button className="button button-secondary" disabled={busy || !issue.trim() || !section}>{busy ? 'Sending…' : 'Send report'}</button>
+        {feedback && <p role="status">{feedback}</p>}
+        {error && <p role="alert">{error}</p>}
+      </form>
     </Modal>}
   </>
 }

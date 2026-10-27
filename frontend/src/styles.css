@@ -98,6 +98,8 @@ svg { flex-shrink: 0; }
 label { display: block; color: var(--cream); font-size: .9rem; font-weight: 800; }
 input, textarea { display: block; width: 100%; min-width: 0; min-height: 3.3rem; padding: .8rem 1rem; border: 2px solid var(--lilac); border-radius: .8rem; color: var(--cream); background: var(--black); }
 textarea { margin: .6rem 0 1rem; resize: vertical; line-height: 1.5; }
+.report-section { display: block; width: 100%; margin: .6rem 0 1rem; padding: .8rem; border: 2px solid var(--lilac); border-radius: .8rem; color: var(--cream); background: var(--black); font: inherit; }
+.report-section:focus-visible { outline: 3px solid var(--gold); outline-offset: 3px; }
 input::placeholder, textarea::placeholder { color: #a69bb9; opacity: 1; }
 .join-form, .auth-form, .recharge-form { display: grid; gap: .8rem; }
 .join-form input { text-align: center; text-transform: uppercase; letter-spacing: .25em; font: 1.7rem var(--display); }
