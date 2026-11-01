@@ -5,7 +5,7 @@ import { Character, CopyButton, GameIcon, GameLogo, Modal, ReportProblem, RoundR
 import { ROUND_STAKE, WINNER_PAYOUT, roundOutcome } from './gamePresentation.js'
 import { clearSession, loadSession, saveSession } from './storage.js'
 import { supabase } from './supabase.js'
-
+import SmartGameCamera from './SmartGameCamera';
 const MOVES = [
   { value: 'rock', label: 'Rock' },
   { value: 'paper', label: 'Paper' },
@@ -163,6 +163,12 @@ function Home({ onEnterRoom, walletBalance }) {
 
   const insufficientForRound = walletBalance !== null && BigInt(walletBalance) < BigInt(ROUND_STAKE)
 
+  const [isGameActive, setIsGameActive] = useState(true); // cámbialo a true para probarlo
+
+  const handlePlaySelected = (opcion) => {
+    console.log("Jugada elegida:", opcion);
+    setIsGameActive(false);
+  };
   return (
     <main className="page home-page">
       <Character className="menu-character menu-character-left" />
@@ -171,7 +177,11 @@ function Home({ onEnterRoom, walletBalance }) {
         <h1 id="home-title"><span>Rock,</span><span>Paper,</span><em>Money</em></h1>
         <p className="hero-copy">Two players. One choice. Make it count.</p>
       </section>
-
+{isGameActive && (
+  <div style={{ marginTop: '20px', display: 'flex', justifyContent: 'center' }}>
+    <SmartGameCamera onPlaySelected={handlePlaySelected} />
+  </div>
+)}
       <section className="menu-actions" aria-label="Enter a game">
         <button className="button button-primary" disabled={busy !== null || insufficientForRound} onClick={() => enter(api.createRoom, 'host')}>
           <GameIcon name="rock" />
